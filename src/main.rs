@@ -1,18 +1,20 @@
 mod discovery;
 mod github;
 mod store;
+mod tray;
 
 use std::{collections::{HashMap, HashSet}, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, FontWeight, KeyBinding, PathPromptOptions,
-    SharedString, Task, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb,
-    size,
+    App, Application, Bounds, ClickEvent, Context, Entity, FontWeight, Global, KeyBinding,
+    PathPromptOptions, SharedString, Task, Window, WindowBounds, WindowOptions, actions, div,
+    prelude::*, px, rgb, size,
 };
 
 use discovery::LocalRepo;
 use store::{PendingReview, Store};
+use tray::Tray;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
 
@@ -44,6 +46,7 @@ struct Octowatcher {
     tab: Tab,
     last_checked: Option<DateTime<Local>>,
     error: Option<String>,
+    tray: Option<Tray>,
     scan_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
     _poll_task: Task<()>,
@@ -59,12 +62,18 @@ impl Octowatcher {
                 cx.background_executor().timer(POLL_INTERVAL).await;
             }
         });
+        let store = Store::load();
+        let (tray, error) = match Tray::new(&store.pending) {
+            Ok(tray) => (Some(tray), None),
+            Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
+        };
         let mut this = Self {
-            store: Store::load(),
+            store,
             repos: None,
             tab: Tab::Reviews,
             last_checked: None,
-            error: None,
+            error,
+            tray,
             scan_task: None,
             fetch_task: None,
             _poll_task: poll_task,
@@ -151,6 +160,7 @@ impl Octowatcher {
         if fetched != self.store.pending {
             self.store.pending = fetched;
             self.save();
+            self.sync_tray();
         }
         if !fresh.is_empty() {
             cx.spawn(async move |this, cx| {
@@ -190,6 +200,7 @@ impl Octowatcher {
                 .pending
                 .retain(|pr| pr.repo.to_lowercase() != key);
             self.save();
+            self.sync_tray();
         }
         cx.notify();
     }
@@ -223,6 +234,13 @@ impl Octowatcher {
         self.store.roots.retain(|r| r != root);
         self.save();
         self.rescan(cx);
+    }
+
+    fn sync_tray(&mut self) {
+        let Some(tray) = &self.tray else { return };
+        if let Err(err) = tray.update(&self.store.pending) {
+            self.error = Some(format!("could not update tray menu: {err:#}"));
+        }
     }
 
     fn save(&mut self) {
@@ -573,29 +591,47 @@ fn main() {
     #[cfg(target_os = "macos")]
     let _ = notify_rust::set_application("com.apple.Terminal");
 
-    Application::new().run(|cx: &mut App| {
+    let app = Application::new();
+    // Clicking the dock icon with the window closed brings it back.
+    app.on_reopen(show_window);
+    app.run(|cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
         cx.set_menus(vec![gpui::Menu {
             name: "Octowatcher".into(),
             items: vec![gpui::MenuItem::action("Quit", Quit)],
         }]);
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
+        tray::listen(cx);
 
-        let bounds = Bounds::centered(None, size(px(560.), px(680.)), cx);
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                ..Default::default()
-            },
-            |_, cx| cx.new(Octowatcher::new),
-        )
-        .unwrap();
-        cx.activate(true);
+        // The app owns the state rather than the window, so closing the
+        // window keeps polling and the tray icon alive until Quit.
+        let octowatcher = cx.new(Octowatcher::new);
+        cx.set_global(MainView(octowatcher));
+        show_window(cx);
     });
+}
+
+struct MainView(Entity<Octowatcher>);
+
+impl Global for MainView {}
+
+/// Brings the window to the front, opening it again if it was closed.
+pub fn show_window(cx: &mut App) {
+    cx.activate(true);
+    if let Some(window) = cx.windows().first() {
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+        return;
+    }
+    let view = cx.global::<MainView>().0.clone();
+    let bounds = Bounds::centered(None, size(px(560.), px(680.)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            ..Default::default()
+        },
+        |_, _| view,
+    )
+    .unwrap();
 }
