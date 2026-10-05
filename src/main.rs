@@ -14,12 +14,14 @@ use gpui::{
 };
 
 use discovery::LocalRepo;
-use store::{PendingReview, Store};
+use store::{PendingReview, Snooze, Store};
 use tray::{Tray, UpdateItem};
 use updater::Release;
 
 /// Choices offered in Settings for minutes between GitHub checks.
 const POLL_CHOICES: [u64; 7] = [1, 2, 5, 10, 15, 30, 60];
+/// Choices offered in Settings for minutes a review stays snoozed.
+const SNOOZE_CHOICES: [u64; 6] = [5, 10, 15, 30, 60, 120];
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 actions!(octowatcher, [Quit]);
@@ -68,6 +70,8 @@ struct Octowatcher {
     scan_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
+    /// Fires when the earliest snooze runs out.
+    wake_task: Option<Task<()>>,
     update_check: Option<Task<()>>,
     _update_schedule: Task<()>,
 }
@@ -90,7 +94,7 @@ impl Octowatcher {
             }
         });
         let store = Store::load();
-        let (tray, error) = match Tray::new(&store.pending) {
+        let (tray, error) = match Tray::new(&store.awake()) {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
         };
@@ -105,10 +109,12 @@ impl Octowatcher {
             scan_task: None,
             fetch_task: None,
             poll_task: None,
+            wake_task: None,
             update_check: None,
             _update_schedule: update_schedule,
         };
         this.schedule_poll(cx);
+        this.schedule_wake(cx);
         this.rescan(cx);
         this
     }
@@ -135,6 +141,78 @@ impl Octowatcher {
         self.save();
         self.schedule_poll(cx);
         cx.notify();
+    }
+
+    fn set_snooze_minutes(&mut self, minutes: u64, cx: &mut Context<Self>) {
+        if self.store.snooze_minutes == minutes {
+            return;
+        }
+        self.store.snooze_minutes = minutes;
+        self.save();
+        cx.notify();
+    }
+
+    /// Hides a pending review from the list and the tray for the snooze
+    /// length, then notifies about it again.
+    fn snooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+        let Some(pr) = self.store.pending.iter().find(|pr| pr.key() == key) else {
+            return;
+        };
+        let snooze = Snooze {
+            repo: key.0.clone(),
+            number: key.1,
+            until: Local::now().timestamp() + self.store.snooze_minutes as i64 * 60,
+            requested_at: pr.requested_at.clone(),
+        };
+        self.store.snoozed.retain(|s| s.key() != key);
+        self.store.snoozed.push(snooze);
+        self.snoozes_changed(cx);
+    }
+
+    fn unsnooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+        self.store.snoozed.retain(|s| s.key() != key);
+        self.snoozes_changed(cx);
+    }
+
+    fn snoozes_changed(&mut self, cx: &mut Context<Self>) {
+        self.save();
+        self.sync_tray();
+        self.schedule_wake(cx);
+        cx.notify();
+    }
+
+    /// Sets a timer for the earliest snooze to run out.
+    fn schedule_wake(&mut self, cx: &mut Context<Self>) {
+        let Some(until) = self.store.snoozed.iter().map(|s| s.until).min() else {
+            self.wake_task = None;
+            return;
+        };
+        let wait = (until - Local::now().timestamp()).max(0) as u64;
+        self.wake_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_secs(wait))
+                .await;
+            this.update(cx, |this, cx| this.wake(cx)).ok();
+        }));
+    }
+
+    /// Brings back every review whose snooze ran out, and notifies again.
+    fn wake(&mut self, cx: &mut Context<Self>) {
+        let now = Local::now().timestamp();
+        let (expired, remaining): (Vec<Snooze>, Vec<Snooze>) =
+            std::mem::take(&mut self.store.snoozed)
+                .into_iter()
+                .partition(|s| s.until <= now);
+        self.store.snoozed = remaining;
+        let woken: Vec<PendingReview> = self
+            .store
+            .pending
+            .iter()
+            .filter(|pr| expired.iter().any(|s| s.key() == pr.key()))
+            .cloned()
+            .collect();
+        self.snoozes_changed(cx);
+        self.notify(woken, cx);
     }
 
     /// Rediscovers local clones, then checks GitHub again.
@@ -212,27 +290,73 @@ impl Octowatcher {
             .cloned()
             .collect();
 
+        // A snooze ends when its PR leaves the list or is requested again.
+        let snoozed = self.store.snoozed.len();
+        self.store.snoozed.retain(|snooze| {
+            fetched
+                .iter()
+                .any(|pr| pr.key() == snooze.key() && pr.requested_at == snooze.requested_at)
+        });
+        let snoozes_changed = self.store.snoozed.len() != snoozed;
+
         if fetched != self.store.pending {
             self.store.pending = fetched;
             self.save();
             self.sync_tray();
         }
-        if !fresh.is_empty() {
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { notify(&fresh) })
-                    .await;
-                if let Err(err) = result {
-                    this.update(cx, |this, cx| {
-                        this.error = Some(format!("could not send notification: {err:#}"));
-                        cx.notify();
-                    })
-                    .ok();
+        if snoozes_changed {
+            self.snoozes_changed(cx);
+        }
+        self.notify(fresh, cx);
+    }
+
+    /// Notifies about reviews to do. A single one gets a button to snooze it.
+    fn notify(&mut self, prs: Vec<PendingReview>, cx: &mut Context<Self>) {
+        if prs.is_empty() {
+            return;
+        }
+        let key = match prs.as_slice() {
+            [pr] => Some(pr.key()),
+            _ => None,
+        };
+        let (summary, body) = notification_text(&prs);
+        let snoozable = key.is_some();
+        let (tx, rx) = async_channel::bounded(1);
+        // Waiting on the click blocks until the user acts, which may be never,
+        // so it gets a thread of its own rather than one of the executor's.
+        std::thread::spawn(move || {
+            let mut notification = notify_rust::Notification::new();
+            notification.summary(&summary).body(&body);
+            if snoozable {
+                notification.action("snooze", "Snooze");
+            }
+            match notification.show() {
+                Ok(handle) if snoozable => handle.wait_for_action(|clicked| {
+                    tx.send_blocking(Ok(clicked.to_string())).ok();
+                }),
+                Ok(_) => {}
+                Err(err) => {
+                    tx.send_blocking(Err(format!("{err:#}"))).ok();
+                }
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(clicked) = rx.recv().await else { return };
+            this.update(cx, |this, cx| match clicked {
+                Ok(action) if action == "snooze" => {
+                    if let Some(key) = key {
+                        this.snooze(key, cx);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    this.error = Some(format!("could not send notification: {err}"));
+                    cx.notify();
                 }
             })
-            .detach();
-        }
+            .ok();
+        })
+        .detach();
     }
 
     fn watched_slugs(&self) -> HashSet<String> {
@@ -519,7 +643,7 @@ impl Octowatcher {
             Some(Update::Ready(version)) => UpdateItem::Ready(version),
             Some(Update::Manual(_)) | None => UpdateItem::Check,
         };
-        if let Err(err) = tray.update(&self.store.pending, item) {
+        if let Err(err) = tray.update(&self.store.awake(), item) {
             self.error = Some(format!("could not update tray menu: {err:#}"));
         }
     }
@@ -531,8 +655,8 @@ impl Octowatcher {
     }
 }
 
-fn notify(fresh: &[PendingReview]) -> notify_rust::error::Result<()> {
-    let (summary, body) = match fresh {
+fn notification_text(prs: &[PendingReview]) -> (String, String) {
+    match prs {
         [pr] => (
             format!(
                 "{} requested your {}",
@@ -548,12 +672,7 @@ fn notify(fresh: &[PendingReview]) -> notify_rust::error::Result<()> {
                 .collect::<Vec<_>>()
                 .join(", "),
         ),
-    };
-    notify_rust::Notification::new()
-        .summary(&summary)
-        .body(&body)
-        .show()
-        .map(drop)
+    }
 }
 
 impl Render for Octowatcher {
@@ -733,6 +852,28 @@ impl Octowatcher {
             .gap_2()
             .children(self.store.pending.iter().enumerate().map(|(ix, pr)| {
                 let url = pr.url.clone();
+                let key = pr.key();
+                let snoozed_until = self.store.snooze_for(pr).map(|snooze| {
+                    DateTime::from_timestamp(snooze.until, 0)
+                        .map(|at| at.with_timezone(&Local).format("%H:%M").to_string())
+                        .unwrap_or_default()
+                });
+                let action = if snoozed_until.is_some() {
+                    button(("unsnooze", ix), "Unsnooze").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            // The card behind the button opens the PR.
+                            cx.stop_propagation();
+                            this.unsnooze(key.clone(), cx);
+                        },
+                    ))
+                } else {
+                    button(("snooze", ix), "Snooze").on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.snooze(key.clone(), cx);
+                        },
+                    ))
+                };
                 let badge = if pr.rereview {
                     Some(("re-review", theme::PEACH))
                 } else {
@@ -748,16 +889,25 @@ impl Octowatcher {
                     .bg(rgb(theme::SURFACE))
                     .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
                     .cursor_pointer()
+                    .when(snoozed_until.is_some(), |s| s.opacity(0.6))
                     .child(
                         div()
                             .flex()
                             .items_center()
+                            .justify_between()
                             .gap_2()
-                            .text_xs()
-                            .text_color(rgb(theme::SUBTEXT))
-                            .child(format!("{}#{}", pr.repo, pr.number))
-                            .children(badge.map(|(label, color)| pill(label, color)))
-                            .when(pr.is_draft, |s| s.child(pill("draft", theme::MUTED))),
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(rgb(theme::SUBTEXT))
+                                    .child(format!("{}#{}", pr.repo, pr.number))
+                                    .children(badge.map(|(label, color)| pill(label, color)))
+                                    .when(pr.is_draft, |s| s.child(pill("draft", theme::MUTED))),
+                            )
+                            .child(action),
                     )
                     .child(
                         div()
@@ -769,7 +919,10 @@ impl Octowatcher {
                         div()
                             .text_xs()
                             .text_color(rgb(theme::MUTED))
-                            .child(format!("by {}", pr.author)),
+                            .child(match &snoozed_until {
+                                Some(at) => format!("by {} · snoozed until {at}", pr.author),
+                                None => format!("by {}", pr.author),
+                            }),
                     )
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)))
             }))
@@ -871,18 +1024,49 @@ impl Octowatcher {
     }
 
     fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let current = self.store.poll_minutes;
+        div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .child(self.render_choices(
+                "Check GitHub for review requests every",
+                "poll",
+                &POLL_CHOICES,
+                self.store.poll_minutes,
+                Self::set_poll_minutes,
+                cx,
+            ))
+            .child(self.render_choices(
+                "Snooze a review for",
+                "snooze-minutes",
+                &SNOOZE_CHOICES,
+                self.store.snooze_minutes,
+                Self::set_snooze_minutes,
+                cx,
+            ))
+    }
+
+    /// A row of minute lengths to pick one from.
+    fn render_choices(
+        &self,
+        title: &'static str,
+        id: &'static str,
+        choices: &[u64],
+        current: u64,
+        pick: fn(&mut Self, u64, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title("Check GitHub for review requests every"))
+            .child(section_title(title))
             .child(
                 div()
                     .flex()
                     .flex_wrap()
                     .gap_2()
-                    .children(POLL_CHOICES.iter().map(|&minutes| {
+                    .children(choices.iter().map(|&minutes| {
                         let active = minutes == current;
                         let label = if minutes < 60 {
                             format!("{minutes} min")
@@ -890,7 +1074,7 @@ impl Octowatcher {
                             format!("{} h", minutes / 60)
                         };
                         div()
-                            .id(("poll", minutes as usize))
+                            .id((id, minutes as usize))
                             .px_3()
                             .py_1()
                             .rounded_md()
@@ -904,7 +1088,7 @@ impl Octowatcher {
                             })
                             .child(label)
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.set_poll_minutes(minutes, cx)
+                                pick(this, minutes, cx)
                             }))
                     })),
             )
@@ -952,12 +1136,6 @@ fn display_path(path: &std::path::Path) -> String {
 }
 
 fn main() {
-    // An unbundled binary has no identity of its own, so notifications borrow
-    // Terminal's. Left unset, the library looks up an app named "use_default"
-    // via AppleScript and macOS asks the user where that app is.
-    #[cfg(target_os = "macos")]
-    let _ = notify_rust::set_application("com.apple.Terminal");
-
     let app = Application::new();
     // Clicking the dock icon with the window closed brings it back.
     app.on_reopen(show_window);

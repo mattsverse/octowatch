@@ -9,6 +9,7 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Uses the repositories you already have.** Octowatcher scans folders such as `~/Dev` for git clones with a GitHub remote, so you only hear about the repositories you work on. You can switch any of them off.
 - **Notifies you about new requests only.** You get one notification when a review is requested, and another if you are asked to re-review after you've already left a review. A pull request leaves the list once you review it, the request is withdrawn, or the PR is closed.
 - **Includes team requests.** It counts requests made to a team you belong to. The request clears once you review, even if the rest of the team hasn't.
+- **Snoozes a review for later.** Snooze a pull request from its notification or from the window. It leaves the tray until the snooze runs out, then notifies you again. A new review request on it ends the snooze early.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
@@ -63,6 +64,8 @@ The window has three tabs.
 
 This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
 
+**Snooze** hides a pull request from the tray for the snooze length set in Settings. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new notification about a single pull request also has a **Snooze** button. One that covers several pull requests doesn't. Snoozes survive a restart.
+
 ### Repositories
 
 **Watched folders** are the folders Octowatcher scans for clones. The first time you launch it, it watches `~/Dev` if that folder exists, and your home folder otherwise. Use **Add folder…** and **Remove** to change the list, and **Rescan** after you clone something new.
@@ -76,6 +79,8 @@ Octowatcher reads the remotes from each clone's `.git/config` and understands SS
 ### Settings
 
 This tab sets how often Octowatcher checks GitHub: every 1, 2, 5, 10, 15, 30 or 60 minutes. The default is 2 minutes.
+
+It also sets how long a snooze lasts: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default is 5 minutes.
 
 ### Running in the background
 
