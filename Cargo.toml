@@ -1,7 +1,11 @@
 [package]
 name = "octowatcher"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
+description = "Watches your local GitHub repositories for pull requests waiting on your review"
+license = "MIT"
+repository = "https://github.com/mattsverse/octowatch"
+authors = ["Matteo Gassend"]
 
 [dependencies]
 anyhow = "1.0.104"
@@ -10,6 +14,37 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 gpui = "0.2.2"
 notify-rust = { version = "4.18", features = ["preview-macos-un"] }
+png = "0.18"
+semver = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tray-icon = "0.26"
+
+[package.metadata.bundle]
+name = "Octowatcher"
+identifier = "io.github.mattsverse.octowatcher"
+icon = [
+    "assets/icons/32x32.png",
+    "assets/icons/32x32@2x.png",
+    "assets/icons/128x128.png",
+    "assets/icons/128x128@2x.png",
+    "assets/icons/256x256.png",
+    "assets/icons/256x256@2x.png",
+    "assets/icons/512x512.png",
+    "assets/icons/512x512@2x.png",
+]
+category = "Developer Tool"
+copyright = "Copyright (c) Matteo Gassend 2026"
+# Runtime libraries gpui (X11/Wayland, Vulkan) and the tray (GTK, AppIndicator) link against.
+deb_depends = [
+    "libxkbcommon0",
+    "libxkbcommon-x11-0",
+    "libwayland-client0",
+    "libvulkan1",
+    "libgtk-3-0",
+    "libayatana-appindicator3-1",
+    "libxdo3",
+]
+
+[package.metadata.bundle.linux]
+startup_wm_class = "octowatcher"
