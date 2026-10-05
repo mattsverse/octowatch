@@ -72,5 +72,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v3
         with:
+          # release-please already wrote the notes; this only attaches assets.
           files: dist/**/*
-          generate_release_notes: true
