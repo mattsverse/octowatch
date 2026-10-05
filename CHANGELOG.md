@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/mattsverse/octowatch/compare/v0.1.0...v0.2.0) (2026-10-05)
+
+
+### Features
+
+* configurable check interval ([02917ff](https://github.com/mattsverse/octowatch/commit/02917ff50b1ca43263f60a9198dad28684312e10))
+
 ## 0.1.0 (2026-10-05)
 
 
