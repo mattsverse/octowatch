@@ -15,6 +15,10 @@ pub struct Store {
     pub pending: Vec<PendingReview>,
     /// Minutes between checks of GitHub for review requests.
     pub poll_minutes: u64,
+    /// Minutes a snoozed review stays hidden.
+    pub snooze_minutes: u64,
+    /// Reviews the user put aside for now.
+    pub snoozed: Vec<Snooze>,
 }
 
 impl Default for Store {
@@ -24,6 +28,8 @@ impl Default for Store {
             disabled: BTreeSet::new(),
             pending: Vec::new(),
             poll_minutes: 2,
+            snooze_minutes: 5,
+            snoozed: Vec::new(),
         }
     }
 }
@@ -46,6 +52,24 @@ pub struct PendingReview {
 impl PendingReview {
     pub fn key(&self) -> (String, u64) {
         (self.repo.to_lowercase(), self.number)
+    }
+}
+
+/// A pending review hidden from the list and the tray until `until`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Snooze {
+    /// `owner/name`, lowercase.
+    pub repo: String,
+    pub number: u64,
+    /// Unix seconds when the review comes back.
+    pub until: i64,
+    /// The request that was snoozed; a newer one ends the snooze.
+    pub requested_at: Option<String>,
+}
+
+impl Snooze {
+    pub fn key(&self) -> (String, u64) {
+        (self.repo.clone(), self.number)
     }
 }
 
@@ -81,6 +105,20 @@ impl Store {
 
     pub fn is_enabled(&self, slug: &str) -> bool {
         !self.disabled.contains(&slug.to_lowercase())
+    }
+
+    pub fn snooze_for(&self, pr: &PendingReview) -> Option<&Snooze> {
+        let key = pr.key();
+        self.snoozed.iter().find(|snooze| snooze.key() == key)
+    }
+
+    /// Pending reviews that aren't snoozed.
+    pub fn awake(&self) -> Vec<PendingReview> {
+        self.pending
+            .iter()
+            .filter(|pr| self.snooze_for(pr).is_none())
+            .cloned()
+            .collect()
     }
 }
 
