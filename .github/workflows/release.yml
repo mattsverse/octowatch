@@ -15,7 +15,7 @@ env:
 
 jobs:
   macos:
-    runs-on: macos-latest
+    runs-on: blacksmith-6vcpu-macos-15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -37,7 +37,7 @@ jobs:
 
   linux:
     # The oldest supported runner, so the AppImage runs on older glibc.
-    runs-on: ubuntu-22.04
+    runs-on: blacksmith-4vcpu-ubuntu-2204
     steps:
       - uses: actions/checkout@v7
       - run: |
