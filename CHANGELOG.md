@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.3.0](https://github.com/mattsverse/octowatch/compare/v0.2.0...v0.3.0) (2026-10-05)
+
+
+### Features
+
+* snooze review requests ([573f3c9](https://github.com/mattsverse/octowatch/commit/573f3c907165d7980f4c4e8ec15b9db3aba97b7e))
+* snooze review requests ([6279ef2](https://github.com/mattsverse/octowatch/commit/6279ef21de57c75304f6b8a524bd5f177a657b6a))
+* update dialogs ([363036b](https://github.com/mattsverse/octowatch/commit/363036b8ef56e9fa2fb904b7bbaedcea5d07c560))
+
 ## [0.2.0](https://github.com/mattsverse/octowatch/compare/v0.1.0...v0.2.0) (2026-10-05)
 
 
