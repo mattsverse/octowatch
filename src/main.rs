@@ -24,7 +24,7 @@ const POLL_CHOICES: [u64; 7] = [1, 2, 5, 10, 15, 30, 60];
 const SNOOZE_CHOICES: [u64; 6] = [5, 10, 15, 30, 60, 120];
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-actions!(octowatcher, [Quit]);
+actions!(octowatcher, [Quit, Refresh]);
 
 mod theme {
     pub const BASE: u32 = 0x1e1e2e;
@@ -1141,10 +1141,18 @@ fn main() {
     app.on_reopen(show_window);
     app.run(|cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
-        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.on_action(|_: &Refresh, cx| refresh(cx));
+        cx.bind_keys([
+            KeyBinding::new("cmd-q", Quit, None),
+            KeyBinding::new("cmd-r", Refresh, None),
+        ]);
         cx.set_menus(vec![gpui::Menu {
             name: "Octowatcher".into(),
-            items: vec![gpui::MenuItem::action("Quit", Quit)],
+            items: vec![
+                gpui::MenuItem::action("Refresh", Refresh),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action("Quit", Quit),
+            ],
         }]);
         tray::listen(cx);
 
@@ -1159,6 +1167,12 @@ fn main() {
 struct MainView(Entity<Octowatcher>);
 
 impl Global for MainView {}
+
+/// Checks GitHub for review requests now, from the tray or the app menu.
+pub fn refresh(cx: &mut App) {
+    let view = cx.global::<MainView>().0.clone();
+    view.update(cx, |this, cx| this.refresh(cx));
+}
 
 /// Checks for a new release now, from the tray.
 pub fn check_for_updates(cx: &mut App) {

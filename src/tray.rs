@@ -10,6 +10,7 @@ use crate::store::PendingReview;
 
 const SHOW_ID: &str = "show";
 const QUIT_ID: &str = "quit";
+const REFRESH_ID: &str = "refresh";
 const RESTART_ID: &str = "restart";
 const CHECK_UPDATES_ID: &str = "check-updates";
 const INSTALL_ID: &str = "install-update";
@@ -75,6 +76,8 @@ pub fn listen(cx: &mut App) {
             let id = event.id.as_ref();
             let handled = if id == SHOW_ID {
                 cx.update(crate::show_window)
+            } else if id == REFRESH_ID {
+                cx.update(crate::refresh)
             } else if id == RESTART_ID {
                 cx.update(|cx| cx.restart())
             } else if id == CHECK_UPDATES_ID {
@@ -117,6 +120,7 @@ fn build_menu(pending: &[PendingReview], update: UpdateItem) -> Result<Menu> {
         ))?;
     }
     menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&MenuItem::with_id(REFRESH_ID, "Refresh Now", true, None))?;
     let item = match update {
         UpdateItem::Check => MenuItem::with_id(CHECK_UPDATES_ID, "Check for Updates…", true, None),
         UpdateItem::Checking => MenuItem::new("Checking for Updates…", false, None),
