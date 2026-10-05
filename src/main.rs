@@ -18,7 +18,8 @@ use store::{PendingReview, Store};
 use tray::Tray;
 use updater::Release;
 
-const POLL_INTERVAL: Duration = Duration::from_secs(120);
+/// Choices offered in Settings for minutes between GitHub checks.
+const POLL_CHOICES: [u64; 7] = [1, 2, 5, 10, 15, 30, 60];
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 actions!(octowatcher, [Quit]);
@@ -47,6 +48,7 @@ enum Update {
 enum Tab {
     Reviews,
     Repositories,
+    Settings,
 }
 
 struct Octowatcher {
@@ -60,20 +62,12 @@ struct Octowatcher {
     update: Option<Update>,
     scan_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
-    _poll_task: Task<()>,
+    poll_task: Option<Task<()>>,
     _update_task: Task<()>,
 }
 
 impl Octowatcher {
     fn new(cx: &mut Context<Self>) -> Self {
-        let poll_task = cx.spawn(async move |this, cx| {
-            loop {
-                if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
-                    break;
-                }
-                cx.background_executor().timer(POLL_INTERVAL).await;
-            }
-        });
         let update_task = cx.spawn(async move |this, cx| {
             // A dev build would overwrite its own target dir with a release.
             if cfg!(debug_assertions) {
@@ -138,11 +132,36 @@ impl Octowatcher {
             update: None,
             scan_task: None,
             fetch_task: None,
-            _poll_task: poll_task,
+            poll_task: None,
             _update_task: update_task,
         };
+        this.schedule_poll(cx);
         this.rescan(cx);
         this
+    }
+
+    /// Restarts the countdown to the next check, so a new interval applies now.
+    /// The scan at startup does the first check.
+    fn schedule_poll(&mut self, cx: &mut Context<Self>) {
+        let interval = Duration::from_secs(self.store.poll_minutes.max(1) * 60);
+        self.poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(interval).await;
+                if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    fn set_poll_minutes(&mut self, minutes: u64, cx: &mut Context<Self>) {
+        if self.store.poll_minutes == minutes {
+            return;
+        }
+        self.store.poll_minutes = minutes;
+        self.save();
+        self.schedule_poll(cx);
+        cx.notify();
     }
 
     /// Rediscovers local clones, then checks GitHub again.
@@ -347,6 +366,7 @@ impl Render for Octowatcher {
         let content = match self.tab {
             Tab::Reviews => self.render_reviews(cx).into_any_element(),
             Tab::Repositories => self.render_repositories(cx).into_any_element(),
+            Tab::Settings => self.render_settings(cx).into_any_element(),
         };
         div()
             .flex()
@@ -431,7 +451,8 @@ impl Octowatcher {
                         Tab::Repositories,
                         format!("Repositories ({repo_count})"),
                         cx,
-                    )),
+                    ))
+                    .child(self.render_tab(Tab::Settings, "Settings".into(), cx)),
             )
     }
 
@@ -471,6 +492,7 @@ impl Octowatcher {
         let id = match tab {
             Tab::Reviews => "tab-reviews",
             Tab::Repositories => "tab-repositories",
+            Tab::Settings => "tab-settings",
         };
         div()
             .id(id)
@@ -640,6 +662,46 @@ impl Octowatcher {
             }));
 
         div().flex().flex_col().gap_6().child(roots).child(list)
+    }
+
+    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current = self.store.poll_minutes;
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_title("Check GitHub for review requests every"))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(POLL_CHOICES.iter().map(|&minutes| {
+                        let active = minutes == current;
+                        let label = if minutes < 60 {
+                            format!("{minutes} min")
+                        } else {
+                            format!("{} h", minutes / 60)
+                        };
+                        div()
+                            .id(("poll", minutes as usize))
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .text_xs()
+                            .cursor_pointer()
+                            .when(active, |s| s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE)))
+                            .when(!active, |s| {
+                                s.bg(rgb(theme::SURFACE))
+                                    .text_color(rgb(theme::SUBTEXT))
+                                    .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
+                            })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.set_poll_minutes(minutes, cx)
+                            }))
+                    })),
+            )
     }
 }
 

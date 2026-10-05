@@ -4,7 +4,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 /// Everything that survives a restart, saved as JSON in the platform config dir.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Store {
     /// Folders scanned for local git clones.
@@ -13,6 +13,19 @@ pub struct Store {
     pub disabled: BTreeSet<String>,
     /// Pull requests currently waiting on the user's review.
     pub pending: Vec<PendingReview>,
+    /// Minutes between checks of GitHub for review requests.
+    pub poll_minutes: u64,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            roots: Vec::new(),
+            disabled: BTreeSet::new(),
+            pending: Vec::new(),
+            poll_minutes: 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
