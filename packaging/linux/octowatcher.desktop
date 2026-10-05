@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Octowatcher
+Comment=Watches your local GitHub repositories for pull requests waiting on your review
+Exec=octowatcher
+Icon=octowatcher
+Categories=Development;
+StartupWMClass=octowatcher
+Terminal=false
