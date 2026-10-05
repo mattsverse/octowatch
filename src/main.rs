@@ -65,6 +65,8 @@ struct Octowatcher {
     tab: Tab,
     last_checked: Option<DateTime<Local>>,
     error: Option<String>,
+    /// Kept separately so a successful GitHub check doesn't hide permission errors.
+    notification_error: Option<String>,
     tray: Option<Tray>,
     update: Option<Update>,
     scan_task: Option<Task<()>>,
@@ -73,12 +75,39 @@ struct Octowatcher {
     /// Fires when the earliest snooze runs out.
     wake_task: Option<Task<()>>,
     update_check: Option<Task<()>>,
-    _update_schedule: Task<()>,
+    /// Requests notification permission, starts polling, then schedules updates.
+    _startup_and_updates: Task<()>,
 }
 
 impl Octowatcher {
     fn new(cx: &mut Context<Self>) -> Self {
-        let update_schedule = cx.spawn(async move |this, cx| {
+        let startup_and_updates = cx.spawn(async move |this, cx| {
+            // Ask without blocking the UI, before any background notification
+            // can be sent. macOS only prompts when permission is undecided.
+            #[cfg(target_os = "macos")]
+            let notification_error = match notify_rust::request_auth().await {
+                Ok(true) => None,
+                Ok(false) => Some(
+                    "Notifications are disabled. Enable Allow Notifications for Octowatcher in System Settings → Notifications."
+                        .into(),
+                ),
+                Err(err) => Some(format!("could not request notification permission: {err:#}")),
+            };
+            if this
+                .update(cx, |this, cx| {
+                    #[cfg(target_os = "macos")]
+                    {
+                        this.notification_error = notification_error;
+                    }
+                    this.schedule_poll(cx);
+                    this.schedule_wake(cx);
+                    this.rescan(cx);
+                })
+                .is_err()
+            {
+                return;
+            }
+
             // A dev build would overwrite its own target dir with a release.
             if cfg!(debug_assertions) {
                 return;
@@ -98,12 +127,13 @@ impl Octowatcher {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
         };
-        let mut this = Self {
+        Self {
             store,
             repos: None,
             tab: Tab::Reviews,
             last_checked: None,
             error,
+            notification_error: None,
             tray,
             update: None,
             scan_task: None,
@@ -111,12 +141,8 @@ impl Octowatcher {
             poll_task: None,
             wake_task: None,
             update_check: None,
-            _update_schedule: update_schedule,
-        };
-        this.schedule_poll(cx);
-        this.schedule_wake(cx);
-        this.rescan(cx);
-        this
+            _startup_and_updates: startup_and_updates,
+        }
     }
 
     /// Restarts the countdown to the next check, so a new interval applies now.
@@ -745,12 +771,17 @@ impl Octowatcher {
                             ))),
                     ),
             )
-            .children(self.error.clone().map(|err| {
-                div()
-                    .text_xs()
-                    .text_color(rgb(theme::RED))
-                    .child(err)
-            }))
+            .children(
+                self.error
+                    .clone()
+                    .or_else(|| self.notification_error.clone())
+                    .map(|err| {
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::RED))
+                            .child(err)
+                    }),
+            )
             .children(self.render_update(cx))
             .child(
                 div()

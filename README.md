@@ -99,6 +99,7 @@ Delete this file to reset Octowatcher. Everything it sends to GitHub goes throug
 
 ## Troubleshooting
 
+- **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then restart the app.
 - **"could not run `gh`; is the GitHub CLI installed?"**: install the GitHub CLI, or put it in one of the folders listed under [Requirements](#requirements).
 - **"gh api failed: …"**: run `gh auth status` in a terminal, and `gh auth login` if you're logged out.
 - **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. Then click **Rescan**.
@@ -120,7 +121,7 @@ sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-
   libgtk-3-dev libayatana-appindicator3-dev libxdo-dev libdbus-1-dev
 ```
 
-If you run the bare binary on macOS, notifications appear under Terminal's name, because an unbundled binary has no app identity of its own. To build the app bundle, use [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle):
+On macOS, notification permission and delivery require a signed `.app` bundle; they don't work when running the bare binary with `cargo run`. An ad-hoc signature is sufficient. To build the app bundle, use [`cargo-bundle`](https://github.com/burtonageo/cargo-bundle):
 
 ```sh
 cargo install cargo-bundle
