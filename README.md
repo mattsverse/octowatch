@@ -11,7 +11,7 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Includes team requests.** It counts requests made to a team you belong to. The request clears once you review, even if the rest of the team hasn't.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
-- **Updates itself.** On macOS, and on Linux when you run the AppImage, it installs new releases in the background and offers **Restart to Update** in the tray menu.
+- **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
 ## Requirements
 

@@ -8,14 +8,14 @@ use std::{collections::{HashMap, HashSet}, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Entity, FontWeight, Global, KeyBinding,
-    PathPromptOptions, SharedString, Task, Window, WindowBounds, WindowOptions, actions, div,
-    prelude::*, px, rgb, size,
+    App, Application, AsyncApp, Bounds, ClickEvent, Context, Entity, FontWeight, Global,
+    KeyBinding, PathPromptOptions, PromptButton, PromptLevel, SharedString, Task, Window,
+    WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 use discovery::LocalRepo;
 use store::{PendingReview, Store};
-use tray::Tray;
+use tray::{Tray, UpdateItem};
 use updater::Release;
 
 /// Choices offered in Settings for minutes between GitHub checks.
@@ -37,7 +37,12 @@ mod theme {
     pub const RED: u32 = 0xf38ba8;
 }
 
+#[derive(Clone)]
 enum Update {
+    /// Newer than the running build, and installable in place.
+    Available(Release),
+    /// Being swapped in for the running copy.
+    Installing(semver::Version),
     /// Installed over the running copy; a restart switches to it.
     Ready(semver::Version),
     /// Couldn't be installed in place; the release page has it.
@@ -63,56 +68,23 @@ struct Octowatcher {
     scan_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
-    _update_task: Task<()>,
+    update_check: Option<Task<()>>,
+    _update_schedule: Task<()>,
 }
 
 impl Octowatcher {
     fn new(cx: &mut Context<Self>) -> Self {
-        let update_task = cx.spawn(async move |this, cx| {
+        let update_schedule = cx.spawn(async move |this, cx| {
             // A dev build would overwrite its own target dir with a release.
             if cfg!(debug_assertions) {
                 return;
             }
             loop {
-                let checked = cx.background_executor().spawn(async { updater::check() }).await;
-                match checked {
-                    Ok(Some(release)) => {
-                        let Ok(installed) = this.read_with(cx, |this, _| {
-                            matches!(&this.update, Some(Update::Ready(v)) if *v >= release.version)
-                        }) else {
-                            break;
-                        };
-                        if !installed {
-                            let result = cx
-                                .background_executor()
-                                .spawn({
-                                    let release = release.clone();
-                                    async move { updater::install(&release) }
-                                })
-                                .await;
-                            let updated = this.update(cx, |this, cx| {
-                                this.update = Some(match result {
-                                    Ok(path) => {
-                                        // Linux relaunches the executable path, which
-                                        // reads as deleted once it was replaced.
-                                        cx.set_restart_path(path);
-                                        Update::Ready(release.version)
-                                    }
-                                    Err(err) => {
-                                        eprintln!("could not install update: {err:#}");
-                                        Update::Manual(release)
-                                    }
-                                });
-                                this.sync_tray();
-                                cx.notify();
-                            });
-                            if updated.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(err) => eprintln!("could not check for updates: {err:#}"),
+                if this
+                    .update(cx, |this, cx| this.check_for_updates(false, cx))
+                    .is_err()
+                {
+                    break;
                 }
                 cx.background_executor().timer(UPDATE_INTERVAL).await;
             }
@@ -133,7 +105,8 @@ impl Octowatcher {
             scan_task: None,
             fetch_task: None,
             poll_task: None,
-            _update_task: update_task,
+            update_check: None,
+            _update_schedule: update_schedule,
         };
         this.schedule_poll(cx);
         this.rescan(cx);
@@ -318,13 +291,235 @@ impl Octowatcher {
         self.rescan(cx);
     }
 
+    /// Looks for a newer release. Scheduled checks announce a new one in a
+    /// notification; `manual` checks come from the tray and answer in a dialog.
+    fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
+        if self.update_check.is_some() || matches!(self.update, Some(Update::Installing(_))) {
+            return;
+        }
+        self.update_check = Some(cx.spawn(async move |this, cx| {
+            let checked = cx
+                .background_executor()
+                .spawn(async { updater::check() })
+                .await;
+            let Ok(state) = this.update(cx, |this, cx| {
+                this.update_check = None;
+                if let Ok(Some(release)) = &checked
+                    && this.found(release.clone())
+                    && !manual
+                {
+                    this.announce_update(cx);
+                }
+                this.sync_tray();
+                cx.notify();
+                this.update.clone()
+            }) else {
+                return;
+            };
+            let release = match checked {
+                Ok(Some(release)) => release,
+                Ok(None) => {
+                    if manual {
+                        let detail = format!(
+                            "Version {} is the latest release.",
+                            updater::current_version()
+                        );
+                        ask(
+                            cx,
+                            PromptLevel::Info,
+                            "Octowatcher is up to date",
+                            &detail,
+                            &[PromptButton::ok("OK")],
+                        )
+                        .await;
+                    }
+                    return;
+                }
+                Err(err) => {
+                    eprintln!("could not check for updates: {err:#}");
+                    if manual {
+                        ask(
+                            cx,
+                            PromptLevel::Warning,
+                            "Could not check for updates",
+                            &format!("{err:#}"),
+                            &[PromptButton::ok("OK")],
+                        )
+                        .await;
+                    }
+                    return;
+                }
+            };
+            if !manual {
+                return;
+            }
+            match state {
+                Some(Update::Ready(version)) => ask_restart(&version, cx).await,
+                Some(Update::Available(_)) => {
+                    let message = format!("Octowatcher {} is available", release.version);
+                    let detail = format!("You have {}.", updater::current_version());
+                    let answer = ask(
+                        cx,
+                        PromptLevel::Info,
+                        &message,
+                        &detail,
+                        &[PromptButton::ok("Update"), PromptButton::cancel("Later")],
+                    )
+                    .await;
+                    if answer == Some(0) {
+                        this.update(cx, |this, cx| this.install_update(cx)).ok();
+                    }
+                }
+                Some(Update::Manual(release)) => {
+                    let message = format!("Octowatcher {} is available", release.version);
+                    let answer = ask(
+                        cx,
+                        PromptLevel::Info,
+                        &message,
+                        "Download it from the release page.",
+                        &[PromptButton::ok("Download"), PromptButton::cancel("Later")],
+                    )
+                    .await;
+                    if answer == Some(0) {
+                        cx.update(|cx| cx.open_url(&release.url)).ok();
+                    }
+                }
+                Some(Update::Installing(_)) | None => {}
+            }
+        }));
+        self.sync_tray();
+    }
+
+    /// Records a release newer than the running build. Returns false when
+    /// it, or something newer, was already known.
+    fn found(&mut self, release: Release) -> bool {
+        let known = match &self.update {
+            Some(Update::Available(known) | Update::Manual(known)) => Some(&known.version),
+            Some(Update::Installing(version) | Update::Ready(version)) => Some(version),
+            None => None,
+        };
+        if known.is_some_and(|version| *version >= release.version) {
+            return false;
+        }
+        self.update = Some(if updater::can_install(&release) {
+            Update::Available(release)
+        } else {
+            Update::Manual(release)
+        });
+        true
+    }
+
+    /// Notifies about the update just found, with a button to act on it.
+    fn announce_update(&mut self, cx: &mut Context<Self>) {
+        let (release, body, action) = match &self.update {
+            Some(Update::Available(release)) => (
+                release,
+                "Install it now, or later from the tray menu.",
+                ("update", "Update"),
+            ),
+            Some(Update::Manual(release)) => (
+                release,
+                "Download it from the release page.",
+                ("download", "Download"),
+            ),
+            _ => return,
+        };
+        let summary = format!("Octowatcher {} is available", release.version);
+        let url = release.url.clone();
+        let (tx, rx) = async_channel::bounded(1);
+        // Waiting on the click blocks until the user acts, which may be never,
+        // so it gets a thread of its own rather than one of the executor's.
+        std::thread::spawn(move || {
+            let shown = notify_rust::Notification::new()
+                .summary(&summary)
+                .body(body)
+                .action(action.0, action.1)
+                .show();
+            match shown {
+                Ok(handle) => handle.wait_for_action(|clicked| {
+                    tx.send_blocking(clicked.to_string()).ok();
+                }),
+                Err(err) => eprintln!("could not send notification: {err:#}"),
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(clicked) = rx.recv().await else { return };
+            match clicked.as_str() {
+                "update" => this.update(cx, |this, cx| this.install_update(cx)).ok(),
+                "download" => cx.update(|cx| cx.open_url(&url)).ok(),
+                // A click on the notification itself.
+                "default" => cx.update(show_window).ok(),
+                _ => None,
+            };
+        })
+        .detach();
+    }
+
+    /// Swaps in the available update, then offers to restart into it.
+    fn install_update(&mut self, cx: &mut Context<Self>) {
+        let Some(Update::Available(release)) = self.update.clone() else {
+            return;
+        };
+        self.update = Some(Update::Installing(release.version.clone()));
+        self.sync_tray();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn({
+                    let release = release.clone();
+                    async move { updater::install(&release) }
+                })
+                .await;
+            let updated = this.update(cx, |this, cx| {
+                this.update = Some(match &result {
+                    Ok(path) => {
+                        // Linux relaunches the executable path, which
+                        // reads as deleted once it was replaced.
+                        cx.set_restart_path(path.clone());
+                        Update::Ready(release.version.clone())
+                    }
+                    Err(err) => {
+                        eprintln!("could not install update: {err:#}");
+                        Update::Manual(release.clone())
+                    }
+                });
+                this.sync_tray();
+                cx.notify();
+            });
+            if updated.is_err() {
+                return;
+            }
+            match result {
+                Ok(_) => ask_restart(&release.version, cx).await,
+                Err(err) => {
+                    let answer = ask(
+                        cx,
+                        PromptLevel::Warning,
+                        "Could not install the update",
+                        &format!("{err:#}"),
+                        &[PromptButton::ok("Download"), PromptButton::cancel("Later")],
+                    )
+                    .await;
+                    if answer == Some(0) {
+                        cx.update(|cx| cx.open_url(&release.url)).ok();
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
     fn sync_tray(&mut self) {
         let Some(tray) = &self.tray else { return };
-        let ready = match &self.update {
-            Some(Update::Ready(version)) => Some(version),
-            _ => None,
+        let item = match &self.update {
+            _ if self.update_check.is_some() => UpdateItem::Checking,
+            Some(Update::Available(release)) => UpdateItem::Available(&release.version),
+            Some(Update::Installing(version)) => UpdateItem::Installing(version),
+            Some(Update::Ready(version)) => UpdateItem::Ready(version),
+            Some(Update::Manual(_)) | None => UpdateItem::Check,
         };
-        if let Err(err) = tray.update(&self.store.pending, ready) {
+        if let Err(err) = tray.update(&self.store.pending, item) {
             self.error = Some(format!("could not update tray menu: {err:#}"));
         }
     }
@@ -458,17 +653,28 @@ impl Octowatcher {
 
     fn render_update(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (message, action) = match self.update.as_ref()? {
+            Update::Available(release) => (
+                format!("Octowatcher {} is available.", release.version),
+                Some(button("install-update", "Update").on_click(
+                    cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx)),
+                )),
+            ),
+            Update::Installing(version) => (format!("Installing Octowatcher {version}…"), None),
             Update::Ready(version) => (
                 format!("Octowatcher {version} is installed."),
-                button("restart", "Restart")
-                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
+                Some(
+                    button("restart", "Restart")
+                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
+                ),
             ),
             Update::Manual(release) => {
                 let url = release.url.clone();
                 (
                     format!("Octowatcher {} is available.", release.version),
-                    button("download-update", "Download")
-                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url))),
+                    Some(
+                        button("download-update", "Download")
+                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url))),
+                    ),
                 )
             }
         };
@@ -483,7 +689,7 @@ impl Octowatcher {
                 .bg(rgb(theme::SURFACE))
                 .text_xs()
                 .child(message)
-                .child(action),
+                .children(action),
         )
     }
 
@@ -775,6 +981,61 @@ fn main() {
 struct MainView(Entity<Octowatcher>);
 
 impl Global for MainView {}
+
+/// Checks for a new release now, from the tray.
+pub fn check_for_updates(cx: &mut App) {
+    let view = cx.global::<MainView>().0.clone();
+    view.update(cx, |this, cx| this.check_for_updates(true, cx));
+}
+
+/// Installs the available update, from the tray.
+pub fn install_update(cx: &mut App) {
+    let view = cx.global::<MainView>().0.clone();
+    view.update(cx, |this, cx| this.install_update(cx));
+}
+
+/// Shows a dialog over the window, opening it first if it was closed, and
+/// resolves to the index of the button clicked. On macOS this is a native
+/// alert; Linux has none, so gpui draws one in the window.
+async fn ask(
+    cx: &mut AsyncApp,
+    level: PromptLevel,
+    message: &str,
+    detail: &str,
+    answers: &[PromptButton],
+) -> Option<usize> {
+    let answer = cx
+        .update(|cx| {
+            show_window(cx);
+            let window = *cx.windows().first()?;
+            window
+                .update(cx, |_, window, cx| {
+                    window.prompt(level, message, Some(detail), answers, cx)
+                })
+                .ok()
+        })
+        .ok()
+        .flatten()?;
+    answer.await.ok()
+}
+
+async fn ask_restart(version: &semver::Version, cx: &mut AsyncApp) {
+    let message = format!("Octowatcher {version} is installed");
+    let answer = ask(
+        cx,
+        PromptLevel::Info,
+        &message,
+        "Restart now to start using it?",
+        &[
+            PromptButton::ok("Restart Now"),
+            PromptButton::cancel("Later"),
+        ],
+    )
+    .await;
+    if answer == Some(0) {
+        cx.update(|cx| cx.restart()).ok();
+    }
+}
 
 /// Brings the window to the front, opening it again if it was closed.
 pub fn show_window(cx: &mut App) {

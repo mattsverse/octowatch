@@ -45,6 +45,13 @@ pub fn check() -> Result<Option<Release>> {
     }))
 }
 
+/// Whether `install` can swap the release in for the running copy, rather
+/// than the user fetching it from the release page.
+pub fn can_install(release: &Release) -> bool {
+    // A dev build would overwrite its own target dir with a release.
+    !cfg!(debug_assertions) && release.asset.is_some() && install_target().is_ok()
+}
+
 /// Downloads the release and swaps it in for the running copy, which keeps
 /// running the old build until it restarts. Returns the path to relaunch.
 pub fn install(release: &Release) -> Result<PathBuf> {

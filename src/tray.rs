@@ -11,10 +11,21 @@ use crate::store::PendingReview;
 const SHOW_ID: &str = "show";
 const QUIT_ID: &str = "quit";
 const RESTART_ID: &str = "restart";
+const CHECK_UPDATES_ID: &str = "check-updates";
+const INSTALL_ID: &str = "install-update";
 /// Menu ids for pull requests are their URL behind this prefix, so a click
 /// carries everything needed to open it.
 const OPEN_PREFIX: &str = "open:";
 const MAX_TITLE_CHARS: usize = 60;
+
+/// What the tray menu offers about updates.
+pub enum UpdateItem<'a> {
+    Check,
+    Checking,
+    Available(&'a Version),
+    Installing(&'a Version),
+    Ready(&'a Version),
+}
 
 /// The menu bar icon: its menu lists the pull requests waiting on a review,
 /// and its title shows how many there are.
@@ -32,16 +43,16 @@ impl Tray {
         let builder = builder.with_icon(tray_icon());
         let icon = builder
             .with_tooltip("Octowatcher")
-            .with_menu(Box::new(build_menu(pending, None)?))
+            .with_menu(Box::new(build_menu(pending, UpdateItem::Check)?))
             .build()?;
         let tray = Self { icon };
         tray.set_count(pending.len());
         Ok(tray)
     }
 
-    /// `ready` is the version of an installed update waiting on a restart.
-    pub fn update(&self, pending: &[PendingReview], ready: Option<&Version>) -> Result<()> {
-        self.icon.set_menu(Some(Box::new(build_menu(pending, ready)?)));
+    pub fn update(&self, pending: &[PendingReview], update: UpdateItem) -> Result<()> {
+        self.icon
+            .set_menu(Some(Box::new(build_menu(pending, update)?)));
         self.set_count(pending.len());
         Ok(())
     }
@@ -66,6 +77,10 @@ pub fn listen(cx: &mut App) {
                 cx.update(crate::show_window)
             } else if id == RESTART_ID {
                 cx.update(|cx| cx.restart())
+            } else if id == CHECK_UPDATES_ID {
+                cx.update(crate::check_for_updates)
+            } else if id == INSTALL_ID {
+                cx.update(crate::install_update)
             } else if id == QUIT_ID {
                 cx.update(|cx| cx.quit())
             } else if let Some(url) = id.strip_prefix(OPEN_PREFIX) {
@@ -81,7 +96,7 @@ pub fn listen(cx: &mut App) {
     .detach();
 }
 
-fn build_menu(pending: &[PendingReview], ready: Option<&Version>) -> Result<Menu> {
+fn build_menu(pending: &[PendingReview], update: UpdateItem) -> Result<Menu> {
     let menu = Menu::new();
     if pending.is_empty() {
         menu.append(&MenuItem::new("Nothing waiting on your review.", false, None))?;
@@ -102,10 +117,23 @@ fn build_menu(pending: &[PendingReview], ready: Option<&Version>) -> Result<Menu
         ))?;
     }
     menu.append(&PredefinedMenuItem::separator())?;
-    if let Some(version) = ready {
-        let label = format!("Restart to Update to {version}");
-        menu.append(&MenuItem::with_id(RESTART_ID, label, true, None))?;
-    }
+    let item = match update {
+        UpdateItem::Check => MenuItem::with_id(CHECK_UPDATES_ID, "Check for Updates…", true, None),
+        UpdateItem::Checking => MenuItem::new("Checking for Updates…", false, None),
+        UpdateItem::Available(version) => {
+            MenuItem::with_id(INSTALL_ID, format!("Update to {version}"), true, None)
+        }
+        UpdateItem::Installing(version) => {
+            MenuItem::new(format!("Installing {version}…"), false, None)
+        }
+        UpdateItem::Ready(version) => MenuItem::with_id(
+            RESTART_ID,
+            format!("Restart to Update to {version}"),
+            true,
+            None,
+        ),
+    };
+    menu.append(&item)?;
     menu.append(&MenuItem::with_id(SHOW_ID, "Open Octowatcher", true, None))?;
     menu.append(&MenuItem::with_id(QUIT_ID, "Quit Octowatcher", true, None))?;
     Ok(menu)
