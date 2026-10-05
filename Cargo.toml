@@ -1,6 +1,6 @@
 [package]
 name = "octowatcher"
-version = "0.0.1"
+version = "0.0.0"
 edition = "2024"
 description = "Watches your local GitHub repositories for pull requests waiting on your review"
 license = "MIT"
@@ -48,3 +48,14 @@ deb_depends = [
 
 [package.metadata.bundle.linux]
 startup_wm_class = "octowatcher"
+
+# cargo-bundle cannot build rpms yet, so cargo-generate-rpm does. Library
+# requirements are worked out from the binary.
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/octowatcher", dest = "/usr/bin/octowatcher", mode = "755" },
+    { source = "packaging/linux/octowatcher.desktop", dest = "/usr/share/applications/octowatcher.desktop", mode = "644" },
+    { source = "assets/icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/octowatcher.png", mode = "644" },
+    { source = "assets/icons/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/octowatcher.png", mode = "644" },
+    { source = "assets/icons/512x512.png", dest = "/usr/share/icons/hicolor/512x512/apps/octowatcher.png", mode = "644" },
+]

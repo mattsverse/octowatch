@@ -133,7 +133,7 @@ impl Pr {
     }
 }
 
-fn gh(args: &[&str]) -> Result<String> {
+pub fn gh(args: &[&str]) -> Result<String> {
     let output = Command::new(gh_binary())
         .args(args)
         .output()

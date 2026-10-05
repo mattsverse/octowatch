@@ -2,6 +2,7 @@ mod discovery;
 mod github;
 mod store;
 mod tray;
+mod updater;
 
 use std::{collections::{HashMap, HashSet}, path::PathBuf, time::Duration};
 
@@ -15,8 +16,10 @@ use gpui::{
 use discovery::LocalRepo;
 use store::{PendingReview, Store};
 use tray::Tray;
+use updater::Release;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(120);
+const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 actions!(octowatcher, [Quit]);
 
@@ -33,6 +36,13 @@ mod theme {
     pub const RED: u32 = 0xf38ba8;
 }
 
+enum Update {
+    /// Installed over the running copy; a restart switches to it.
+    Ready(semver::Version),
+    /// Couldn't be installed in place; the release page has it.
+    Manual(Release),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Reviews,
@@ -47,9 +57,11 @@ struct Octowatcher {
     last_checked: Option<DateTime<Local>>,
     error: Option<String>,
     tray: Option<Tray>,
+    update: Option<Update>,
     scan_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
     _poll_task: Task<()>,
+    _update_task: Task<()>,
 }
 
 impl Octowatcher {
@@ -60,6 +72,55 @@ impl Octowatcher {
                     break;
                 }
                 cx.background_executor().timer(POLL_INTERVAL).await;
+            }
+        });
+        let update_task = cx.spawn(async move |this, cx| {
+            // A dev build would overwrite its own target dir with a release.
+            if cfg!(debug_assertions) {
+                return;
+            }
+            loop {
+                let checked = cx.background_executor().spawn(async { updater::check() }).await;
+                match checked {
+                    Ok(Some(release)) => {
+                        let Ok(installed) = this.read_with(cx, |this, _| {
+                            matches!(&this.update, Some(Update::Ready(v)) if *v >= release.version)
+                        }) else {
+                            break;
+                        };
+                        if !installed {
+                            let result = cx
+                                .background_executor()
+                                .spawn({
+                                    let release = release.clone();
+                                    async move { updater::install(&release) }
+                                })
+                                .await;
+                            let updated = this.update(cx, |this, cx| {
+                                this.update = Some(match result {
+                                    Ok(path) => {
+                                        // Linux relaunches the executable path, which
+                                        // reads as deleted once it was replaced.
+                                        cx.set_restart_path(path);
+                                        Update::Ready(release.version)
+                                    }
+                                    Err(err) => {
+                                        eprintln!("could not install update: {err:#}");
+                                        Update::Manual(release)
+                                    }
+                                });
+                                this.sync_tray();
+                                cx.notify();
+                            });
+                            if updated.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => eprintln!("could not check for updates: {err:#}"),
+                }
+                cx.background_executor().timer(UPDATE_INTERVAL).await;
             }
         });
         let store = Store::load();
@@ -74,9 +135,11 @@ impl Octowatcher {
             last_checked: None,
             error,
             tray,
+            update: None,
             scan_task: None,
             fetch_task: None,
             _poll_task: poll_task,
+            _update_task: update_task,
         };
         this.rescan(cx);
         this
@@ -238,7 +301,11 @@ impl Octowatcher {
 
     fn sync_tray(&mut self) {
         let Some(tray) = &self.tray else { return };
-        if let Err(err) = tray.update(&self.store.pending) {
+        let ready = match &self.update {
+            Some(Update::Ready(version)) => Some(version),
+            _ => None,
+        };
+        if let Err(err) = tray.update(&self.store.pending, ready) {
             self.error = Some(format!("could not update tray menu: {err:#}"));
         }
     }
@@ -350,6 +417,7 @@ impl Octowatcher {
                     .text_color(rgb(theme::RED))
                     .child(err)
             }))
+            .children(self.render_update(cx))
             .child(
                 div()
                     .flex()
@@ -365,6 +433,37 @@ impl Octowatcher {
                         cx,
                     )),
             )
+    }
+
+    fn render_update(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (message, action) = match self.update.as_ref()? {
+            Update::Ready(version) => (
+                format!("Octowatcher {version} is installed."),
+                button("restart", "Restart")
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
+            ),
+            Update::Manual(release) => {
+                let url = release.url.clone();
+                (
+                    format!("Octowatcher {} is available.", release.version),
+                    button("download-update", "Download")
+                        .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url))),
+                )
+            }
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .bg(rgb(theme::SURFACE))
+                .text_xs()
+                .child(message)
+                .child(action),
+        )
     }
 
     fn render_tab(&self, tab: Tab, label: String, cx: &mut Context<Self>) -> impl IntoElement {
