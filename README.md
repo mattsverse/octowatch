@@ -32,11 +32,13 @@ Download the latest build from the [releases page](https://github.com/mattsverse
 ### macOS
 
 1. Open the `.dmg` and drag **Octowatcher** into **Applications**.
-2. The app isn't notarized, so the first launch may be blocked. If it is, right-click the app and choose **Open**, or run:
+2. Open **Octowatcher** from Applications.
 
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Octowatcher.app
-   ```
+Older, unnotarized releases may be blocked on first launch. For those builds, run:
+
+```sh
+xattr -dr com.apple.quarantine /Applications/Octowatcher.app
+```
 
 The build is universal and runs on both Apple silicon and Intel Macs.
 
@@ -127,6 +129,34 @@ On macOS, notification permission and delivery require a signed `.app` bundle; t
 cargo install cargo-bundle
 cargo bundle --release
 ```
+
+## Releasing
+
+The Release workflow builds on `v*` tags. It can also be run manually to build
+and verify artifacts without publishing a release.
+
+The macOS job requires these repository secrets under **Settings → Secrets and
+variables → Actions**:
+
+| Secret | Value |
+| --- | --- |
+| `APPLE_CERTIFICATE_P12` | Base64-encoded Developer ID Application certificate and private key, exported as a `.p12` |
+| `APPLE_CERTIFICATE_PASSWORD` | The `.p12` export password |
+| `APPLE_ID` | Developer Apple Account email |
+| `APPLE_TEAM_ID` | The certificate's 10-character developer Team ID |
+| `APPLE_APP_SPECIFIC_PASSWORD` | An app-specific password for notarization |
+
+`packaging/macos/release.sh` signs the universal app with Hardened Runtime,
+submits it to Apple, and staples the notarization ticket before creating the
+self-update archive and DMG. It also signs, notarizes, and staples the DMG.
+Publication requires successful notarization and verification of both downloads.
+The temporary signing keychain and credentials are removed when the script exits.
+
+If Apple rejects a submission, the job prints its notarization log. Each submission
+waits up to 40 minutes; a timeout fails the job while Apple may continue processing.
+The submission ID in the job output can be used to check its status with
+`xcrun notarytool info`. Changing your Apple Account password revokes app-specific
+passwords, so update `APPLE_APP_SPECIFIC_PASSWORD` afterward.
 
 ## License
 

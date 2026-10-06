@@ -24,10 +24,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-bundle --version "$CARGO_BUNDLE_VERSION" --locked
       # Two targets are combined with lipo into one universal app.
-      - run: cargo bundle --release --format dmg -t aarch64-apple-darwin -t x86_64-apple-darwin
-      # The dmg is for first installs; self-updates swap in the bare bundle.
-      # COPYFILE_DISABLE keeps macOS metadata (._ files) out of the archive.
-      - run: COPYFILE_DISABLE=1 tar -C target/universal/release/bundle/dmg -czf octowatcher-macos.tar.gz Octowatcher.app
+      - run: cargo bundle --release --format osx -t aarch64-apple-darwin -t x86_64-apple-darwin
+      - name: Sign, notarize, and package macOS release
+        timeout-minutes: 90
+        env:
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: bash packaging/macos/release.sh
       - uses: actions/upload-artifact@v7
         with:
           name: macos
