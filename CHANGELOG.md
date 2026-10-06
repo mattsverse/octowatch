@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/mattsverse/octowatch/compare/v0.4.0...v0.4.1) (2026-10-06)
+
+
+### Bug Fixes
+
+* use com.matteogassend.octowatcher as the bundle identifier ([9f618eb](https://github.com/mattsverse/octowatch/commit/9f618eb10bcf8bdc91a6a0e3549b9e99cadbb1c4))
+
 ## [0.4.0](https://github.com/mattsverse/octowatch/compare/v0.3.0...v0.4.0) (2026-10-05)
 
 
