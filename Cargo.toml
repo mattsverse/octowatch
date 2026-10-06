@@ -22,7 +22,7 @@ tray-icon = "0.26"
 
 [package.metadata.bundle]
 name = "Octowatcher"
-identifier = "io.github.mattsverse.octowatcher"
+identifier = "com.matteogassend.octowatcher"
 icon = [
     "assets/icons/32x32.png",
     "assets/icons/32x32@2x.png",
