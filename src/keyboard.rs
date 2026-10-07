@@ -22,6 +22,15 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Control {
     Refresh,
+    HealthDetails,
+    InstallGh,
+    CopyLogin,
+    HealthFolders,
+    HealthAddRoot,
+    HealthRescan,
+    NotificationSettings,
+    HealthTestNotification,
+    HealthRefresh,
     Update,
     Tab(Tab),
     Search,
@@ -158,6 +167,12 @@ impl Keyboard {
                         .unwrap_or(0);
                     return Some(peers[index.min(peers.len() - 1)].clone());
                 }
+                if matches!(key, Control::Review(_) | Control::Snooze(_)) {
+                    let reset = Control::Filter("no-results-reset".into());
+                    if available.contains(&reset) {
+                        return Some(reset);
+                    }
+                }
                 let index = self.order.iter().position(|old| old == key).unwrap_or(0);
                 order.get(index.min(order.len().saturating_sub(1))).cloned()
             });
@@ -237,7 +252,10 @@ impl Keyboard {
         let Some(key) = self.focused(window) else {
             return;
         };
-        if matches!(key, Control::Refresh | Control::Update | Control::Tab(_)) {
+        if matches!(
+            key,
+            Control::Refresh | Control::HealthDetails | Control::Update | Control::Tab(_)
+        ) {
             return;
         }
         let Some(bounds) = self.targets[&key].bounds.get() else {

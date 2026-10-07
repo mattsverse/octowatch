@@ -536,6 +536,8 @@ fn paginated_queries_use_each_hosts_current_viewer_and_team_membership() {
                 }
                 query => panic!("unexpected query: {query}"),
             };
+            let mut data = data;
+            data["viewer"] = json!({"login": viewer});
             Ok(json!({"data": data}).to_string())
         })
         .unwrap();
@@ -582,7 +584,9 @@ fn host_authentication_and_schema_failures_preserve_other_repositories() {
             if args[3] == "user" {
                 return Ok("me".into());
             }
-            Ok(json!({"data": repository(vec![], None)}).to_string())
+            let mut data = repository(vec![], None);
+            data["viewer"] = json!({"login": "me"});
+            Ok(json!({"data": data}).to_string())
         })
         .unwrap();
         assert_eq!(fetched.completed_repos, HashSet::from([healthy]));
@@ -876,4 +880,246 @@ fn cli_output_drains_large_responses_and_preserves_failure_details() {
     assert!(output.status.success());
     assert_eq!(output.stdout.len(), 131072);
     assert_eq!(output.stderr.len(), 131072);
+}
+
+#[test]
+fn zero_repositories_probes_auth_without_claiming_a_successful_review_sync() {
+    for (login, expected) in [
+        (Ok("alice\n".into()), Readiness::Ready("alice".into())),
+        (Err(anyhow::anyhow!("HTTP 401")), Readiness::SignedOut),
+    ] {
+        let mut login = Some(login);
+        let fetched = fetch_repositories_with(&HashSet::new(), |args| {
+            assert_eq!(
+                args,
+                ["api", "--hostname", PUBLIC_HOST, "user", "--jq", ".login"]
+            );
+            login.take().expect("only one readiness probe")
+        })
+        .unwrap();
+        assert_eq!(fetched.readiness[PUBLIC_HOST], expected);
+        assert!(fetched.pending.is_empty());
+        assert!(fetched.completed_repos.is_empty());
+        assert!(fetched.successful_hosts.is_empty());
+        let mut store = crate::store::Store::default();
+        let mut health = crate::health::SyncHealth::default();
+        health.apply_hosts(&fetched, &mut store, 100);
+        assert_eq!(store.last_successful_sync, None);
+        assert!(!health.verified);
+    }
+}
+
+#[test]
+fn missing_signed_out_and_offline_cli_checks_preserve_success_time_and_recover() {
+    let watched = HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]);
+    for (script, expected) in [
+        (None, Readiness::Missing),
+        (
+            Some("printf 'HTTP 401: gh auth login' >&2; exit 1"),
+            Readiness::SignedOut,
+        ),
+        (
+            Some("printf 'dial tcp: network is unreachable' >&2; exit 1"),
+            Readiness::Offline,
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-gh");
+        let mut store = crate::store::Store::default();
+        store.activate_host_account(PUBLIC_HOST, "me");
+        store.last_successful_sync = Some(100);
+        let failed = fetch_repositories_with(&watched, |_| {
+            let mut command = if let Some(script) = script {
+                let mut command = Command::new("/bin/sh");
+                command.args(["-c", script]);
+                command
+            } else {
+                Command::new(&path)
+            };
+            gh_output(
+                &["api"],
+                command_output(&mut command, Duration::from_secs(2))?,
+            )
+        })
+        .unwrap();
+        assert_eq!(failed.readiness[PUBLIC_HOST], expected);
+        assert!(failed.completed_repos.is_empty());
+        let mut health = crate::health::SyncHealth::default();
+        health.apply_hosts(&failed, &mut store, 200);
+        assert_eq!(store.last_successful_sync, Some(100));
+        assert!(!health.verified);
+        let recovered = fetch_repositories_with(&watched, |args| {
+            if args[3] == "user" {
+                return Ok("me".into());
+            }
+            let mut data = repository(vec![], None);
+            data["viewer"] = json!({"login": "me"});
+            Ok(json!({"data": data}).to_string())
+        })
+        .unwrap();
+        health.apply_hosts(&recovered, &mut store, 300);
+        assert!(health.verified);
+        assert_eq!(store.last_successful_sync, Some(300));
+    }
+}
+
+#[test]
+fn account_change_on_a_history_page_discards_host_results_and_old_account_cache() {
+    let watched = HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]);
+    let fetched = fetch_repositories_with(&watched, |args| {
+        if args[3] == "user" { return Ok("me".into()); }
+        let query = args.iter().find_map(|arg| arg.strip_prefix("query=")).unwrap();
+        let mut data = if query == REPOSITORY_QUERY {
+            let mut data = repository(vec![pr(1, vec![user("me")])], None);
+            data["viewer"] = json!({"login": "me"});
+            data
+        } else {
+            json!({"viewer": {"login": "new-account"}, "node": {"timelineItems": page(vec![requested(user("me"), T2)], None)}})
+        };
+        // Keep the actual account identity present on each response.
+        assert!(data.get_mut("viewer").is_some());
+        Ok(json!({"data": data}).to_string())
+    }).unwrap();
+    assert_eq!(
+        fetched.readiness[PUBLIC_HOST],
+        Readiness::Ready("new-account".into())
+    );
+    assert!(fetched.pending.is_empty());
+    assert!(fetched.completed_repos.is_empty());
+    assert!(fetched.successful_hosts.is_empty());
+    assert!(
+        fetched
+            .errors
+            .iter()
+            .any(|error| error.contains("account changed"))
+    );
+    let mut store = crate::store::Store::default();
+    store.activate_host_account(PUBLIC_HOST, "me");
+    store.pending = vec![PendingReview {
+        host: PUBLIC_HOST.into(),
+        account: "me".into(),
+        account_id: 1,
+        repo: "o/r".into(),
+        number: 1,
+        title: "Old account".into(),
+        author: "author".into(),
+        url: "https://github.com/o/r/pull/1".into(),
+        is_draft: false,
+        rereview: false,
+        requested_at: Some(T1.into()),
+    }];
+    store.queue_notifications(&store.pending.clone());
+    store.snooze(&store.pending[0].key(), 30, 1_000);
+    store.last_successful_sync = Some(100);
+    let mut health = crate::health::SyncHealth::default();
+    assert!(
+        health
+            .apply_hosts(&fetched, &mut store, 200)
+            .contains(PUBLIC_HOST)
+    );
+    assert!(store.pending.is_empty());
+    assert!(store.snoozed.is_empty());
+    assert!(store.notification_queue.is_empty());
+    assert_eq!(store.last_successful_sync, None);
+    assert!(!health.verified);
+}
+
+#[test]
+fn response_without_viewer_is_not_accepted_as_an_empty_success() {
+    let watched = HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]);
+    let fetched = fetch_repositories_with(&watched, |args| {
+        if args[3] == "user" {
+            return Ok("me".into());
+        }
+        Ok(json!({"data": repository(vec![], None)}).to_string())
+    })
+    .unwrap();
+    assert!(fetched.completed_repos.is_empty());
+    assert!(fetched.successful_hosts.is_empty());
+    assert!(fetched.errors[0].contains("omitted the active account"));
+}
+
+#[test]
+fn request_beyond_twenty_events_ends_old_snooze_and_queues_one_fresh_alert() {
+    let watched = HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]);
+    let mut store = crate::store::Store::default();
+    store.activate_host_account(PUBLIC_HOST, "me");
+    let old = PendingReview {
+        host: PUBLIC_HOST.into(),
+        account: "me".into(),
+        account_id: 1,
+        repo: "o/r".into(),
+        number: 1,
+        title: "Review 1".into(),
+        author: "author".into(),
+        url: "https://github.com/o/r/pull/1".into(),
+        is_draft: false,
+        rereview: false,
+        requested_at: Some(T1.into()),
+    };
+    store.local_repos.insert("o/r".into());
+    store.available_accounts.insert("me".into());
+    store.reconcile(vec![old.clone()], &BTreeMap::from([("me".into(), 1)]));
+    store.mark_delivered(&store.notification_queue.clone());
+    store.snooze(&old.key(), 30, 1_000);
+    let fetched = fetch_repositories_with(&watched, |args| {
+        if args[3] == "user" {
+            return Ok("me".into());
+        }
+        let field = |name: &str| {
+            args.iter()
+                .find_map(|arg| arg.strip_prefix(&format!("{name}=")))
+        };
+        let mut data = if field("query") == Some(REPOSITORY_QUERY) {
+            repository(vec![pr(1, vec![user("me")])], None)
+        } else if field("after").is_none() {
+            let mut events = vec![requested(user("me"), T1)];
+            events.extend((0..20).map(|_| requested(user("another-reviewer"), T3)));
+            json!({"node": {"timelineItems": page(events, Some("older-request-page"))}})
+        } else {
+            assert_eq!(field("after"), Some("older-request-page"));
+            json!({"node": {"timelineItems": page(vec![requested(user("me"), T2)], None)}})
+        };
+        data["viewer"] = json!({"login": "me"});
+        Ok(json!({"data": data}).to_string())
+    })
+    .unwrap();
+    assert!(fetched.errors.is_empty());
+    let pending = fetched
+        .pending
+        .into_iter()
+        .map(|mut pr| {
+            pr.account = "me".into();
+            pr.account_id = 1;
+            pr
+        })
+        .collect();
+    let changed = store.reconcile_repositories(pending, &fetched.completed_repos, &watched);
+    assert_eq!(changed.fresh.len(), 1);
+    assert!(store.snoozed.is_empty());
+    assert_eq!(store.notifications_due().len(), 1);
+    assert_eq!(store.pending[0].requested_at.as_deref(), Some(T2));
+}
+
+#[test]
+fn partial_graphql_error_still_invalidates_a_detected_account_change() {
+    let watched = HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]);
+    let fetched = fetch_repositories_with(&watched, |args| {
+        if args[3] == "user" {
+            return Ok("me".into());
+        }
+        Ok(
+            json!({"data": {"viewer": {"login": "new-account"}, "repository": null},
+            "errors": [{"message": "Repository unavailable"}]})
+            .to_string(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        fetched.readiness[PUBLIC_HOST],
+        Readiness::Ready("new-account".into())
+    );
+    assert!(fetched.completed_repos.is_empty());
+    assert!(fetched.successful_hosts.is_empty());
+    assert!(fetched.errors[0].contains("account changed"));
 }

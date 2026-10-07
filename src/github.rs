@@ -67,6 +67,26 @@ fn parse_hosts(output: &str) -> Result<Vec<String>> {
     Ok(hosts.into_iter().collect())
 }
 
+const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Readiness {
+    #[default]
+    Checking,
+    Missing,
+    NotRunnable,
+    SignedOut,
+    Offline,
+    Unavailable,
+    Ready(String),
+}
+
+#[cfg(test)]
+pub struct Check {
+    pub readiness: Readiness,
+    pub reviews: Result<Vec<PendingReview>>,
+}
+
 mod queue;
 pub use queue::FetchedReviews;
 
@@ -79,7 +99,7 @@ pub fn fetch_awaiting_reviews(repos: &HashSet<RepositoryId>) -> Result<FetchedRe
 fn gh_request(args: &[&str]) -> Result<String> {
     let mut command = Command::new(gh_binary());
     command.args(args);
-    let output = command_output(&mut command, Duration::from_secs(60))
+    let output = command_output(&mut command, Duration::from_secs(30))
         .with_context(|| format!("gh {} request failed", args.first().unwrap_or(&"")))?;
     gh_output(args, output)
 }
@@ -101,6 +121,9 @@ fn gh_output(args: &[&str], output: Output) -> Result<String> {
 fn command_output(command: &mut Command, timeout: Duration) -> Result<Output> {
     let deadline = Instant::now() + timeout;
     let mut child = command
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_PAGER", "cat")
+        .env_remove("GH_DEBUG")
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -233,13 +256,31 @@ const ACCESS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 trait GhRunner {
     /// `token` lives only for this invocation, never in command arguments.
     fn run(&self, args: &[&str], token: Option<&str>) -> Result<String>;
+    fn begin_check(&self) {}
 }
 
-struct Cli;
+struct Cli(std::cell::Cell<Instant>);
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self(std::cell::Cell::new(Instant::now()))
+    }
+}
 
 impl GhRunner for Cli {
+    fn begin_check(&self) {
+        self.0.set(Instant::now());
+    }
     fn run(&self, args: &[&str], token: Option<&str>) -> Result<String> {
-        run_command(command(args, token), token)
+        let remaining = CHECK_TIMEOUT.saturating_sub(self.0.get().elapsed());
+        if remaining.is_zero() {
+            bail!("GitHub account check timed out after 60 seconds. Refresh to retry.");
+        }
+        run_command_with_timeout(
+            command(args, token),
+            token,
+            remaining.min(Duration::from_secs(30)),
+        )
     }
 }
 
@@ -303,7 +344,7 @@ fn credential(runner: &impl GhRunner, account: &str, known_id: Option<u64>) -> R
 }
 
 pub fn poll(repos: &[String], preferences: Store, cache: AccessCache) -> Result<Poll> {
-    poll_with(&Cli, repos, preferences, cache, Instant::now())
+    poll_with(&Cli::default(), repos, preferences, cache, Instant::now())
 }
 
 fn poll_with(
@@ -318,6 +359,7 @@ fn poll_with(
     let mut checks = Vec::new();
     let mut checked_ids = BTreeSet::new();
     for account in &mut accounts {
+        runner.begin_check();
         // Verify disabled identities too, so renames cannot re-enable them.
         let identity = if account.state != "success" {
             Err(anyhow::anyhow!(
@@ -431,8 +473,12 @@ fn fetch_account_reviews(
         .map(|repo| RepositoryId::new(PUBLIC_HOST, repo))
         .collect();
     let mut account_failure = None;
+    let mut identity_failed = false;
     // Share membership results only within this verified account's current poll.
     let result = queue::fetch_with(&repositories, me, &mut |query, variables| {
+        if identity_failed {
+            bail!("Credential identity changed during this check; Refresh to retry.");
+        }
         let mut args = vec![
             "api".to_string(),
             "graphql".into(),
@@ -446,6 +492,37 @@ fn fetch_account_reviews(
             &args.iter().map(String::as_str).collect::<Vec<_>>(),
             Some(token),
         );
+        let result = result.and_then(|output| {
+            let value: serde_json::Value = serde_json::from_str(&output)?;
+            let viewer = value.pointer("/data/viewer").and_then(|viewer| {
+                Some((
+                    viewer
+                        .get("login")?
+                        .as_str()
+                        .filter(|login| !login.is_empty())?,
+                    viewer.get("databaseId")?.as_u64()?,
+                ))
+            });
+            if let Some((login, id)) = viewer {
+                if id != session.viewer.id || !login.eq_ignore_ascii_case(me) {
+                    identity_failed = true;
+                    account_failure = Some(
+                        "Credential identity changed during this check; Refresh to retry.".into(),
+                    );
+                    bail!("Credential identity changed during this check; Refresh to retry.");
+                }
+            } else if value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                identity_failed = true;
+                account_failure =
+                    Some("GitHub response omitted the verified account; Refresh to retry.".into());
+                bail!("GitHub response omitted the verified account; Refresh to retry.");
+            }
+            Ok(output)
+        });
         if let Err(error) = &result {
             let message = format!("{error:#}");
             let lower = message.to_lowercase();
@@ -560,7 +637,7 @@ fn check_repo_access(
 /// Updates use saved github.com credentials independently of monitoring
 /// settings. Prefer the active healthy account, then try other saved accounts.
 pub fn gh(args: &[&str]) -> Result<String> {
-    update_gh(&Cli, args)
+    update_gh(&Cli::default(), args)
 }
 
 fn update_gh(runner: &impl GhRunner, args: &[&str]) -> Result<String> {
@@ -568,6 +645,7 @@ fn update_gh(runner: &impl GhRunner, args: &[&str]) -> Result<String> {
     accounts.sort_by_key(|a| !a.active);
     let mut last_error = None;
     for account in accounts.iter().filter(|a| a.state == "success") {
+        runner.begin_check();
         match credential(runner, &account.login, None)
             .and_then(|session| runner.run(args, Some(&session.token)))
         {
@@ -601,7 +679,8 @@ fn command(args: &[&str], token: Option<&str>) -> Command {
     command
         .env("GH_HOST", "github.com")
         .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_NO_UPDATE_NOTIFIER", "1");
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_PAGER", "cat");
     if let Some(token) = token {
         command.env("GH_TOKEN", token);
     }
@@ -615,18 +694,25 @@ fn command(args: &[&str], token: Option<&str>) -> Command {
     command
 }
 
-fn run_command(mut command: Command, token: Option<&str>) -> Result<String> {
-    let output = if command
-        .get_args()
-        .next()
-        .is_some_and(|arg| arg == "release")
-    {
-        command
-            .output()
-            .context("could not run `gh`; is the GitHub CLI installed?")?
-    } else {
-        command_output(&mut command, Duration::from_secs(60))?
-    };
+#[cfg(test)]
+fn run_command(command: Command, token: Option<&str>) -> Result<String> {
+    run_command_with_timeout(command, token, Duration::from_secs(30))
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    token: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let download = command.get_args().any(|arg| arg == "download");
+    let output = command_output(
+        &mut command,
+        if download {
+            Duration::from_secs(10 * 60)
+        } else {
+            timeout
+        },
+    )?;
     if !output.status.success() {
         let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if let Some(token) = token {
@@ -635,6 +721,60 @@ fn run_command(mut command: Command, token: Option<&str>) -> Result<String> {
         bail!("gh failed: {error}");
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+pub fn classify_failure(err: &anyhow::Error) -> Readiness {
+    let message = format!("{err:#}").to_lowercase();
+    if message.contains("could not run `gh`") && message.contains("no such file or directory") {
+        return Readiness::Missing;
+    }
+    if err
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Readiness::Missing;
+    }
+    if err
+        .chain()
+        .any(|cause| cause.to_string().starts_with("could not run `gh`"))
+    {
+        return Readiness::NotRunnable;
+    }
+    if is_connection_error(err) {
+        return Readiness::Offline;
+    }
+    if message.contains("http 401")
+        || message.contains("authentication unavailable")
+        || message.contains("credential identity changed")
+        || message.contains("gh auth login")
+        || message.contains("authentication token")
+        || message.contains("no saved credential")
+        || message.contains("saved credential unavailable")
+    {
+        Readiness::SignedOut
+    } else {
+        Readiness::Unavailable
+    }
+}
+
+/// `gh` reports transport failures as text; only recognizable transport
+/// diagnostics establish unreachable status. Other failures remain generic.
+pub fn is_connection_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_lowercase();
+    [
+        "network is unreachable",
+        "no such host",
+        "could not resolve host",
+        "dial tcp",
+        "connection refused",
+        "connection reset",
+        "tls handshake timeout",
+        "i/o timeout",
+        "error connecting to api.github.com",
+        "check your internet connection",
+    ]
+    .iter()
+    .any(|hint| message.contains(hint))
 }
 
 /// Apps launched from Finder get a bare PATH, so look in the usual places too.
@@ -730,6 +870,18 @@ mod tests {
         }
 
         fn snapshot(&self, credential: &str, account: &str, repo: &str, output: &str) {
+            let account_id = if credential == "alice" { 1 } else { 2 };
+            self.snapshot_with_id(credential, account, account_id, repo, output);
+        }
+
+        fn snapshot_with_id(
+            &self,
+            credential: &str,
+            account: &str,
+            account_id: u64,
+            repo: &str,
+            output: &str,
+        ) {
             let response: serde_json::Value = serde_json::from_str(output).unwrap();
             let mut nodes = response["data"]["search"]["nodes"]
                 .as_array()
@@ -757,7 +909,7 @@ mod tests {
             let token = format!("fixture-token-{credential}");
             self.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY),
                 "-f", &format!("owner={owner}"), "-f", &format!("name={name}")], Some(&token),
-                Ok(serde_json::json!({"data":{"repository":{"nameWithOwner":repo,"isArchived":false,"pullRequests":{
+                Ok(serde_json::json!({"data":{"viewer":{"login":account,"databaseId":account_id},"repository":{"nameWithOwner":repo,"isArchived":false,"pullRequests":{
                     "nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}
                 }}}}).to_string()));
             for (id, nodes) in histories {
@@ -771,19 +923,18 @@ mod tests {
                         &format!("id={id}"),
                     ],
                     Some(&token),
-                    Ok(serde_json::json!({"data":{"node":{"timelineItems":{
+                    Ok(serde_json::json!({"data":{"viewer":{"login":account,"databaseId":account_id},"node":{"timelineItems":{
                         "nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}
                     }}}})
                     .to_string()),
                 );
             }
-            let _ = account; // Identity is already verified separately; request fixtures carry reviewer names.
         }
 
         fn successful(&self, account: &str, id: u64) {
             self.identity(account, id);
             self.access(account, REPO, Ok(REPO.into()));
-            self.search(account, REVIEWS);
+            self.snapshot_with_id(account, account, id, REPO, REVIEWS);
         }
 
         fn finished(&self) {
@@ -813,6 +964,7 @@ mod tests {
 
     fn apply(store: &mut Store, poll: Poll) {
         store.available_accounts.clear();
+        store.stale_accounts.clear();
         store.unavailable_repos.clear();
         store.confirmed_requests.clear();
         for account in poll.accounts {
@@ -882,7 +1034,7 @@ mod tests {
             }
             script.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY),
                 "-f", "owner=owner", "-f", "name=repo", "-f", "after=next"],
-                Some(&format!("fixture-token-{account}")), Ok(serde_json::json!({"data":{"repository":{
+                Some(&format!("fixture-token-{account}")), Ok(serde_json::json!({"data":{"viewer":{"login":account,"databaseId":if account == "alice" {1} else {2}},"repository":{
                     "nameWithOwner":REPO,"isArchived":false,"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
                 }}}).to_string()));
         }
@@ -970,6 +1122,66 @@ mod tests {
         assert_eq!(store.pending.len(), 2);
         assert!(!store.snoozed.contains(&snooze));
         script.finished();
+    }
+
+    #[test]
+    fn changed_numeric_identity_on_a_history_page_invalidates_the_entire_account_check() {
+        let script = Script::default();
+        script.status(
+            r#"{"hosts":{"github.com":[{"login":"alice","state":"success","active":true}]}}"#,
+        );
+        script.identity("alice", 1);
+        script.access("alice", REPO, Ok(REPO.into()));
+        script.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY), "-f", "owner=owner", "-f", "name=repo"], Some("fixture-token-alice"),
+            Ok(serde_json::json!({"data":{"viewer":{"login":"alice","databaseId":1},"repository":{"nameWithOwner":REPO,"isArchived":false,"pullRequests":{
+                "pageInfo":{"hasNextPage":false,"endCursor":null}, "nodes":[{"id":"PR_7","number":7,"title":"Review","url":"https://github.com/owner/repo/pull/7","isDraft":false,"state":"OPEN","author":{"login":"author"},
+                "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"requestedReviewer":{"__typename":"User","login":"alice"}}]}}]
+            }}}}).to_string()));
+        script.step(&["api", "graphql", "-f", &format!("query={}", queue::HISTORY_QUERY), "-f", "id=PR_7"], Some("fixture-token-alice"),
+            Ok(serde_json::json!({"data":{"viewer":{"login":"alice","databaseId":99},"node":null}, "errors":[{"message":"Repository unavailable"}]}).to_string()));
+        let poll = poll_script(&script);
+        let error = poll.checks[0].reviews.as_ref().err().unwrap();
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(classify_failure(error), Readiness::SignedOut);
+        script.finished();
+    }
+
+    #[test]
+    fn public_response_with_empty_errors_still_requires_verified_viewer() {
+        let script = Script::default();
+        script.status(
+            r#"{"hosts":{"github.com":[{"login":"alice","state":"success","active":true}]}}"#,
+        );
+        script.identity("alice", 1);
+        script.access("alice", REPO, Ok(REPO.into()));
+        script.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY), "-f", "owner=owner", "-f", "name=repo"], Some("fixture-token-alice"),
+            Ok(serde_json::json!({"data":{"repository":{"nameWithOwner":REPO,"isArchived":false,"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}},"errors":[]}).to_string()));
+        let poll = poll_script(&script);
+        assert!(
+            poll.checks[0]
+                .reviews
+                .as_ref()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("omitted the verified account")
+        );
+        script.finished();
+    }
+
+    #[test]
+    fn account_deadline_expires_before_starting_another_subprocess() {
+        let runner = Cli(std::cell::Cell::new(Instant::now() - CHECK_TIMEOUT));
+        let error = runner.run(&["api", "user"], None).unwrap_err();
+        assert!(error.to_string().contains("timed out after 60 seconds"));
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!(
+                "Could not discover accounts: could not run `gh`; is the GitHub CLI installed?: No such file or directory (os error 2)"
+            )),
+            Readiness::Missing
+        );
+        runner.begin_check();
+        assert!(runner.0.get().elapsed() < Duration::from_secs(1));
     }
 
     #[test]

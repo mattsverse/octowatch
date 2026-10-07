@@ -1,14 +1,13 @@
 //! Complete, host-scoped repository snapshots independent of credential selection.
+use super::{CHECK_TIMEOUT, Readiness, classify_failure, command_output, gh_binary, gh_output};
 #[cfg(test)]
-use super::{check_cli_version, command_output, gh_output, known_hosts_with, parse_hosts};
-#[cfg(test)]
+use super::{check_cli_version, known_hosts_with, parse_hosts};
 use crate::repository::PUBLIC_HOST;
 use crate::{repository::RepositoryId, store::PendingReview};
 use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
-use std::collections::{BTreeSet, HashMap, HashSet};
-#[cfg(test)]
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::{
     process::Command,
     time::{Duration, Instant},
@@ -17,6 +16,7 @@ use std::{
 // 1,000-result ceiling and its dashboard qualifiers need not share API behavior.
 pub(super) const REPOSITORY_QUERY: &str = r#"
 query($owner: String!, $name: String!, $after: String) {
+  viewer { login databaseId }
   repository(owner: $owner, name: $name) {
     nameWithOwner
     isArchived
@@ -36,6 +36,7 @@ query($owner: String!, $name: String!, $after: String) {
 
 const REQUESTS_QUERY: &str = r#"
 query($id: ID!, $after: String) {
+  viewer { login databaseId }
   node(id: $id) {
     ... on PullRequest {
       reviewRequests(first: 100, after: $after) {
@@ -49,6 +50,7 @@ query($id: ID!, $after: String) {
 
 pub(super) const MEMBERS_QUERY: &str = r#"
 query($id: ID!, $me: String!, $after: String) {
+  viewer { login databaseId }
   node(id: $id) {
     ... on Team {
       members(first: 100, after: $after, query: $me, membership: ALL) {
@@ -62,6 +64,7 @@ query($id: ID!, $me: String!, $after: String) {
 
 pub(super) const HISTORY_QUERY: &str = r#"
 query($id: ID!, $after: String) {
+  viewer { login databaseId }
   node(id: $id) {
     ... on PullRequest {
       timelineItems(first: 100, after: $after, itemTypes: [REVIEW_REQUESTED_EVENT, PULL_REQUEST_REVIEW]) {
@@ -87,45 +90,82 @@ pub struct FetchedReviews {
     pub pending: Vec<PendingReview>,
     pub completed_repos: HashSet<RepositoryId>,
     pub errors: Vec<String>,
+    pub readiness: BTreeMap<String, Readiness>,
+    pub successful_hosts: BTreeSet<String>,
 }
 
 pub fn fetch_awaiting_reviews(repos: &HashSet<RepositoryId>) -> Result<FetchedReviews> {
-    fetch_repositories_with(repos, super::gh_request)
+    let mut active_host = String::new();
+    let mut started = Instant::now();
+    fetch_repositories_with(repos, |args| {
+        let host = args.get(2).copied().unwrap_or(PUBLIC_HOST);
+        if active_host != host {
+            active_host = host.into();
+            started = Instant::now();
+        }
+        let remaining = CHECK_TIMEOUT.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            bail!(
+                "GitHub check timed out after 60 seconds. Cached reviews remain unverified; Refresh to retry."
+            );
+        }
+        gh_output(
+            args,
+            command_output(
+                Command::new(gh_binary()).args(args),
+                remaining.min(Duration::from_secs(30)),
+            )?,
+        )
+    })
+}
+
+fn viewer_login(host: &str, run: &mut impl FnMut(&[&str]) -> Result<String>) -> Result<String> {
+    let login = run(&["api", "--hostname", host, "user", "--jq", ".login"]).with_context(|| {
+        format!("could not read viewer; check `gh auth status --hostname {host}`")
+    })?;
+    let login = login.trim();
+    if login.is_empty() {
+        bail!("GitHub returned no account");
+    }
+    Ok(login.into())
 }
 
 fn fetch_repositories_with(
     repos: &HashSet<RepositoryId>,
     mut run: impl FnMut(&[&str]) -> Result<String>,
 ) -> Result<FetchedReviews> {
-    let hosts: BTreeSet<_> = repos.iter().map(|repo| repo.host.clone()).collect();
+    let mut hosts: BTreeSet<_> = repos.iter().map(|repo| repo.host.clone()).collect();
+    // Zero repositories still needs CLI/auth setup details, but cannot establish
+    // that no reviews are waiting or advance the successful-sync timestamp.
+    if hosts.is_empty() {
+        hosts.insert(PUBLIC_HOST.into());
+    }
     let mut fetched = FetchedReviews::default();
     for host in hosts {
-        let me = run(&["api", "--hostname", &host, "user", "--jq", ".login"])
-            .with_context(|| {
-                format!("could not read viewer; check `gh auth status --hostname {host}`")
-            })
-            .and_then(|login| {
-                let login = login.trim().to_string();
-                if login.is_empty() {
-                    bail!(
-                        "`gh api user` returned no login; check `gh auth status --hostname {host}`"
-                    );
-                }
-                Ok(login)
-            });
-        let me = match me {
+        let me = match viewer_login(&host, &mut run) {
             Ok(me) => me,
             Err(err) => {
+                fetched
+                    .readiness
+                    .insert(host.clone(), classify_failure(&err));
                 fetched.errors.push(format!("{host}: {err:#}"));
                 continue;
             }
         };
-        let host_repos = repos
+        let mut readiness = Readiness::Ready(me.clone());
+        let host_repos: HashSet<_> = repos
             .iter()
             .filter(|repo| repo.host == host)
             .cloned()
             .collect();
+        if host_repos.is_empty() {
+            fetched.readiness.insert(host, readiness);
+            continue;
+        }
         let result = fetch_with(&host_repos, &me, &mut |query, variables| {
+            if readiness != Readiness::Ready(me.clone()) {
+                bail!("GitHub account changed during this check. Refresh to retry.");
+            }
             let mut args = vec![
                 "api".to_string(),
                 "--hostname".into(),
@@ -137,11 +177,38 @@ fn fetch_repositories_with(
             for (name, value) in variables {
                 args.extend(["-f".into(), format!("{name}={value}")]);
             }
-            run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+            let output = run(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+            let response: GraphqlResponse =
+                serde_json::from_str(&output).context("unexpected GitHub response")?;
+            let viewer = response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("viewer"))
+                .and_then(|viewer| viewer.get("login"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|login| !login.is_empty());
+            if let Some(viewer) = viewer {
+                if !viewer.eq_ignore_ascii_case(&me) {
+                    readiness = Readiness::Ready(viewer.into());
+                    bail!("GitHub account changed during this check. Refresh to retry.");
+                }
+            } else if response.errors.is_empty() {
+                bail!("GitHub response omitted the active account");
+            }
+            // Permission/schema errors explain absent viewer data. A valid
+            // changed viewer still invalidates old identity even with errors.
+            Ok(output)
         })?;
-        fetched.pending.extend(result.pending);
-        fetched.completed_repos.extend(result.completed_repos);
+        // Any page under another identity invalidates this entire host result.
+        if readiness == Readiness::Ready(me) {
+            if result.errors.is_empty() && result.completed_repos == host_repos {
+                fetched.successful_hosts.insert(host.clone());
+            }
+            fetched.pending.extend(result.pending);
+            fetched.completed_repos.extend(result.completed_repos);
+        }
         fetched.errors.extend(result.errors);
+        fetched.readiness.insert(host, readiness);
     }
     Ok(fetched)
 }

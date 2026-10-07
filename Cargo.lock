@@ -4156,6 +4156,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "tray-icon",
  "unicode-segmentation",
 ]
