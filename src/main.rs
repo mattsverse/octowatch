@@ -1,9 +1,11 @@
 mod discovery;
 mod github;
 mod health;
+mod instance;
 mod keyboard;
 #[cfg(test)]
 mod keyboard_tests;
+mod login;
 mod notifications;
 mod refresh_queue;
 mod repository;
@@ -114,6 +116,8 @@ struct Octowatcher {
     tray_error: Option<String>,
     save_error: Option<String>,
     notification_error: Option<String>,
+    login_state: login::State,
+    login_error: Option<String>,
     notifications_ready: bool,
     scan_error: Option<String>,
     account_errors: BTreeMap<String, String>,
@@ -130,6 +134,8 @@ struct Octowatcher {
     notification_tasks: HashMap<usize, Task<()>>,
     tray: Option<Tray>,
     update: Option<Update>,
+    #[cfg(target_os = "linux")]
+    restart_path: Option<PathBuf>,
     scan_task: Option<Task<()>>,
     refresh_queue: refresh_queue::RefreshQueue,
     fetch_task: Option<Task<()>>,
@@ -230,6 +236,9 @@ impl Octowatcher {
                         .map(Control::Account),
                 );
                 controls.extend(Appearance::CHOICES.map(Control::Appearance));
+                if !matches!(self.login_state, login::State::Unavailable(_)) {
+                    controls.push(Control::LaunchAtLogin);
+                }
                 controls.extend(POLL_CHOICES.map(Control::Poll));
                 controls.extend(SNOOZE_CHOICES.map(Control::SnoozeMinutes));
                 controls.extend([
@@ -342,7 +351,19 @@ impl Octowatcher {
                 cx.background_executor().timer(UPDATE_INTERVAL).await;
             }
         });
-        let (store, load_warning) = Store::load();
+        let (mut store, load_warning) = Store::load();
+        let (login_state, login_error) = match login::status() {
+            Ok(state) => {
+                if !matches!(state, login::State::Unavailable(_)) {
+                    store.launch_at_login = state.requested();
+                }
+                (state, None)
+            }
+            Err(err) => (
+                login::State::Off,
+                Some(format!("could not read launch at login: {err:#}")),
+            ),
+        };
         let review_delivery = Delivery::for_launch(&store);
         let review_search = cx.new(SearchInput::new);
         let search_subscription = cx.subscribe(
@@ -411,6 +432,8 @@ impl Octowatcher {
             tray_error,
             save_error: None,
             notification_error: None,
+            login_state,
+            login_error,
             notifications_ready: !cfg!(target_os = "macos"),
             scan_error: None,
             account_errors: BTreeMap::new(),
@@ -424,6 +447,8 @@ impl Octowatcher {
             notification_tasks: HashMap::new(),
             tray,
             update: None,
+            #[cfg(target_os = "linux")]
+            restart_path: None,
             scan_task: None,
             refresh_queue: refresh_queue::RefreshQueue::default(),
             fetch_task: None,
@@ -467,6 +492,41 @@ impl Octowatcher {
         }
         self.store.snooze_minutes = minutes;
         self.save();
+        cx.notify();
+    }
+
+    fn refresh_login_status(&mut self, cx: &mut Context<Self>) {
+        match login::status() {
+            Ok(state) => {
+                if !matches!(state, login::State::Unavailable(_))
+                    && self.store.launch_at_login != state.requested()
+                {
+                    self.store.launch_at_login = state.requested();
+                    self.save();
+                }
+                self.login_state = state;
+                self.login_error = None;
+            }
+            Err(err) => self.login_error = Some(format!("could not read launch at login: {err:#}")),
+        }
+        cx.notify();
+    }
+
+    fn toggle_login(&mut self, cx: &mut Context<Self>) {
+        // Refresh first in case the OS setting changed while our window was
+        // closed. A failed operation never records the requested change as done.
+        let changed = login::status().and_then(|state| login::set_enabled(!state.requested()));
+        match changed {
+            Ok(state) => {
+                self.store.launch_at_login = state.requested();
+                self.login_state = state;
+                self.login_error = None;
+                self.save();
+            }
+            Err(err) => {
+                self.login_error = Some(format!("could not change launch at login: {err:#}"))
+            }
+        }
         cx.notify();
     }
 
@@ -1442,6 +1502,10 @@ impl Octowatcher {
                         // Linux relaunches the executable path, which
                         // reads as deleted once it was replaced.
                         cx.set_restart_path(path.clone());
+                        #[cfg(target_os = "linux")]
+                        {
+                            this.restart_path = Some(path.clone());
+                        }
                         Update::Ready(release.version.clone())
                     }
                     Err(err) => {
@@ -1992,7 +2056,7 @@ impl Octowatcher {
                     format!("Octowatcher {version} is installed."),
                     Some(
                         self.button(Control::Update, "Restart", theme)
-                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| restart(cx))),
                     ),
                 ),
                 Update::Manual(release) => {
@@ -3036,6 +3100,63 @@ impl Octowatcher {
                             .child("System follows your desktop’s light or dark appearance."),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("Launch at login", theme))
+                    .child(match &self.login_state {
+                        login::State::Unavailable(reason) => div()
+                            .text_xs()
+                            .text_color(rgb(theme.muted_text))
+                            .child(reason.clone())
+                            .into_any_element(),
+                        state => {
+                            div()
+                                .flex()
+                                .child(
+                                    self.button(
+                                        Control::LaunchAtLogin,
+                                        match state {
+                                            login::State::On => "On",
+                                            login::State::NeedsApproval => "Awaiting approval",
+                                            login::State::NeedsRepair => "Repair",
+                                            _ => "Off",
+                                        },
+                                        theme,
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _: &ClickEvent, _, cx| this.toggle_login(cx),
+                                    )),
+                                )
+                                .into_any_element()
+                        }
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.secondary_text))
+                            .child("Start quietly in the tray when you sign in."),
+                    )
+                    .when(self.login_state == login::State::NeedsApproval, |row| {
+                        row.child(
+                            div().text_xs().text_color(rgb(theme.warning)).child(
+                                "Allow Octowatcher in System Settings → General → Login Items.",
+                            ),
+                        )
+                    })
+                    .when(self.login_state == login::State::NeedsRepair, |row| {
+                        row.child(
+                            div().text_xs().text_color(rgb(theme.warning)).child(
+                                "The startup command has changed. Repair it to start this copy at login.",
+                            ),
+                        )
+                    })
+                    .when_some(self.login_error.clone(), |row, error| {
+                        row.child(div().text_xs().text_color(rgb(theme.error)).child(error))
+                    }),
+            )
             .child(self.render_choices(
                 theme,
                 ("Check GitHub for review requests every", Control::Poll),
@@ -3370,10 +3491,19 @@ fn bind_review_keys(cx: &mut App) {
 }
 
 fn main() {
+    let instance = match instance::Instance::acquire(login::is_background_launch()) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return,
+        Err(err) => {
+            eprintln!("could not start Octowatcher: {err:#}");
+            std::process::exit(1);
+        }
+    };
+    let reopen = instance.reopen.clone();
     let app = Application::new();
     // Clicking the dock icon with the window closed brings it back.
     app.on_reopen(show_window);
-    app.run(|cx: &mut App| {
+    app.run(move |cx: &mut App| {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &Refresh, cx| refresh(cx));
         bind_review_keys(cx);
@@ -3391,9 +3521,26 @@ fn main() {
         // The app owns the state rather than the window, so closing the
         // window keeps polling and the tray icon alive until Quit.
         let octowatcher = cx.new(Octowatcher::new);
+        let show = login::should_show_window(
+            login::is_background_launch(),
+            octowatcher.read(cx).tray.is_some(),
+        );
         cx.set_global(MainView(octowatcher));
-        show_window(cx);
+        cx.spawn(async move |cx| {
+            while reopen.recv().await.is_ok() {
+                if cx.update(show_window).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        if show {
+            show_window(cx);
+        }
     });
+    // Keep the descriptor and IPC worker alive through the entire app loop,
+    // including window closure and the updater's wait-for-exit restart handoff.
+    drop(instance);
 }
 
 struct MainView(Entity<Octowatcher>);
@@ -3463,27 +3610,71 @@ async fn ask_restart(version: &semver::Version, cx: &mut AsyncApp) {
     )
     .await;
     if answer == Some(0) {
-        cx.update(|cx| cx.restart()).ok();
+        cx.update(restart).ok();
+    }
+}
+
+/// Restarts after the current process exits, retaining instance ownership until
+/// then. macOS keeps GPUI's native bundle relaunch; Linux quotes the target path.
+pub fn restart(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    cx.restart();
+    #[cfg(target_os = "linux")]
+    {
+        let view = cx.global::<MainView>().0.clone();
+        let path = view
+            .read(cx)
+            .restart_path
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(updater::running_executable);
+        match path.and_then(|path| updater::relaunch(&path)) {
+            Ok(()) => cx.quit(),
+            Err(err) => eprintln!("could not restart Octowatcher: {err:#}"),
+        }
     }
 }
 
 /// Brings the window to the front, opening it again if it was closed.
 pub fn show_window(cx: &mut App) {
+    let view = cx.global::<MainView>().0.clone();
+    view.update(cx, |this, cx| this.refresh_login_status(cx));
     cx.activate(true);
-    if let Some(window) = cx.windows().first() {
+    let existing = cx.windows().first().copied();
+    #[cfg(not(target_os = "linux"))]
+    if let Some(window) = existing {
         window
             .update(cx, |_, window, _| window.activate_window())
             .ok();
         return;
     }
-    let view = cx.global::<MainView>().0.clone();
     let bounds = Bounds::centered(None, size(px(560.), px(680.)), cx);
+    let window_bounds = WindowBounds::Windowed(bounds);
+    // GPUI has no unminimize API on Linux, and activation alone can leave a
+    // minimized surface hidden. Replace the native window, preserving the
+    // shared view/state and bounds. Open first: zero windows stops GPUI Linux.
+    #[cfg(target_os = "linux")]
+    let window_bounds = existing
+        .and_then(|window| {
+            window
+                .update(cx, |_, window, _| window.window_bounds())
+                .ok()
+        })
+        .unwrap_or(window_bounds);
     cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(window_bounds),
+            app_id: Some("octowatcher".into()),
             ..Default::default()
         },
         |window, cx| {
+            // GPUI 0.2.2 stops both Linux backends when their last window is
+            // destroyed. Minimize on Close to keep the tray and polling alive.
+            #[cfg(target_os = "linux")]
+            window.on_window_should_close(cx, |window, _| {
+                window.minimize_window();
+                false
+            });
             window.focus(&view.read(cx).focus_handle);
             view.update(cx, |this, cx| {
                 this.appearance_subscription =
@@ -3493,6 +3684,12 @@ pub fn show_window(cx: &mut App) {
         },
     )
     .unwrap();
+    #[cfg(target_os = "linux")]
+    if let Some(window) = existing {
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .ok();
+    }
 }
 
 #[cfg(test)]
@@ -3579,6 +3776,8 @@ mod review_view_tests {
             tray_error: None,
             save_error: None,
             notification_error: None,
+            login_state: login::State::Unavailable("Test build".into()),
+            login_error: None,
             account_errors: BTreeMap::new(),
             repo_errors: BTreeMap::new(),
             access_cache: github::AccessCache::default(),
@@ -3588,6 +3787,8 @@ mod review_view_tests {
             notification_tasks: HashMap::new(),
             tray: None,
             update: None,
+            #[cfg(target_os = "linux")]
+            restart_path: None,
             scan_task: None,
             refresh_queue: refresh_queue::RefreshQueue::default(),
             fetch_task: None,

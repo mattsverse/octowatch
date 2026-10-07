@@ -746,6 +746,45 @@ fn picker_keyboard_choices_cancel_escape_and_focus_return(cx: &mut TestAppContex
     });
 }
 
+#[cfg(debug_assertions)]
+#[gpui::test]
+fn launch_at_login_follows_appearance_and_supports_keyboard_activation(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let mut view = fixture(window, cx);
+        view.tab = Tab::Settings;
+        view.login_state = login::State::Off;
+        view
+    });
+    focus(&view, Control::Appearance(Appearance::Dark), cx);
+    press(cx, "tab");
+    assert_eq!(focused(&view, cx), Some(Control::LaunchAtLogin));
+    // The debug-build guard fails safely instead of touching native login
+    // registration. Its error proves Enter reached the actual click handler.
+    press(cx, "enter");
+    cx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .login_error
+                .as_ref()
+                .unwrap()
+                .contains("could not change launch at login")
+        );
+        assert!(!view.read(cx).store.launch_at_login);
+    });
+    assert_eq!(focused(&view, cx), Some(Control::LaunchAtLogin));
+    view.update(cx, |view, _| view.login_error = None);
+    press(cx, "space");
+    cx.update(|_, cx| assert!(view.read(cx).login_error.is_some()));
+    press(cx, "tab");
+    assert_eq!(focused(&view, cx), Some(Control::Poll(1)));
+    view.update(cx, |view, cx| {
+        view.login_state = login::State::Unavailable("Test build".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| assert!(!view.read(cx).controls().contains(&Control::LaunchAtLogin)));
+}
+
 #[gpui::test]
 fn health_shortcut_and_recovery_actions_are_keyboard_reachable(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|window, cx| {

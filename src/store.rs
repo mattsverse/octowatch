@@ -31,6 +31,8 @@ pub struct Store {
     pub snooze_minutes: u64,
     /// Reviews the user put aside for now.
     pub snoozed: Vec<Snooze>,
+    /// Last observed login registration; the OS remains authoritative.
+    pub launch_at_login: bool,
     /// Account the cached reviews and snoozes belong to. Older files omit it.
     pub sync_account: Option<String>,
     /// Active account per host; legacy sync_account belongs to github.com.
@@ -90,6 +92,7 @@ impl Default for Store {
             poll_minutes: 2,
             snooze_minutes: 5,
             snoozed: Vec::new(),
+            launch_at_login: false,
             sync_account: None,
             sync_accounts: BTreeMap::new(),
             last_successful_sync: None,
@@ -1914,6 +1917,36 @@ mod tests {
         assert!(!result.pending_changed);
         assert!(!result.snoozes_changed);
         assert_eq!(store.pending[0].requested_at.as_deref(), Some(T1));
+    }
+
+    #[test]
+    fn legacy_settings_default_login_off_and_preserve_existing_preferences() {
+        let legacy = r#"{
+            "roots": ["/home/user/Dev"],
+            "disabled": ["owner/repo"],
+            "poll_minutes": 15,
+            "snooze_minutes": 30,
+            "pending": [],
+            "snoozed": []
+        }"#;
+        let mut store = Store::from_json(legacy).unwrap();
+        assert!(!store.launch_at_login);
+        assert_eq!(store.poll_minutes, 15);
+        assert_eq!(store.snooze_minutes, 30);
+        assert_eq!(
+            store.roots,
+            vec![std::path::PathBuf::from("/home/user/Dev")]
+        );
+        assert!(store.disabled.contains("owner/repo"));
+        store.launch_at_login = true;
+        store.last_successful_sync = Some(123);
+        let saved = serde_json::to_string(&store).unwrap();
+        let restored = Store::from_json(&saved).unwrap();
+        assert_eq!(restored.last_successful_sync, Some(123));
+        assert!(restored.launch_at_login);
+        assert_eq!(restored.poll_minutes, 15);
+        assert_eq!(restored.roots, store.roots);
+        assert_eq!(restored.disabled, store.disabled);
     }
 
     #[test]

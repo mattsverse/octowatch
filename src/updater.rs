@@ -171,6 +171,68 @@ fn swap(asset: &str, staging: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub fn running_executable() -> Result<PathBuf> {
+    // AppImages mount their inner executable at a temporary, read-only path.
+    match std::env::var_os("APPIMAGE") {
+        Some(path) => Ok(PathBuf::from(path).canonicalize()?),
+        None => Ok(std::env::current_exe()?.canonicalize()?),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn relaunch(path: &Path) -> Result<()> {
+    restart_command(path, std::process::id())
+        .spawn()
+        .context("could not start relaunch helper")?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn restart_command(path: &Path, pid: u32) -> std::process::Command {
+    use std::os::unix::process::CommandExt as _;
+
+    // Preserve GPUI's wait-for-exit handoff, passing the PID and path as
+    // arguments. Its Linux restart implementation interpolates the path into
+    // shell text, which fails for AppImages with spaces or shell metacharacters.
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.1; done; exec \"$2\"")
+        .arg("octowatcher-restart")
+        .arg(pid.to_string())
+        .arg(path)
+        .process_group(0);
+    command
+}
+
+#[cfg(test)]
+mod restart_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[test]
+    fn relaunch_handles_paths_with_spaces_and_shell_metacharacters() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("Octowatcher ' $`% image.AppImage");
+        fs::write(&executable, "#!/bin/sh\nprintf 'relaunched\\n'\n").unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut previous = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = previous.id();
+        previous.wait().unwrap();
+        let result = restart_command(&executable, pid).output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(result.stdout, b"relaunched\n");
+    }
+}
+
 #[derive(Deserialize)]
 struct Latest {
     tag_name: String,

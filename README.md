@@ -19,6 +19,7 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), using saved github.com accounts and existing Enterprise host credentials without switching your active CLI account.
 - **Supports Enterprise hosts.** Watch github.com, Enterprise Server and Enterprise Cloud with data residency together; matching repositories on different hosts stay separate.
 - **Follows your desktop appearance.** Use System, Light or Dark in Settings. System is the default, and your choice survives restarts.
+- **Starts quietly at login when you choose.** Enable **Launch at login** in Settings to keep checking from the tray after you sign in. Opening Octowatcher yourself shows its window, and repeated launches reopen the running app.
 - **Shows setup and health.** See saved-account readiness, the CLI active account, watched-folder readiness, notification permission, and last successful sync, with recovery actions when a check fails.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
@@ -175,9 +176,15 @@ Failed review deliveries remain queued, including across restarts, and retry aft
 
 Octowatcher observes at most 32 active notifications, with a one-hour action lifetime, to avoid accumulating tasks and connections. Extra review alerts stay queued until an observer frees capacity or a later successful check. Linux desktops vary in support for notification buttons and body clicks; the Reviews tab and tray remain available.
 
+**Launch at login** is off by default. Switch it on to start Octowatcher quietly in the tray when you sign in. It is available for signed macOS release apps installed in `/Applications` or `~/Applications` on macOS 13 or later, and for Linux `.deb`, `.rpm`, and AppImage installs. Development binaries show this setting as unavailable; older macOS versions can still launch and run Octowatcher normally.
+
+On macOS, this uses the system login item service. If approval is needed, allow Octowatcher in **System Settings → General → Login Items**. On Linux, it creates `~/.config/autostart/com.matteogassend.octowatcher.desktop` (or under `$XDG_CONFIG_HOME` when set). Keep an AppImage in a permanent location before enabling this setting; after moving or renaming it, Settings shows **Repair** instead of **On**. Click **Repair** to register its new path. Updates installed in place keep that path.
+
+Disabling startup in your desktop's login settings is respected; Octowatcher does not turn it back on when it starts. Deleting `state.json` resets app preferences but does not remove a system login registration; switch **Launch at login** off to remove it.
+
 ### Keyboard access
 
-- **Tab / Shift+Tab** move forward or backward through the window's controls. A contrasting border shows focus in either theme, and content scrolls into view when you navigate to it. Settings starts with setup recovery and account controls, followed by the System, Light and Dark appearance choices; changing appearance keeps focus on your choice.
+- **Tab / Shift+Tab** move forward or backward through the window's controls. A contrasting border shows focus in either theme, and content scrolls into view when you navigate to it. Settings starts with setup recovery and account controls, followed by the System, Light and Dark appearance choices and the available Launch at login control; changing appearance keeps focus on your choice.
 - **Enter / Space** activate the focused control: open a review, snooze or unsnooze it, switch a tab, toggle a repository, or pick a setting. Each review's Snooze button is a separate focus stop; activating it keeps you in Octowatcher.
 - To snooze with the keyboard, activate **Snooze…**, use **Tab / Shift+Tab** to choose a duration or **Cancel**, then press **Enter / Space**. **Escape** cancels the open picker without resetting your filters. With no picker open, it resets search and filters. Choosing or canceling returns focus to that review’s Snooze button, or a nearby remaining Snooze button if a filter hides that review. Snoozing a different review from a notification preserves your open picker and focus.
 - **Left / Right** switch tabs when a tab has focus, wrapping at either end.
@@ -192,16 +199,22 @@ The current GPUI dependency (0.2.2) does not expose an accessibility tree or API
 
 Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To get the window back, choose **Open Octowatcher** from the tray menu, or on macOS click the Dock icon. To stop the app, choose **Quit Octowatcher**.
 
+On Linux, **Close** minimizes the window and leaves its taskbar entry available. GPUI's Linux backend otherwise exits when the last window is destroyed. Opening Octowatcher again creates a visible window with the same app state and window bounds. The desktop controls whether it receives keyboard focus. On macOS, Close removes the window as before.
+
+There is one running instance per user, even if you launch another copy or start it from a terminal. An ordinary launch brings back that instance's window; a login launch leaves it quietly in the background. This prevents duplicate checks, notifications, and simultaneous state writes. The instance lock uses the OS’s private directory for your user ID: `/run/user/<uid>` on Linux and the Darwin user cache on macOS. Changing `HOME`, `XDG_RUNTIME_DIR`, or home permissions does not create another instance. Linux requires that user runtime directory to exist with mode `0700`, as provisioned by typical desktop login managers; a custom `XDG_RUNTIME_DIR` alone is insufficient. **Quit Octowatcher** stops it until you open it again or next sign in, without disabling launch at login. Restarting after an update opens the new version's window.
+
+For a quiet manual launch, pass `--background` to the binary or AppImage (on macOS, use `open /Applications/Octowatcher.app --args --background`). If the app cannot create its tray icon, it opens the window so you can still access it. On Linux, the desktop must still provide a visible AppIndicator tray; a successfully created icon cannot tell Octowatcher whether the desktop displays it.
+
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval, snooze length, appearance, review mute and draft preference), the last discovered checkout paths, account-specific snoozes, cached review lists, and undelivered review alerts to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval, snooze length, last observed launch-at-login status, appearance, review mute and draft preference), the last discovered checkout paths, account-specific snoozes, cached review lists, and undelivered review alerts to one JSON file:
 
 | Platform | Path |
 | --- | --- |
 | macOS | `~/Library/Application Support/octowatcher/state.json` |
 | Linux | `~/.config/octowatcher/state.json` |
 
-Delete this file to reset Octowatcher. Everything it sends to GitHub goes through `gh`.
+Delete this file to reset Octowatcher’s saved preferences and review state. Login registration is managed separately by the operating system. Everything it sends to GitHub goes through `gh`.
 
 If this file is invalid, Octowatcher reports the recovery in **Setup & health** and preserves its original contents in a uniquely named `state-recovery-*.json` beside it before allowing defaults to be saved. Review the default folders and settings, or restore the backup to `state.json` and restart. If the file cannot be read or a backup cannot be made, saving is paused to protect it; fix the file or directory permissions and restart. Intentionally removing every watched folder is preserved across restarts.
 
@@ -242,6 +255,16 @@ On macOS, notification permission and delivery require a signed `.app` bundle; t
 cargo install cargo-bundle
 cargo bundle --release
 ```
+
+On Linux, an isolated X11 window lifecycle check verifies Close, minimize, and reopening the running process:
+
+```sh
+sudo apt install xvfb openbox xdotool wmctrl x11-utils dbus-x11
+cargo build --locked
+tests/linux-window-reopen.sh target/debug/octowatcher
+```
+
+Run this check under a dedicated OS test user or inside a container with a private `/run/user/<uid>` directory. It starts its own virtual display and uses temporary settings, but instance ownership is per OS user. Wayland compositor behavior still needs a desktop check.
 
 ## Testing notifications
 

@@ -47,6 +47,7 @@ pub(crate) enum Control {
     RepositoryAccount(String, String),
     AllRepositoryAccounts(String),
     Appearance(Appearance),
+    LaunchAtLogin,
     Poll(u64),
     SnoozeMinutes(u64),
     MuteNotifications,
