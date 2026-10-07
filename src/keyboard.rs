@@ -1,6 +1,11 @@
 //! Focus identities belong to controls, never to their current row index.
 //! GPUI 0.2.2 supplies Enter/Space click activation once a div tracks focus.
-use std::{cell::Cell, collections::HashMap, path::PathBuf, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    rc::Rc,
+};
 
 use gpui::{
     App, Bounds, Div, FocusHandle, Pixels, ScrollHandle, Stateful, Window, canvas, div, prelude::*,
@@ -18,6 +23,8 @@ pub(crate) enum Control {
     Refresh,
     Update,
     Tab(Tab),
+    Search,
+    Filter(gpui::ElementId),
     Review((RepositoryId, u64)),
     Snooze((RepositoryId, u64)),
     SnoozeDuration((RepositoryId, u64), u64),
@@ -42,6 +49,7 @@ struct FocusTarget {
 pub(crate) struct Keyboard {
     pub root: FocusHandle,
     pub scroll: ScrollHandle,
+    pub review_viewport: Rc<Cell<Option<Bounds<Pixels>>>>,
     order: Vec<Control>,
     targets: HashMap<Control, FocusTarget>,
     reveal_pending: Cell<bool>,
@@ -53,6 +61,7 @@ impl Keyboard {
         Self {
             root: cx.focus_handle(),
             scroll: ScrollHandle::new(),
+            review_viewport: Rc::new(Cell::new(None)),
             order: Vec::new(),
             targets: HashMap::new(),
             reveal_pending: Cell::new(false),
@@ -64,20 +73,69 @@ impl Keyboard {
         self.palette = palette;
     }
 
+    pub fn register_search(&mut self, focus: FocusHandle) {
+        self.targets
+            .entry(Control::Search)
+            .or_insert_with(|| FocusTarget {
+                focus,
+                bounds: Rc::new(Cell::new(None)),
+            });
+    }
+
+    pub fn handle(&self, key: &Control) -> FocusHandle {
+        self.targets[key].focus.clone()
+    }
+
+    pub fn tab_neighbor(&self, current: Option<&Control>, backwards: bool) -> Option<Control> {
+        let count = self.order.len();
+        if count == 0 {
+            return None;
+        }
+        let index =
+            current.and_then(|key| self.order.iter().position(|candidate| candidate == key));
+        let next = match (index, backwards) {
+            (Some(index), true) => (index + count - 1) % count,
+            (Some(index), false) => (index + 1) % count,
+            (None, true) => count - 1,
+            (None, false) => 0,
+        };
+        Some(self.order[next].clone())
+    }
+
+    pub fn take_reveal_request(&self) -> bool {
+        self.reveal_pending.replace(false)
+    }
+
     /// Retain focus across reordering; move to a nearby control if it disappears.
     pub fn reconcile(&mut self, order: Vec<Control>, window: &mut Window, cx: &mut App) {
         let focused = self.focused(window);
+        let available: HashSet<_> = order.iter().collect();
         if focused.is_some() && self.order != order {
             self.request_reveal();
         }
         let replacement = focused
             .as_ref()
-            .filter(|key| !order.contains(key))
+            .filter(|key| !available.contains(key))
             .map(|key| {
                 if let Control::SnoozeDuration(review, _) | Control::CancelSnooze(review) = key {
                     let trigger = Control::Snooze(review.clone());
-                    if order.contains(&trigger) {
+                    if available.contains(&trigger) {
                         return Some(trigger);
+                    }
+                    // Choosing a duration can hide the row under an Awake
+                    // filter. Continue at a nearby remaining Snooze trigger.
+                    let triggers: Vec<_> = order
+                        .iter()
+                        .filter(|key| matches!(key, Control::Snooze(_)))
+                        .collect();
+                    if !triggers.is_empty() {
+                        let index = self
+                            .order
+                            .iter()
+                            .filter(|key| matches!(key, Control::Snooze(_)))
+                            .position(|key| key == &trigger)
+                            .unwrap_or(0);
+                        return Some(triggers[index.min(triggers.len() - 1)].clone());
                     }
                 }
                 // Cards and Snooze buttons alternate in tab order. Recover by
@@ -99,7 +157,7 @@ impl Keyboard {
                 let index = self.order.iter().position(|old| old == key).unwrap_or(0);
                 order.get(index.min(order.len().saturating_sub(1))).cloned()
             });
-        self.targets.retain(|key, _| order.contains(key));
+        self.targets.retain(|key, _| available.contains(key));
         for key in &order {
             self.targets
                 .entry(key.clone())
@@ -109,6 +167,9 @@ impl Keyboard {
                 });
         }
         self.order = order;
+        for target in self.targets.values() {
+            target.bounds.set(None);
+        }
         if let Some(replacement) = replacement {
             if let Some(key) = replacement {
                 self.focus(&key, window);
@@ -157,6 +218,8 @@ impl Keyboard {
             .child(
                 canvas(move |rect, _, _| bounds.set(Some(rect)), |_, _, _, _| {})
                     .absolute()
+                    .top_0()
+                    .left_0()
                     .size_full(),
             )
     }
@@ -192,7 +255,6 @@ impl Keyboard {
         }
     }
 
-    #[cfg(test)]
     pub fn bounds(&self, key: &Control) -> Option<Bounds<Pixels>> {
         self.targets.get(key)?.bounds.get()
     }

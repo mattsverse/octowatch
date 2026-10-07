@@ -4157,6 +4157,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tray-icon",
+ "unicode-segmentation",
 ]
 
 [[package]]
