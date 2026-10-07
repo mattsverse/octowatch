@@ -19,6 +19,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tray-icon = "0.26"
 
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = "0.3.1"
 
@@ -64,6 +67,3 @@ assets = [
     { source = "assets/icons/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/octowatcher.png", mode = "644" },
     { source = "assets/icons/512x512.png", dest = "/usr/share/icons/hicolor/512x512/apps/octowatcher.png", mode = "644" },
 ]
-
-[dev-dependencies]
-gpui = { version = "0.2.2", features = ["test-support"] }

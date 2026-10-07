@@ -33,6 +33,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Octowatcher>) -> Octowatcher {
             paths: vec!["/test/repo".into()],
         }]),
         tab: Tab::Reviews,
+        snooze_picker: None,
         last_checked: None,
         fetch_error: None,
         tray_error: None,
@@ -113,7 +114,7 @@ fn tab_traversal_and_tab_arrows(cx: &mut TestAppContext) {
 fn snooze_activation_never_opens_parent_card(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(fixture);
     focus(&view, Control::Snooze(key(1)), cx);
-    press(cx, "enter");
+    press(cx, "enter tab enter");
     cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_some()));
     assert_eq!(cx.opened_url(), None);
     assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
@@ -131,6 +132,15 @@ fn snooze_activation_never_opens_parent_card(cx: &mut TestAppContext) {
     });
     cx.simulate_mouse_move(bounds.center(), None, Modifiers::none());
     cx.simulate_click(bounds.center(), Modifiers::none());
+    assert_eq!(cx.opened_url(), None);
+    let duration = cx.update(|_, cx| {
+        view.read(cx)
+            .keyboard
+            .bounds(&Control::SnoozeDuration(key(1), 5))
+            .unwrap()
+    });
+    cx.simulate_mouse_move(duration.center(), None, Modifiers::none());
+    cx.simulate_click(duration.center(), Modifiers::none());
     cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_some()));
     assert_eq!(cx.opened_url(), None);
     assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
@@ -352,6 +362,7 @@ fn bulk_removed_reviews_keep_activation_kind(cx: &mut TestAppContext) {
         assert_eq!(focused(&view, visual), Some(expected));
         press(visual, "enter");
         if snooze {
+            press(visual, "tab enter");
             visual.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(3)).is_some()));
             assert_eq!(visual.opened_url(), None);
         } else {
@@ -360,4 +371,60 @@ fn bulk_removed_reviews_keep_activation_kind(cx: &mut TestAppContext) {
         }
         visual.update(|window, _| window.remove_window());
     }
+}
+
+#[gpui::test]
+fn picker_keyboard_choices_cancel_escape_and_focus_return(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(fixture);
+    cx.simulate_resize(size(px(560.), px(300.)));
+    view.update(cx, |view, cx| {
+        // Preserve access to an older saved default outside the usual presets.
+        view.store.snooze_minutes = 7;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    focus(&view, Control::Snooze(key(1)), cx);
+    press(cx, "enter");
+    cx.update(|_, cx| {
+        assert_eq!(view.read(cx).snooze_picker, Some(key(1)));
+        assert!(view.read(cx).store.snoozed.is_empty());
+    });
+    for minutes in SNOOZE_CHOICES.into_iter().chain([7]) {
+        press(cx, "tab");
+        let control = Control::SnoozeDuration(key(1), minutes);
+        assert_eq!(focused(&view, cx), Some(control.clone()));
+        cx.update(|_, cx| {
+            let keyboard = &view.read(cx).keyboard;
+            let bounds = keyboard.bounds(&control).unwrap();
+            assert!(bounds.top() >= keyboard.scroll.bounds().top());
+            assert!(bounds.bottom() <= keyboard.scroll.bounds().bottom());
+        });
+    }
+    press(cx, "tab");
+    assert_eq!(focused(&view, cx), Some(Control::CancelSnooze(key(1))));
+    press(cx, "space");
+    assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
+    cx.update(|_, cx| assert!(view.read(cx).snooze_picker.is_none()));
+    press(cx, "enter tab escape");
+    assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
+    cx.update(|_, cx| assert!(view.read(cx).snooze_picker.is_none()));
+    let before = Local::now().timestamp();
+    press(cx, "enter tab tab tab space");
+    let after = Local::now().timestamp();
+    assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        let until = view.store.snooze_for(&review(1)).unwrap().until;
+        assert!((before + 15 * 60..=after + 15 * 60).contains(&until));
+        assert_eq!(view.store.snooze_minutes, 7);
+        assert!(view.snooze_picker.is_none());
+    });
+    assert_eq!(cx.opened_url(), None);
+    press(cx, "space enter");
+    focus(&view, Control::Tab(Tab::Reviews), cx);
+    press(cx, "right");
+    cx.update(|_, cx| {
+        assert_eq!(view.read(cx).tab, Tab::Repositories);
+        assert!(view.read(cx).snooze_picker.is_none());
+    });
 }

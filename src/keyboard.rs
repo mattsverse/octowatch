@@ -16,6 +16,8 @@ pub(crate) enum Control {
     Tab(Tab),
     Review((String, u64)),
     Snooze((String, u64)),
+    SnoozeDuration((String, u64), u64),
+    CancelSnooze((String, u64)),
     RemoveRoot(PathBuf),
     AddRoot,
     Rescan,
@@ -59,6 +61,12 @@ impl Keyboard {
             .as_ref()
             .filter(|key| !order.contains(key))
             .map(|key| {
+                if let Control::SnoozeDuration(review, _) | Control::CancelSnooze(review) = key {
+                    let trigger = Control::Snooze(review.clone());
+                    if order.contains(&trigger) {
+                        return Some(trigger);
+                    }
+                }
                 // Cards and Snooze buttons alternate in tab order. Recover by
                 // position among controls of the same kind so a refresh cannot
                 // silently change what Enter/Space will do.
