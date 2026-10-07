@@ -90,7 +90,7 @@ Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To
 
 ## Where your data lives
 
-Octowatcher saves your folders, the repositories you switched off, the check interval and the current review list to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories, check interval and snooze length), your snoozes, and the current review list for the repositories you watch to one JSON file:
 
 | Platform | Path |
 | --- | --- |
