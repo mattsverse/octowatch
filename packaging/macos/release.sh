@@ -103,11 +103,23 @@ inspect() {
     hdiutil imageinfo "$2" 2>&1 | head -5 || true
     tail -c 512 "$2" | xxd | head -2 || true
 }
-sw_vers; xcode-select -p; xcrun notarytool --version; hdiutil version || true
-df -h . "$work_dir" || true
+sw_vers; xcode-select -p; xcrun notarytool --version; df -h . "$work_dir" || true
 hdiutil create -ov -volname Octowatcher -fs HFS+ -format UDZO \
     -srcfolder "$work_dir/dmg" "$dmg"
 inspect "after create" "$dmg"
+mkdir -p diag
+cp "$dmg" diag/fresh.dmg
+cp -R "$work_dir/dmg" diag/srcfolder
+curl -fsSL -o diag/v0.4.1.dmg https://github.com/mattsverse/octowatch/releases/download/v0.4.1/Octowatcher.dmg || true
+inspect "control: published v0.4.1 DMG" diag/v0.4.1.dmg
+hdiutil verify diag/v0.4.1.dmg 2>&1 | tail -3 || true
+hdiutil verify "$dmg" 2>&1 | tail -3 || true
+hdiutil create -ov -volname Octowatcher -fs HFS+ -format UDRW \
+    -srcfolder "$work_dir/dmg" "$work_dir/uncompressed.dmg"
+inspect "uncompressed UDRW" "$work_dir/uncompressed.dmg"
+hdiutil create -ov -volname Octowatcher -fs APFS -format UDZO \
+    -srcfolder "$work_dir/dmg" "$work_dir/apfs.dmg"
+inspect "APFS UDZO" "$work_dir/apfs.dmg"
 hdiutil create -ov -volname Octowatcher -fs HFS+ -format UDZO \
     -srcfolder "$work_dir/dmg" "$work_dir/temp-copy.dmg"
 inspect "temp-dir copy after create" "$work_dir/temp-copy.dmg"
