@@ -444,18 +444,24 @@ impl Octowatcher {
                 }
                 cx.notify();
             },
-            move |this, response, cx| match target.respond(response, &this.store) {
-                Some(ReviewAction::OpenPr(url)) => cx.open_url(&url),
-                Some(ReviewAction::OpenReviews) => {
-                    this.tab = Tab::Reviews;
-                    show_window(cx);
-                }
-                Some(ReviewAction::Snooze(pr)) => this.snooze(pr.key(), cx),
-                None => {}
-            },
+            move |this, response, cx| this.respond_to_review(&target, response, cx),
         );
         if !started {
             self.review_delivery.deferred();
+        }
+    }
+
+    fn respond_to_review(&mut self, target: &Target, response: Response, cx: &mut Context<Self>) {
+        match target.respond(response, &self.store) {
+            Some(ReviewAction::OpenPr(url)) => cx.open_url(&url),
+            Some(ReviewAction::OpenReviews) => {
+                self.tab = Tab::Reviews;
+                // The response runs inside an entity update; opening a new
+                // window reads this view and must wait for it to be returned.
+                cx.defer(show_window);
+            }
+            Some(ReviewAction::Snooze(pr)) => self.snooze(pr.key(), cx),
+            None => {}
         }
     }
 
@@ -762,13 +768,17 @@ impl Octowatcher {
             body.into(),
             Some(action),
             cx,
-            move |this, response, cx| match response {
-                Response::Action(id) if id == "update" => this.install_update(cx),
-                Response::Action(id) if id == "download" => cx.open_url(&url),
-                Response::Clicked => show_window(cx),
-                _ => {}
-            },
+            move |this, response, cx| this.respond_to_update(response, &url, cx),
         );
+    }
+
+    fn respond_to_update(&mut self, response: Response, url: &str, cx: &mut Context<Self>) {
+        match response {
+            Response::Action(id) if id == "update" => self.install_update(cx),
+            Response::Action(id) if id == "download" => cx.open_url(url),
+            Response::Clicked => cx.defer(show_window),
+            _ => {}
+        }
     }
 
     /// Swaps in the available update, then offers to restart into it.
@@ -2245,6 +2255,94 @@ mod review_view_tests {
             _startup_and_updates: cx.spawn(async |_, _| {}),
             appearance_subscription: None,
         }
+    }
+
+    #[gpui::test]
+    fn summary_notification_responses_reopen_closed_reviews_preserving_filters(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_review_keys);
+        let (view, visual) = cx.add_window_view(|window, cx| {
+            let view = fixture(cx, 10);
+            window.focus(&view.focus_handle);
+            view
+        });
+        visual.simulate_keystrokes(find_key());
+        visual.simulate_input("#1");
+        cx.update(|cx| cx.set_global(MainView(view.clone())));
+        view.update(cx, |view, cx| {
+            view.review_filters.repository = Some("Acme/API".into());
+            view.review_filters.draft = DraftFilter::Ready;
+            view.review_filters.review = ReviewFilter::First;
+            view.review_filters.snooze = SnoozeFilter::Awake;
+            view.review_filters_changed(cx);
+        });
+        for response in [Response::Clicked, Response::Action("open-reviews".into())] {
+            // Use the same entity-update boundary as start_notification's
+            // response callback, without sending any native notification.
+            view.update(cx, |view, _| view.tab = Tab::Settings);
+            cx.update(|cx| {
+                let window = cx.windows()[0];
+                window
+                    .update(cx, |_, window, _| window.remove_window())
+                    .unwrap();
+            });
+            view.update(cx, |view, cx| {
+                view.respond_to_review(&Target::Summary, response, cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            cx.update(|cx| assert_eq!(cx.windows().len(), 1));
+            view.read_with(cx, |view, _| {
+                assert!(view.tab == Tab::Reviews);
+                assert_eq!(
+                    view.review_filters,
+                    ReviewFilters {
+                        query: "#1".into(),
+                        repository: Some("Acme/API".into()),
+                        draft: DraftFilter::Ready,
+                        review: ReviewFilter::First,
+                        snooze: SnoozeFilter::Awake,
+                    }
+                );
+                assert_eq!(view.review_scroll.item_count(), 1);
+                assert!(view.appearance_subscription.is_some());
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn update_notification_click_reopens_closed_window_preserving_the_tab(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let view = cx.new(|cx| {
+            let mut view = fixture(cx, 2);
+            view.tab = Tab::Settings;
+            view
+        });
+        cx.update(|cx| cx.set_global(MainView(view.clone())));
+        view.update(cx, |view, cx| {
+            view.respond_to_update(
+                Response::Clicked,
+                "https://github.com/mattsverse/octowatch/releases",
+                cx,
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(cx.windows().len(), 1));
+        view.read_with(cx, |view, _| assert!(view.tab == Tab::Settings));
+        // An existing window is activated rather than duplicated.
+        view.update(cx, |view, cx| {
+            view.respond_to_update(
+                Response::Clicked,
+                "https://github.com/mattsverse/octowatch/releases",
+                cx,
+            );
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|cx| assert_eq!(cx.windows().len(), 1));
     }
 
     #[gpui::test]

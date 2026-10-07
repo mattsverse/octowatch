@@ -78,7 +78,7 @@ The list shows **X of Y reviews**. The Reviews tab keeps the total count, includ
 
 Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. In short windows, the filter area scrolls while leaving space for reviews; keyboard focus scrolls each control into view. When no PRs match, the window shows a no-results message and a reset button.
 
-Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front; its **Open Reviews** button does the same. After the first successful GitHub check at each launch, Octowatcher summarizes the eligible reviews already waiting.
+Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front, reopening the window if you closed it; its **Open Reviews** button does the same. Your current search and filters stay active. After the first successful GitHub check at each launch, Octowatcher summarizes the eligible reviews already waiting.
 
 **Snooze…** opens a duration picker for that pull request: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default from Settings is marked; choose a duration to snooze, or **Cancel** to leave the review waiting. Each choice applies only to that snooze and doesn't change the default. Only one picker is open at a time.
 
