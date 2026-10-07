@@ -1,5 +1,7 @@
 //! Review delivery and action routing, independent of the desktop UI.
 
+use std::collections::BTreeSet;
+
 use crate::{
     notifications::Response,
     store::{PendingReview, ReviewNotice, Store},
@@ -18,11 +20,16 @@ pub struct Batch {
 impl Delivery {
     /// Only one send can consume the persisted queue at a time. Responses
     /// don't keep this gate locked: delivery and interaction are separate.
-    pub fn begin(&mut self, store: &Store) -> Option<Batch> {
+    /// Cached notices wait until their own host has succeeded after launch.
+    pub fn begin(&mut self, store: &Store, validated_hosts: &BTreeSet<String>) -> Option<Batch> {
         if self.in_flight {
             return None;
         }
-        let due = store.notifications_due();
+        let due = store
+            .notifications_due()
+            .into_iter()
+            .filter(|(_, pr)| validated_hosts.contains(&pr.repository().host))
+            .collect::<Vec<_>>();
         if due.is_empty() {
             return None;
         }
@@ -33,12 +40,22 @@ impl Delivery {
 
     /// Drain reviews queued during a successful send without waiting for a
     /// poll or user action. Failures release the gate but never retry in a loop.
-    pub fn complete(&mut self, store: &mut Store, batch: &Batch, delivered: bool) -> Option<Batch> {
+    pub fn complete(
+        &mut self,
+        store: &mut Store,
+        batch: &Batch,
+        delivered: bool,
+        validated_hosts: &BTreeSet<String>,
+    ) -> Option<Batch> {
         if delivered {
             store.mark_delivered(&batch.notices);
         }
         self.in_flight = false;
-        if delivered { self.begin(store) } else { None }
+        if delivered {
+            self.begin(store, validated_hosts)
+        } else {
+            None
+        }
     }
 
     pub fn deferred(&mut self) {
@@ -100,11 +117,16 @@ mod tests {
     use super::*;
     use crate::store::Snooze;
 
+    fn validated_hosts() -> BTreeSet<String> {
+        [crate::repository::default_host()].into()
+    }
+
     const T1: &str = "2026-01-01T00:00:00Z";
     const T2: &str = "2026-01-02T00:00:00Z";
 
     fn pr(number: u64, draft: bool) -> PendingReview {
         PendingReview {
+            host: crate::repository::default_host(),
             repo: "Owner/Repo".into(),
             number,
             title: format!("Review {number}"),
@@ -118,7 +140,8 @@ mod tests {
 
     fn snooze(pr: &PendingReview, until: i64) -> Snooze {
         Snooze {
-            repo: pr.key().0,
+            host: pr.repository().host,
+            repo: pr.repository().slug,
             number: pr.number,
             requested_at: pr.requested_at.clone(),
             until,
@@ -130,22 +153,130 @@ mod tests {
     }
 
     #[test]
+    fn identical_reviews_on_different_hosts_keep_notices_and_actions_separate() {
+        let public = pr(1, false);
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            url: "https://github.example.com/Owner/Repo/pull/1".into(),
+            ..public.clone()
+        };
+        let mut store = Store::default();
+        store.reconcile(vec![public.clone(), enterprise.clone()]);
+        store = round_trip(&store);
+        assert_eq!(store.notification_queue.len(), 2);
+        assert!(store.notification_queue[0].matches(&public));
+        assert!(!store.notification_queue[0].matches(&enterprise));
+        // Snooze/unsnooze must clear only that host's delivery event.
+        store.snooze(&public.key(), 5, 0);
+        assert_eq!(store.notifications_due()[0].1, enterprise);
+        store.unsnooze(&public.key());
+        assert_eq!(store.notification_queue.len(), 1);
+        assert!(store.notification_queue[0].matches(&enterprise));
+        // A stale public alert cannot snooze the Enterprise counterpart.
+        store
+            .pending
+            .retain(|review| review.host == enterprise.host);
+        assert_eq!(
+            Target::Single(public).respond(Response::Action("snooze".into()), &store),
+            None
+        );
+        assert_eq!(
+            Target::Single(enterprise.clone()).respond(Response::Clicked, &store),
+            Some(ReviewAction::OpenPr(enterprise.url))
+        );
+    }
+
+    #[test]
+    fn failed_hosts_keep_queued_notices_until_their_own_launch_validation() {
+        let public = pr(1, false);
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store::default();
+        store.reconcile(vec![enterprise.clone()]);
+        store = round_trip(&store);
+        let watched = [public.repository(), enterprise.repository()].into();
+        let mut healthy = validated_hosts();
+        store.reconcile_hosts(vec![public.clone()], &healthy, &watched);
+        store.queue_startup_notifications(&healthy);
+        let enterprise_notice = store
+            .notification_queue
+            .iter()
+            .find(|notice| notice.matches(&enterprise))
+            .unwrap()
+            .clone();
+        let mut delivery = Delivery::default();
+        let first = delivery.begin(&store, &healthy).unwrap();
+        assert_eq!(first.reviews, vec![public]);
+        // Successful draining must also skip the still-unvalidated host.
+        assert!(
+            delivery
+                .complete(&mut store, &first, true, &healthy)
+                .is_none()
+        );
+        assert_eq!(store.notification_queue, vec![enterprise_notice.clone()]);
+        store = round_trip(&store);
+        assert!(delivery.begin(&store, &healthy).is_none());
+        let recovered = [enterprise.host.clone()].into();
+        store.reconcile_hosts(vec![enterprise.clone()], &recovered, &watched);
+        store.queue_startup_notifications(&recovered);
+        healthy.extend(recovered);
+        let next = delivery.begin(&store, &healthy).unwrap();
+        assert_eq!(next.reviews, vec![enterprise]);
+        assert_ne!(next.notices[0].sequence, enterprise_notice.sequence);
+        assert!(
+            delivery
+                .complete(&mut store, &next, true, &healthy)
+                .is_none()
+        );
+        assert!(store.notification_queue.is_empty());
+    }
+
+    #[test]
+    fn startup_seeding_does_not_announce_unvalidated_cached_hosts() {
+        let public = pr(1, false);
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store {
+            pending: vec![public.clone(), enterprise.clone()],
+            ..Store::default()
+        };
+        store.queue_startup_notifications(&validated_hosts());
+        assert_eq!(store.notification_queue.len(), 1);
+        assert!(store.notification_queue[0].matches(&public));
+        store.queue_startup_notifications(&[enterprise.host.clone()].into());
+        assert_eq!(store.notification_queue.len(), 2);
+        assert!(store.notification_queue[1].matches(&enterprise));
+    }
+
+    #[test]
     fn failed_delivery_survives_polls_and_restart_then_recovers() {
         let review = pr(1, false);
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![review.clone()]);
-        let failed = delivery.begin(&store).unwrap();
+        let failed = delivery.begin(&store, &validated_hosts()).unwrap();
         // Both service errors and denied permission are failed deliveries.
-        assert!(delivery.complete(&mut store, &failed, false).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &failed, false, &validated_hosts())
+                .is_none()
+        );
         store = round_trip(&store);
         assert!(store.reconcile(vec![review.clone()]).fresh.is_empty());
-        let retried = delivery.begin(&store).unwrap();
+        let retried = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(failed.notices, retried.notices);
-        assert!(delivery.complete(&mut store, &retried, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &retried, true, &validated_hosts())
+                .is_none()
+        );
         assert!(store.notification_queue.is_empty());
         store.reconcile(vec![review]);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
     }
 
     #[test]
@@ -158,19 +289,27 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![review.clone()]);
-        let failed = delivery.begin(&store).unwrap();
-        assert!(delivery.complete(&mut store, &failed, false).is_none());
+        let failed = delivery.begin(&store, &validated_hosts()).unwrap();
+        assert!(
+            delivery
+                .complete(&mut store, &failed, false, &validated_hosts())
+                .is_none()
+        );
         let result = store.reconcile(vec![without_timestamp.clone()]);
         assert!(result.fresh.is_empty());
         assert!(!result.notifications_changed);
         store = round_trip(&store);
-        let retry = delivery.begin(&store).unwrap();
+        let retry = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(retry.notices, failed.notices);
         assert_eq!(retry.reviews, vec![review.clone()]);
-        assert!(delivery.complete(&mut store, &retry, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &retry, true, &validated_hosts())
+                .is_none()
+        );
         for fetched in [without_timestamp, review.clone()] {
             assert!(store.reconcile(vec![fetched]).fresh.is_empty());
-            assert!(delivery.begin(&store).is_none());
+            assert!(delivery.begin(&store, &validated_hosts()).is_none());
         }
         // A genuinely later request must still get its own alert.
         let newer = PendingReview {
@@ -181,7 +320,10 @@ mod tests {
             store.reconcile(vec![newer.clone()]).fresh,
             vec![newer.clone()]
         );
-        assert_eq!(delivery.begin(&store).unwrap().reviews, vec![newer]);
+        assert_eq!(
+            delivery.begin(&store, &validated_hosts()).unwrap().reviews,
+            vec![newer]
+        );
     }
 
     #[test]
@@ -189,13 +331,19 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![pr(1, false)]);
-        let first = delivery.begin(&store).unwrap();
+        let first = delivery.begin(&store, &validated_hosts()).unwrap();
         store.reconcile(vec![pr(1, false), pr(2, false)]);
-        assert!(delivery.begin(&store).is_none());
-        let next = delivery.complete(&mut store, &first, true).unwrap();
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
+        let next = delivery
+            .complete(&mut store, &first, true, &validated_hosts())
+            .unwrap();
         assert_eq!(next.reviews, vec![pr(2, false)]);
-        assert!(delivery.begin(&store).is_none()); // Next send owns the gate.
-        assert!(delivery.complete(&mut store, &next, true).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none()); // Next send owns the gate.
+        assert!(
+            delivery
+                .complete(&mut store, &next, true, &validated_hosts())
+                .is_none()
+        );
         assert!(store.notification_queue.is_empty());
     }
 
@@ -204,14 +352,22 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![pr(1, false)]);
-        let first = delivery.begin(&store).unwrap();
+        let first = delivery.begin(&store, &validated_hosts()).unwrap();
         store.reconcile(vec![pr(1, false), pr(2, false)]);
-        assert!(delivery.complete(&mut store, &first, false).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &first, false, &validated_hosts())
+                .is_none()
+        );
         assert_eq!(store.notification_queue.len(), 2);
         store.reconcile(store.pending.clone());
-        let retry = delivery.begin(&store).unwrap();
+        let retry = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(retry.reviews, vec![pr(1, false), pr(2, false)]);
-        assert!(delivery.complete(&mut store, &retry, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &retry, true, &validated_hosts())
+                .is_none()
+        );
     }
 
     #[test]
@@ -222,15 +378,23 @@ mod tests {
         };
         let mut delivery = Delivery::default();
         store.reconcile(vec![pr(1, false)]);
-        let first = delivery.begin(&store).unwrap();
+        let first = delivery.begin(&store, &validated_hosts()).unwrap();
         store.reconcile(vec![pr(1, false), pr(2, false), pr(3, true), pr(4, false)]);
         store.snooze(&pr(4, false).key(), 5, 0);
         store.notifications_muted = true;
-        assert!(delivery.complete(&mut store, &first, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &first, true, &validated_hosts())
+                .is_none()
+        );
         store.notifications_muted = false;
-        let catch_up = delivery.begin(&store).unwrap();
+        let catch_up = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(catch_up.reviews, vec![pr(2, false)]);
-        assert!(delivery.complete(&mut store, &catch_up, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &catch_up, true, &validated_hosts())
+                .is_none()
+        );
         assert_eq!(store.notification_queue.len(), 1); // Suppressed draft.
     }
 
@@ -240,18 +404,22 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![review.clone()]);
-        let batch = delivery.begin(&store).unwrap();
+        let batch = delivery.begin(&store, &validated_hosts()).unwrap();
         for _ in 0..5 {
             store.reconcile(vec![review.clone()]);
-            assert!(delivery.begin(&store).is_none());
+            assert!(delivery.begin(&store, &validated_hosts()).is_none());
             assert_eq!(store.notification_queue.len(), 1);
         }
         // No click, dismiss, or Snooze response is needed to acknowledge delivery.
-        assert!(delivery.complete(&mut store, &batch, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &batch, true, &validated_hosts())
+                .is_none()
+        );
         let target = Target::for_reviews(&batch.reviews);
         assert!(target.respond(Response::Dismissed, &store).is_none());
         store.reconcile(vec![review]);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
     }
 
     #[test]
@@ -270,7 +438,7 @@ mod tests {
             pr(5, false),
         ]);
         store.snoozed.push(snooze(&pr(4, false), 100));
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         assert_eq!(store.pending.len(), 5);
         assert_eq!(store.awake().len(), 4); // Includes the draft.
         store = round_trip(&store);
@@ -278,13 +446,17 @@ mod tests {
         // #5 was resolved while muted and must not appear on resume.
         store.reconcile(vec![pr(1, false), pr(2, false), pr(3, true), pr(4, false)]);
         store.notifications_muted = false;
-        let batch = delivery.begin(&store).unwrap();
+        let batch = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(
             batch.reviews.iter().map(|pr| pr.number).collect::<Vec<_>>(),
             vec![1, 2]
         );
-        assert!(delivery.complete(&mut store, &batch, true).is_none());
-        assert!(delivery.begin(&store).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &batch, true, &validated_hosts())
+                .is_none()
+        );
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         assert_eq!(store.notification_queue.len(), 2); // Suppressed draft and snooze.
     }
 
@@ -296,18 +468,22 @@ mod tests {
         };
         let mut delivery = Delivery::default();
         store.reconcile(vec![pr(1, true)]);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         assert_eq!(store.awake().len(), 1);
         store.reconcile(vec![pr(1, true)]);
         assert_eq!(store.notification_queue.len(), 1);
         store = round_trip(&store);
         assert!(!store.notify_drafts);
         assert!(store.reconcile(vec![pr(1, false)]).fresh.is_empty());
-        let batch = delivery.begin(&store).unwrap();
+        let batch = delivery.begin(&store, &validated_hosts()).unwrap();
         assert!(!batch.reviews[0].is_draft);
-        assert!(delivery.complete(&mut store, &batch, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &batch, true, &validated_hosts())
+                .is_none()
+        );
         store.reconcile(vec![pr(1, false)]);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
     }
 
     #[test]
@@ -315,15 +491,22 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![pr(1, true)]);
-        let batch = delivery.begin(&store).unwrap();
-        assert!(delivery.complete(&mut store, &batch, true).is_none());
+        let batch = delivery.begin(&store, &validated_hosts()).unwrap();
+        assert!(
+            delivery
+                .complete(&mut store, &batch, true, &validated_hosts())
+                .is_none()
+        );
         store.reconcile(vec![pr(1, false)]);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         store.notify_drafts = false;
         store.reconcile(vec![pr(1, false), pr(2, true)]);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         store.notify_drafts = true;
-        assert_eq!(delivery.begin(&store).unwrap().reviews, vec![pr(2, true)]);
+        assert_eq!(
+            delivery.begin(&store, &validated_hosts()).unwrap().reviews,
+            vec![pr(2, true)]
+        );
     }
 
     #[test]
@@ -336,22 +519,37 @@ mod tests {
         };
         let mut delivery = Delivery::default();
         assert!(store.reconcile(store.pending.clone()).fresh.is_empty());
-        store.queue_startup_notifications();
-        let batch = delivery.begin(&store).unwrap();
+        store.queue_startup_notifications(&validated_hosts());
+        let batch = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(batch.reviews, vec![pr(1, false), pr(2, false)]);
         assert!(matches!(
             Target::for_reviews(&batch.reviews),
             Target::Summary
         ));
-        assert!(delivery.complete(&mut store, &batch, false).is_none());
-        let retry = delivery.begin(&store).unwrap();
+        assert!(
+            delivery
+                .complete(&mut store, &batch, false, &validated_hosts())
+                .is_none()
+        );
+        let retry = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(batch.notices, retry.notices);
-        assert!(delivery.complete(&mut store, &retry, true).is_none());
-        assert!(delivery.begin(&store).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &retry, true, &validated_hosts())
+                .is_none()
+        );
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         // Existing behavior: each new app launch summarizes the waiting reviews.
         store = round_trip(&store);
-        store.queue_startup_notifications();
-        assert_eq!(delivery.begin(&store).unwrap().reviews.len(), 2);
+        store.queue_startup_notifications(&validated_hosts());
+        assert_eq!(
+            delivery
+                .begin(&store, &validated_hosts())
+                .unwrap()
+                .reviews
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -362,13 +560,16 @@ mod tests {
             ..Store::default()
         };
         let mut delivery = Delivery::default();
-        store.queue_startup_notifications();
-        assert!(delivery.begin(&store).is_none());
+        store.queue_startup_notifications(&validated_hosts());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         store = round_trip(&store);
         store.reconcile(vec![pr(1, false)]);
-        store.queue_startup_notifications();
+        store.queue_startup_notifications(&validated_hosts());
         store.notifications_muted = false;
-        assert_eq!(delivery.begin(&store).unwrap().reviews, vec![pr(1, false)]);
+        assert_eq!(
+            delivery.begin(&store, &validated_hosts()).unwrap().reviews,
+            vec![pr(1, false)]
+        );
     }
 
     #[test]
@@ -376,7 +577,7 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![pr(1, false)]);
-        let old = delivery.begin(&store).unwrap();
+        let old = delivery.begin(&store, &validated_hosts()).unwrap();
         let newer = PendingReview {
             requested_at: Some(T2.into()),
             rereview: true,
@@ -384,7 +585,9 @@ mod tests {
         };
         store.reconcile(vec![newer.clone()]);
         assert_eq!(store.notification_queue.len(), 1);
-        let new = delivery.complete(&mut store, &old, true).unwrap();
+        let new = delivery
+            .complete(&mut store, &old, true, &validated_hosts())
+            .unwrap();
         assert_eq!(new.reviews, vec![newer]);
         assert_ne!(old.notices, new.notices);
     }
@@ -395,17 +598,23 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![review.clone()]);
-        let old = delivery.begin(&store).unwrap();
+        let old = delivery.begin(&store, &validated_hosts()).unwrap();
         store.discard_notification(&review.key());
         store.snoozed.push(snooze(&review, 100));
         assert!(store.notifications_due().is_empty());
         assert!(store.take_expired(99).is_empty());
         assert_eq!(store.take_expired(100), vec![review]);
-        let reminder = delivery.complete(&mut store, &old, true).unwrap();
+        let reminder = delivery
+            .complete(&mut store, &old, true, &validated_hosts())
+            .unwrap();
         assert_ne!(old.notices, reminder.notices);
-        assert!(delivery.complete(&mut store, &reminder, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &reminder, true, &validated_hosts())
+                .is_none()
+        );
         assert!(store.take_expired(101).is_empty());
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
     }
 
     #[test]
@@ -419,10 +628,13 @@ mod tests {
         let mut delivery = Delivery::default();
         store.take_expired(100);
         assert_eq!(store.awake().len(), 1);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         store = round_trip(&store);
         store.notifications_muted = false;
-        assert_eq!(delivery.begin(&store).unwrap().reviews, vec![pr(1, false)]);
+        assert_eq!(
+            delivery.begin(&store, &validated_hosts()).unwrap().reviews,
+            vec![pr(1, false)]
+        );
     }
 
     #[test]
@@ -441,9 +653,12 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![pr(1, false)]);
-        let deferred = delivery.begin(&store).unwrap();
+        let deferred = delivery.begin(&store, &validated_hosts()).unwrap();
         delivery.deferred();
-        assert_eq!(delivery.begin(&store).unwrap().notices, deferred.notices);
+        assert_eq!(
+            delivery.begin(&store, &validated_hosts()).unwrap().notices,
+            deferred.notices
+        );
     }
 
     #[test]
@@ -517,12 +732,12 @@ mod tests {
         let mut delivery = Delivery::default();
         store.reconcile(vec![review.clone()]);
         assert!(store.snooze(&review.key(), 5, 0));
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         // Unsnooze reveals the review and cancels any undelivered alert.
         store.unsnooze(&review.key());
         store.reconcile(vec![review]);
         assert_eq!(store.awake().len(), 1);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         assert!(store.take_expired(100).is_empty());
     }
 
@@ -542,18 +757,26 @@ mod tests {
         assert!(store.notification_queue.is_empty());
         store = round_trip(&store);
         assert_eq!(store.take_expired(1_300), vec![short.clone()]);
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         store.notifications_muted = false;
-        let batch = delivery.begin(&store).unwrap();
+        let batch = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(batch.reviews, vec![short]);
-        assert!(delivery.complete(&mut store, &batch, true).is_none());
-        assert!(delivery.begin(&store).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &batch, true, &validated_hosts())
+                .is_none()
+        );
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         assert_eq!(store.take_expired(8_200), vec![long.clone()]);
-        let batch = delivery.begin(&store).unwrap();
+        let batch = delivery.begin(&store, &validated_hosts()).unwrap();
         assert_eq!(batch.reviews, vec![long]);
-        assert!(delivery.complete(&mut store, &batch, true).is_none());
+        assert!(
+            delivery
+                .complete(&mut store, &batch, true, &validated_hosts())
+                .is_none()
+        );
         assert!(store.take_expired(9_000).is_empty());
-        assert!(delivery.begin(&store).is_none());
+        assert!(delivery.begin(&store, &validated_hosts()).is_none());
         assert_eq!(store.snooze_minutes, 5);
     }
 

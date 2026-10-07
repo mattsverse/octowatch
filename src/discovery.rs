@@ -6,6 +6,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::repository::{RepositoryId, normalize_host};
+
 const MAX_DEPTH: usize = 5;
 const MAX_CONFIG_LINE_BYTES: u64 = 64 * 1024;
 const SKIPPED_DIRS: &[&str] = &[
@@ -20,8 +22,9 @@ const SKIPPED_DIRS: &[&str] = &[
 /// A GitHub repository with at least one clone on this machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalRepo {
-    /// `owner/name` as written in the remote URL.
-    pub slug: String,
+    /// Legacy discovery caches stored public GitHub slugs under `slug`.
+    #[serde(alias = "slug")]
+    pub id: RepositoryId,
     pub paths: Vec<PathBuf>,
 }
 
@@ -47,7 +50,7 @@ impl ScanResult {
         let mut found = BTreeMap::new();
         for repo in &self.repos {
             for path in &repo.paths {
-                record(&mut found, &repo.slug, path);
+                record(&mut found, &repo.id, path);
             }
         }
         let unavailable: Vec<_> = self
@@ -63,7 +66,7 @@ impl ScanResult {
                         path.starts_with(logical) || identity.starts_with(physical)
                     })
                 {
-                    record(&mut found, &repo.slug, path);
+                    record(&mut found, &repo.id, path);
                 }
             }
         }
@@ -74,32 +77,27 @@ impl ScanResult {
 /// Paths are keyed by their physical identity, while displayed/cache paths
 /// preserve the watched root (including an explicitly watched symlink).
 struct FoundRepo {
-    slug: String,
+    id: RepositoryId,
     paths: BTreeMap<PathBuf, PathBuf>,
 }
 
-fn record(found: &mut BTreeMap<String, FoundRepo>, slug: &str, path: &Path) {
-    let repo = found
-        .entry(slug.to_lowercase())
-        .or_insert_with(|| FoundRepo {
-            slug: slug.to_string(),
-            paths: BTreeMap::new(),
-        });
+fn record(found: &mut BTreeMap<RepositoryId, FoundRepo>, id: &RepositoryId, path: &Path) {
+    let repo = found.entry(id.clone()).or_insert_with(|| FoundRepo {
+        id: id.clone(),
+        paths: BTreeMap::new(),
+    });
     repo.paths
         .entry(normalized_path(path))
         .or_insert_with(|| path.to_path_buf());
 }
 
-fn grouped_repos(found: BTreeMap<String, FoundRepo>) -> Vec<LocalRepo> {
+fn grouped_repos(found: BTreeMap<RepositoryId, FoundRepo>) -> Vec<LocalRepo> {
     found
         .into_values()
         .map(|repo| {
             let mut paths: Vec<_> = repo.paths.into_values().collect();
             paths.sort();
-            LocalRepo {
-                slug: repo.slug,
-                paths,
-            }
+            LocalRepo { id: repo.id, paths }
         })
         .collect()
 }
@@ -107,13 +105,21 @@ fn grouped_repos(found: BTreeMap<String, FoundRepo>) -> Vec<LocalRepo> {
 /// Walks `roots` for checkouts and groups them by GitHub repository. Resolves
 /// gitfiles and commondir without traversing the external metadata directory.
 /// No subprocesses or filesystem watches are needed.
-pub fn discover(roots: &[PathBuf]) -> ScanResult {
-    discover_with_hosts(roots, &github_hosts())
+pub fn discover(roots: &[PathBuf], hosts: &[String]) -> ScanResult {
+    let config = dirs::home_dir()
+        .and_then(|home| fs::read_to_string(home.join(".ssh/config")).ok())
+        .unwrap_or_default();
+    discover_with_aliases(roots, hosts, &ssh_aliases(&config))
 }
 
-fn discover_with_hosts(roots: &[PathBuf], hosts: &[String]) -> ScanResult {
+fn discover_with_aliases(
+    roots: &[PathBuf],
+    hosts: &[String],
+    aliases: &BTreeMap<String, String>,
+) -> ScanResult {
     let mut scanner = Scanner {
         hosts,
+        aliases,
         found: BTreeMap::new(),
         issues: Vec::new(),
         visited: BTreeMap::new(),
@@ -181,7 +187,7 @@ pub fn within_roots(repos: &[LocalRepo], roots: &[PathBuf]) -> Vec<LocalRepo> {
                 .cloned()
                 .collect();
             (!paths.is_empty()).then(|| LocalRepo {
-                slug: repo.slug.clone(),
+                id: repo.id.clone(),
                 paths,
             })
         })
@@ -190,12 +196,13 @@ pub fn within_roots(repos: &[LocalRepo], roots: &[PathBuf]) -> Vec<LocalRepo> {
 
 struct Scanner<'a> {
     hosts: &'a [String],
-    found: BTreeMap<String, FoundRepo>,
+    aliases: &'a BTreeMap<String, String>,
+    found: BTreeMap<RepositoryId, FoundRepo>,
     issues: Vec<ScanIssue>,
     /// Revisit an overlapping root only when it offers more depth allowance.
     visited: BTreeMap<PathBuf, usize>,
     /// Main clones and linked worktrees share config; read it once per scan.
-    configs: BTreeMap<PathBuf, Result<Vec<String>, String>>,
+    configs: BTreeMap<PathBuf, Result<Vec<RepositoryId>, String>>,
     inspected: BTreeSet<PathBuf>,
 }
 
@@ -229,7 +236,8 @@ impl Scanner<'_> {
                     self.configs
                         .entry(config.clone())
                         .or_insert_with(|| {
-                            github_slugs(&config, self.hosts).map_err(|err| err.to_string())
+                            github_repositories(&config, self.hosts, self.aliases)
+                                .map_err(|err| err.to_string())
                         })
                         .clone()
                 }) {
@@ -340,37 +348,35 @@ fn checkout_config(git: &Path) -> Result<PathBuf, String> {
     Ok(common.join("config"))
 }
 
-/// `github.com` plus every SSH alias pointing at it, so remotes such as
-/// `git@github-work:owner/repo.git` are recognised.
-fn github_hosts() -> Vec<String> {
-    let mut hosts = vec!["github.com".to_string()];
-    let config = dirs::home_dir()
-        .and_then(|home| fs::read_to_string(home.join(".ssh").join("config")).ok())
-        .unwrap_or_default();
-    hosts.extend(ssh_aliases_for_github(&config));
-    hosts
-}
-
-fn ssh_aliases_for_github(config: &str) -> Vec<String> {
-    let mut aliases = Vec::new();
+/// Literal Host aliases in ~/.ssh/config. Keep the first HostName, including
+/// unsupported destinations, so a later block cannot rebind an alias to GitHub.
+/// Complex OpenSSH rules (Include, Match, wildcard/negated Host blocks) are not
+/// evaluated; only straightforward literal aliases are supported.
+fn ssh_aliases(config: &str) -> BTreeMap<String, String> {
+    let mut aliases = BTreeMap::new();
     let mut current: Vec<String> = Vec::new();
     for line in config.lines() {
-        let line = line.trim();
+        let line = line.split('#').next().unwrap_or_default().trim();
         let Some((key, value)) = line.split_once(|c: char| c.is_whitespace() || c == '=') else {
             continue;
         };
         let value = value.trim_start_matches(|c: char| c.is_whitespace() || c == '=');
-        match key.to_lowercase().as_str() {
+        match key.to_ascii_lowercase().as_str() {
             "host" => {
-                current = value
-                    .split_whitespace()
-                    .filter(|pattern| !pattern.contains(['*', '?', '!']))
-                    .map(str::to_lowercase)
-                    .collect();
+                let patterns: Vec<_> = value.split_whitespace().collect();
+                current = if patterns.iter().any(|p| p.contains(['*', '?', '!'])) {
+                    Vec::new()
+                } else {
+                    patterns.into_iter().filter_map(normalize_host).collect()
+                };
             }
-            "match" => current.clear(),
-            "hostname" if value.eq_ignore_ascii_case("github.com") => {
-                aliases.append(&mut current);
+            "match" | "include" => current.clear(),
+            "hostname" => {
+                if let Some(host) = normalize_host(value) {
+                    for alias in &current {
+                        aliases.entry(alias.clone()).or_insert_with(|| host.clone());
+                    }
+                }
             }
             _ => {}
         }
@@ -378,13 +384,18 @@ fn ssh_aliases_for_github(config: &str) -> Vec<String> {
     aliases
 }
 
-fn github_slugs(config: &Path, hosts: &[String]) -> std::io::Result<Vec<String>> {
+fn github_repositories(
+    config: &Path,
+    hosts: &[String],
+    aliases: &BTreeMap<String, String>,
+) -> std::io::Result<Vec<RepositoryId>> {
     use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
     // Stream arbitrary-size configs, bounding allocation before reading each
     // line. An oversized line warns and retains the checkout's cached state.
     let mut reader = BufReader::new(open_metadata(config)?);
     let mut bytes = Vec::new();
     let mut slugs = Vec::new();
+    let mut in_remote = false;
     loop {
         bytes.clear();
         let count = reader
@@ -410,50 +421,94 @@ fn github_slugs(config: &Path, hosts: &[String]) -> std::io::Result<Vec<String>>
         }
         let line =
             std::str::from_utf8(&bytes).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
-        let Some((key, value)) = line.trim().split_once('=') else {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_remote = line.to_ascii_lowercase().starts_with("[remote ");
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
             continue;
         };
-        if key.trim() == "url"
-            && let Some(slug) = parse_github_url(value.trim(), hosts)
+        if in_remote
+            && key.trim().eq_ignore_ascii_case("url")
+            && let Some(slug) = parse_github_url(value.trim(), hosts, aliases)
         {
             slugs.push(slug);
         }
     }
-    slugs.sort_by_key(|slug| slug.to_lowercase());
-    slugs.dedup_by_key(|slug| slug.to_lowercase());
+    slugs.sort();
+    slugs.dedup();
     Ok(slugs)
 }
 
-/// Extracts `owner/name` from the SSH, scp-like and HTTPS forms of a remote
-/// URL whose host is one of `hosts`.
-fn parse_github_url(url: &str, hosts: &[String]) -> Option<String> {
-    let (host, path) = match url.split_once("://") {
-        Some((_, rest)) => rest.split_once('/')?,
-        None => url.split_once(':')?,
+/// Only SSH remotes resolve aliases. HTTPS authorities must name an API host
+/// directly; an SSH alias never authorizes HTTPS on a different destination.
+fn parse_github_url(
+    url: &str,
+    hosts: &[String],
+    aliases: &BTreeMap<String, String>,
+) -> Option<RepositoryId> {
+    let (authority, path, ssh) = match url.split_once("://") {
+        Some(("https", rest)) => {
+            let (authority, path) = rest.split_once('/')?;
+            (authority, path, false)
+        }
+        Some(("ssh", rest)) => {
+            let (authority, path) = rest.split_once('/')?;
+            (authority, path, true)
+        }
+        Some(_) => return None,
+        None => {
+            let (authority, path) = url.split_once(':')?;
+            (authority, path, true)
+        }
     };
-    let host = host.rsplit('@').next()?;
-    let host = host.split(':').next()?.to_lowercase();
-    if !hosts.contains(&host) {
+    let authority = authority.rsplit('@').next()?;
+    let raw_host = if let Some((host, port)) = authority.split_once(':') {
+        let port: u16 = port.parse().ok()?;
+        if port == 0 || (!ssh && port != 443) {
+            return None;
+        }
+        host
+    } else {
+        authority
+    };
+    let host = normalize_host(raw_host)?;
+    let host = if ssh {
+        aliases.get(&host).unwrap_or(&host)
+    } else {
+        &host
+    };
+    if !hosts.iter().any(|known| known.eq_ignore_ascii_case(host)) {
         return None;
     }
     let path = path.trim_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let (owner, name) = path.split_once('/')?;
-    (!owner.is_empty() && !name.is_empty() && !name.contains('/'))
-        .then(|| format!("{owner}/{name}"))
+    let valid_component = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+    };
+    (valid_component(owner) && valid_component(name))
+        .then(|| RepositoryId::new(host, &format!("{owner}/{name}")))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_github_url, ssh_aliases_for_github};
-
-    use super::{LocalRepo, ScanIssue, ScanResult, discover, discover_with_hosts, within_roots};
+    use super::*;
     use std::{
         fs,
         path::{Path, PathBuf},
         process::Command,
         sync::atomic::{AtomicU64, Ordering},
     };
+
+    fn discover(roots: &[PathBuf]) -> ScanResult {
+        super::discover_with_aliases(roots, &hosts(), &BTreeMap::new())
+    }
 
     struct Fixture(PathBuf);
 
@@ -536,17 +591,92 @@ mod tests {
     }
 
     #[test]
+    fn enterprise_worktree_survives_metadata_outage_and_remote_changes() {
+        let f = Fixture::new();
+        let main = f.path("external/main");
+        init_repo(&main);
+        git(
+            &main,
+            &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+        );
+        git(
+            &main,
+            &["remote", "add", "upstream", "git@work:owner/repo.git"],
+        );
+        let root = f.path("watched");
+        fs::create_dir(&root).unwrap();
+        let worktree = root.join("worktree");
+        git(
+            &main,
+            &["worktree", "add", "--detach", worktree.to_str().unwrap()],
+        );
+        let roots = [root, worktree.clone()];
+        let aliases = ssh_aliases("Host work\n HostName github.example.com\n");
+        let mut previous = discover_with_aliases(&roots, &hosts(), &aliases).repos;
+        assert_eq!(previous.len(), 2);
+        assert!(
+            previous
+                .iter()
+                .all(|repo| repo.paths == vec![worktree.clone()])
+        );
+        assert_ne!(previous[0].id, previous[1].id);
+
+        // Both hosts share the external config but keep separate cache entries.
+        fs::rename(main.join(".git"), f.path("offline")).unwrap();
+        let mut unavailable = discover_with_aliases(&roots, &hosts(), &aliases);
+        assert_eq!(unavailable.issues.len(), 1);
+        unavailable.retain_unavailable(&previous);
+        assert_eq!(unavailable.repos, previous);
+        fs::rename(f.path("offline"), main.join(".git")).unwrap();
+
+        git(
+            &main,
+            &[
+                "remote",
+                "set-url",
+                "upstream",
+                "git@work:owner/changed.git",
+            ],
+        );
+        let mut recovered = discover_with_aliases(&roots, &hosts(), &aliases);
+        assert!(recovered.issues.is_empty());
+        recovered.retain_unavailable(&previous);
+        assert!(
+            recovered
+                .repos
+                .iter()
+                .any(|repo| repo.id == RepositoryId::new("github.com", "owner/repo"))
+        );
+        assert!(
+            recovered
+                .repos
+                .iter()
+                .any(|repo| repo.id == RepositoryId::new("github.example.com", "owner/changed"))
+        );
+        assert_eq!(recovered.repos.len(), 2);
+        previous = recovered.repos;
+        git(&main, &["worktree", "remove", worktree.to_str().unwrap()]);
+        let mut removed = discover_with_aliases(&roots, &hosts(), &aliases);
+        // Removing an explicitly watched folder is unavailable, so scan the
+        // readable parent alone to establish that the checkout disappeared.
+        assert_eq!(removed.issues.len(), 1);
+        removed = discover_with_aliases(&roots[..1], &hosts(), &aliases);
+        removed.retain_unavailable(&previous);
+        assert!(removed.repos.is_empty());
+    }
+
+    #[test]
     fn observes_create_move_remove_and_remote_changes() {
         let f = Fixture::new();
         let roots = [f.0.clone()];
         assert!(discover(&roots).repos.is_empty());
         let clone = f.checkout("clone", &["git@github.com:owner/old.git"]);
-        assert_eq!(discover(&roots).repos[0].slug, "owner/old");
+        assert_eq!(discover(&roots).repos[0].id.slug, "owner/old");
         write_remotes(
             &clone.join(".git/config"),
             &["https://github.com/owner/new.git"],
         );
-        assert_eq!(discover(&roots).repos[0].slug, "owner/new");
+        assert_eq!(discover(&roots).repos[0].id.slug, "owner/new");
         let moved = f.path("moved");
         fs::rename(&clone, &moved).unwrap();
         assert_eq!(discover(&roots).repos[0].paths, vec![moved.clone()]);
@@ -582,7 +712,7 @@ mod tests {
         let scan = discover(std::slice::from_ref(&watched));
         assert!(scan.issues.is_empty(), "{:?}", scan.issues);
         assert_eq!(scan.repos.len(), 2);
-        assert_eq!(scan.repos[0].slug, "Owner/Repo");
+        assert_eq!(scan.repos[0].id.slug, "owner/repo");
         assert_eq!(scan.repos[0].paths, vec![worktree.clone()]);
         git(
             &main,
@@ -595,7 +725,7 @@ mod tests {
         );
         let scan = discover(&[watched, main.clone()]);
         assert!(scan.issues.is_empty());
-        assert_eq!(scan.repos[0].slug, "owner/changed");
+        assert_eq!(scan.repos[0].id.slug, "owner/changed");
         assert_eq!(scan.repos[0].paths.len(), 2);
     }
 
@@ -654,11 +784,11 @@ mod tests {
         );
         let scan = discover(std::slice::from_ref(&parent));
         assert_eq!(scan.repos.len(), 1);
-        assert_eq!(scan.repos[0].slug, "o/parent");
+        assert_eq!(scan.repos[0].id.slug, "o/parent");
         let scan = discover(&[parent, submodule.clone()]);
         assert!(scan.issues.is_empty());
         assert_eq!(scan.repos.len(), 2);
-        assert_eq!(scan.repos[0].slug, "o/module");
+        assert_eq!(scan.repos[0].id.slug, "o/module");
         assert_eq!(scan.repos[0].paths, vec![submodule]);
     }
 
@@ -690,9 +820,10 @@ mod tests {
         }
         f.checkout("local", &["git@gitlab.com:o/local.git"]);
         f.checkout("local/nested", &["git@github.com:o/nested.git"]);
-        let scan = discover_with_hosts(
+        let scan = discover_with_aliases(
             std::slice::from_ref(&f.0),
-            &["github-work".into(), "github.com".into()],
+            &["github.com".into()],
+            &ssh_aliases("Host github-work\n HostName github.com\n"),
         );
         assert!(scan.issues.is_empty());
         assert_eq!(scan.repos.len(), 1);
@@ -793,6 +924,7 @@ mod tests {
         assert_eq!(previous.len(), 1);
         let mut store = Store {
             pending: vec![PendingReview {
+                host: crate::repository::default_host(),
                 repo: "o/r".into(),
                 number: 1,
                 title: "review".into(),
@@ -803,6 +935,7 @@ mod tests {
                 requested_at: None,
             }],
             snoozed: vec![Snooze {
+                host: crate::repository::default_host(),
                 repo: "o/r".into(),
                 number: 1,
                 until: 100,
@@ -815,11 +948,7 @@ mod tests {
         fs::rename(&metadata, f.path("offline")).unwrap();
         let mut scan = discover(std::slice::from_ref(&root));
         scan.retain_unavailable(&previous);
-        let watched = scan
-            .repos
-            .iter()
-            .map(|repo| repo.slug.to_lowercase())
-            .collect();
+        let watched = scan.repos.iter().map(|repo| repo.id.clone()).collect();
         store.retain_watched(&watched);
         assert_eq!(
             store.snoozed.len(),
@@ -850,7 +979,7 @@ mod tests {
         symlink(&pointer, clone.join(".git/commondir")).unwrap();
         let root = f.path("watched");
         let previous = discover(std::slice::from_ref(&root)).repos;
-        assert_eq!(previous[0].slug, "o/shared");
+        assert_eq!(previous[0].id.slug, "o/shared");
         fs::rename(&pointer, f.path("offline-pointer")).unwrap();
         let mut scan = discover(std::slice::from_ref(&root));
         scan.retain_unavailable(&previous);
@@ -877,7 +1006,7 @@ mod tests {
                         scan.issues.is_empty(),
                         "length {content_length}, ending {ending:?}"
                     );
-                    assert_eq!(scan.repos[0].slug, "o/boundary");
+                    assert_eq!(scan.repos[0].id.slug, "o/boundary");
                 } else {
                     assert!(scan.repos.is_empty());
                     assert_eq!(scan.issues.len(), 1, "ending {ending:?}");
@@ -927,7 +1056,7 @@ mod tests {
             1,
             "valid configs must not be excluded by their total size"
         );
-        assert_eq!(scan.repos[0].slug, "o/large");
+        assert_eq!(scan.repos[0].id.slug, "o/large");
         assert!(scan.issues.is_empty());
     }
 
@@ -954,12 +1083,12 @@ mod tests {
     fn a_successful_checkout_overrides_a_broader_scan_failure() {
         let path = PathBuf::from("/root/clone");
         let previous = [LocalRepo {
-            slug: "o/old".into(),
+            id: RepositoryId::new("github.com", "o/old"),
             paths: vec![path.clone()],
         }];
         let mut scan = ScanResult {
             repos: vec![LocalRepo {
-                slug: "o/new".into(),
+                id: RepositoryId::new("github.com", "o/new"),
                 paths: vec![path.clone()],
             }],
             issues: vec![ScanIssue {
@@ -970,7 +1099,7 @@ mod tests {
         };
         scan.retain_unavailable(&previous);
         assert_eq!(scan.repos.len(), 1);
-        assert_eq!(scan.repos[0].slug, "o/new");
+        assert_eq!(scan.repos[0].id.slug, "o/new");
     }
 
     #[test]
@@ -1009,7 +1138,7 @@ mod tests {
             assert_eq!(
                 scan.repos
                     .iter()
-                    .find(|repo| repo.slug == "o/shared")
+                    .find(|repo| repo.id.slug == "o/shared")
                     .unwrap()
                     .paths
                     .len(),
@@ -1022,38 +1151,84 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_remote_forms() {
-        let hosts = vec!["github.com".to_string(), "github-work".to_string()];
-        for url in [
-            "git@github.com:owner/repo.git",
-            "git@github.com:owner/repo",
-            "ssh://git@github.com/owner/repo.git",
-            "ssh://git@github.com:22/owner/repo.git",
-            "https://github.com/owner/repo.git",
-            "https://github.com/owner/repo/",
-            "git@github-work:owner/repo.git",
-        ] {
-            assert_eq!(
-                parse_github_url(url, &hosts).as_deref(),
-                Some("owner/repo"),
-                "{url}"
-            );
-        }
-        assert_eq!(
-            parse_github_url("git@gitlab.com:owner/repo.git", &hosts),
-            None
-        );
-        assert_eq!(parse_github_url("https://github.com/owner", &hosts), None);
-        assert_eq!(parse_github_url("/some/local/path", &hosts), None);
+    fn hosts() -> Vec<String> {
+        ["github.com", "github.example.com", "acme.ghe.com"]
+            .map(str::to_string)
+            .to_vec()
     }
 
     #[test]
-    fn finds_ssh_aliases() {
-        let config = "Host github.com\n  HostName github.com\nHost github-work gh\n  HostName github.com\nHost other\n  HostName example.com\nHost *\n  HostName github.com\n";
-        assert_eq!(
-            ssh_aliases_for_github(config),
-            vec!["github.com", "github-work", "gh"]
+    fn parses_remote_forms_and_canonicalizes_aliases() {
+        let aliases = ssh_aliases(
+            "Host work\n HostName github.example.com\nHost public\n HostName github.com",
         );
+        for (url, host) in [
+            ("git@github.com:Owner/Repo.git", "github.com"),
+            (
+                "ssh://git@github.example.com/Owner/Repo.git",
+                "github.example.com",
+            ),
+            ("ssh://git@work:2222/Owner/Repo.git", "github.example.com"),
+            (
+                "https://github.example.com:443/Owner/Repo.git",
+                "github.example.com",
+            ),
+            ("https://ACME.GHE.COM/Owner/Repo/", "acme.ghe.com"),
+            ("git@public:Owner/Repo", "github.com"),
+        ] {
+            assert_eq!(
+                parse_github_url(url, &hosts(), &aliases),
+                Some(RepositoryId::new(host, "owner/repo")),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://work/owner/repo.git",
+            "http://github.com/owner/repo",
+            "git://github.com/owner/repo",
+            "git@gitlab.com:owner/repo.git",
+            "https://github.com:8443/owner/repo",
+            "ssh://github.com:bad/owner/repo",
+            "https://github.com/owner",
+            "https://github.com/owner/repo/pull/1",
+            "https://github.com/owner/repo?x=1",
+            "/some/local/path",
+            "../owner/repo",
+            "git@unknown.ghe.com:owner/repo.git",
+            "https://github.com/../repo",
+        ] {
+            assert_eq!(parse_github_url(url, &hosts(), &aliases), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn aliases_keep_destinations_separate_and_first_hostname_wins() {
+        let config = "Host work gh\n HostName=github.example.com # comment\nHost public\n HostName github.com\nHost other\n HostName gitlab.com\nHost other\n HostName github.com\nHost neg !neg\n HostName github.com\nHost *\n HostName github.com\nMatch all\n HostName github.com\n";
+        let aliases = ssh_aliases(config);
+        assert_eq!(aliases.get("work").unwrap(), "github.example.com");
+        assert_eq!(aliases.get("gh").unwrap(), "github.example.com");
+        assert_eq!(aliases.get("public").unwrap(), "github.com");
+        assert!(!aliases.contains_key("neg"));
+        assert_eq!(
+            parse_github_url("git@other:owner/repo", &hosts(), &aliases),
+            None
+        );
+    }
+
+    #[test]
+    fn discovery_groups_by_host_and_slug_without_collisions() {
+        let root =
+            std::env::temp_dir().join(format!("octowatcher-discovery-{}", std::process::id()));
+        for clone in ["one", "two"] {
+            let dir = root.join(clone).join(".git");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("config"), "[remote \"origin\"]\n url = git@github.com:Owner/Repo.git\n[remote \"upstream\"]\n url = https://github.example.com/owner/repo.git\n[remote \"duplicate\"]\n url = git@github.com:owner/repo.git\n[submodule \"ignored\"]\n url = https://github.com/other/repo.git\n").unwrap();
+        }
+        let found =
+            discover_with_aliases(std::slice::from_ref(&root), &hosts(), &BTreeMap::new()).repos;
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|repo| repo.paths.len() == 2));
+        assert_ne!(found[0].id, found[1].id);
     }
 }
