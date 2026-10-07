@@ -11,6 +11,7 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Includes team requests.** It counts requests made to a team you belong to. The request clears once you review, even if the rest of the team hasn't.
 - **Snoozes a review for later.** Snooze a pull request from its notification or from the window. It leaves the tray until the snooze runs out, then notifies you again. A new review request on it ends the snooze early.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
+- **Starts quietly at login when you choose.** Enable **Launch at login** in Settings to keep checking from the tray after you sign in. Opening Octowatcher yourself shows its window, and repeated launches reopen the running app.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
@@ -84,20 +85,32 @@ This tab sets how often Octowatcher checks GitHub: every 1, 2, 5, 10, 15, 30 or 
 
 It also sets how long a snooze lasts: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default is 5 minutes.
 
+**Launch at login** is off by default. Switch it on to start Octowatcher quietly in the tray when you sign in. It is available for signed macOS release apps installed in `/Applications` or `~/Applications` on macOS 13 or later, and for Linux `.deb`, `.rpm`, and AppImage installs. Development binaries show this setting as unavailable; older macOS versions can still launch and run Octowatcher normally.
+
+On macOS, this uses the system login item service. If approval is needed, allow Octowatcher in **System Settings → General → Login Items**. On Linux, it creates `~/.config/autostart/com.matteogassend.octowatcher.desktop` (or under `$XDG_CONFIG_HOME` when set). Keep an AppImage in a permanent location before enabling this setting; after moving or renaming it, turn launch at login off and back on to register its new path. Updates installed in place keep that path.
+
+Disabling startup in your desktop's login settings is respected; Octowatcher does not turn it back on when it starts. Deleting `state.json` resets app preferences but does not remove a system login registration; switch **Launch at login** off to remove it.
+
 ### Running in the background
 
 Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To get the window back, choose **Open Octowatcher** from the tray menu, or on macOS click the Dock icon. To stop the app, choose **Quit Octowatcher**.
 
+On Linux, **Close** minimizes the window and leaves its taskbar entry available. GPUI's Linux backend otherwise exits when the last window is destroyed. Opening Octowatcher again asks the desktop to restore the window; Wayland desktops may only mark it as needing attention, in which case use its taskbar entry. On macOS, Close removes the window as before.
+
+There is one running instance per user, even if you launch another copy or start it from a terminal. An ordinary launch brings back that instance's window; a login launch leaves it quietly in the background. This prevents duplicate checks, notifications, and simultaneous state writes. **Quit Octowatcher** stops it until you open it again or next sign in, without disabling launch at login. Restarting after an update opens the new version's window.
+
+For a quiet manual launch, pass `--background` to the binary or AppImage (on macOS, use `open /Applications/Octowatcher.app --args --background`). If the app cannot create its tray icon, it opens the window so you can still access it. On Linux, the desktop must still provide a visible AppIndicator tray; a successfully created icon cannot tell Octowatcher whether the desktop displays it.
+
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories, check interval and snooze length), your snoozes, and the current review list for the repositories you watch to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories, check interval, snooze length and last observed launch-at-login status), your snoozes, and the current review list for the repositories you watch to one JSON file:
 
 | Platform | Path |
 | --- | --- |
 | macOS | `~/Library/Application Support/octowatcher/state.json` |
 | Linux | `~/.config/octowatcher/state.json` |
 
-Delete this file to reset Octowatcher. Everything it sends to GitHub goes through `gh`.
+Delete this file to reset Octowatcher's saved preferences and review state. Login registration is managed separately by the operating system. Everything it sends to GitHub goes through `gh`.
 
 ## Troubleshooting
 

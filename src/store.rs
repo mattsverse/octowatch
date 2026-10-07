@@ -23,6 +23,8 @@ pub struct Store {
     pub snooze_minutes: u64,
     /// Reviews the user put aside for now.
     pub snoozed: Vec<Snooze>,
+    /// Last observed login registration; the OS remains authoritative.
+    pub launch_at_login: bool,
 }
 
 impl Default for Store {
@@ -34,6 +36,7 @@ impl Default for Store {
             poll_minutes: 2,
             snooze_minutes: 5,
             snoozed: Vec::new(),
+            launch_at_login: false,
         }
     }
 }
@@ -366,6 +369,34 @@ mod tests {
             pr("Owner/Repo", 7, None).key(),
             ("owner/repo".to_string(), 7)
         );
+    }
+
+    #[test]
+    fn legacy_settings_default_login_off_and_preserve_existing_preferences() {
+        let legacy = r#"{
+            "roots": ["/home/user/Dev"],
+            "disabled": ["owner/repo"],
+            "poll_minutes": 15,
+            "snooze_minutes": 30,
+            "pending": [],
+            "snoozed": []
+        }"#;
+        let mut store: Store = serde_json::from_str(legacy).unwrap();
+        assert!(!store.launch_at_login);
+        assert_eq!(store.poll_minutes, 15);
+        assert_eq!(store.snooze_minutes, 30);
+        assert_eq!(
+            store.roots,
+            vec![std::path::PathBuf::from("/home/user/Dev")]
+        );
+        assert!(store.disabled.contains("owner/repo"));
+        store.launch_at_login = true;
+        let saved = serde_json::to_string(&store).unwrap();
+        let restored: Store = serde_json::from_str(&saved).unwrap();
+        assert!(restored.launch_at_login);
+        assert_eq!(restored.poll_minutes, 15);
+        assert_eq!(restored.roots, store.roots);
+        assert_eq!(restored.disabled, store.disabled);
     }
 
     #[test]

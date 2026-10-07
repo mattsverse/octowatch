@@ -4068,12 +4068,17 @@ dependencies = [
  "chrono",
  "dirs 7.0.0",
  "gpui",
+ "gtk",
+ "libc",
  "mac-usernotifications",
  "notify-rust",
+ "objc2",
+ "objc2-foundation",
  "png 0.18.1",
  "semver",
  "serde",
  "serde_json",
+ "tempfile",
  "tray-icon",
 ]
 

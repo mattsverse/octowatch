@@ -13,6 +13,7 @@ async-channel = "2.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 gpui = "0.2.2"
+libc = "0.2"
 png = "0.18"
 semver = "1"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -21,9 +22,17 @@ tray-icon = "0.26"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = "0.3.1"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventManager", "NSAppleEventDescriptor", "NSError", "NSProcessInfo", "NSString"] }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 notify-rust = "4.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+[dev-dependencies]
+tempfile = "3"
 
 [package.metadata.bundle]
 name = "Octowatcher"

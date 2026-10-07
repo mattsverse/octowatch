@@ -36,6 +36,11 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(pending: &[PendingReview]) -> Result<Self> {
+        // GPUI has its own X11/Wayland event loop; it doesn't initialize GTK
+        // for the AppIndicator and its menu. An initialization failure must
+        // return an error so quiet startup can fall back to opening a window.
+        #[cfg(target_os = "linux")]
+        gtk::init().map_err(|err| anyhow::anyhow!("could not initialize GTK: {err}"))?;
         let builder = TrayIconBuilder::new();
         // Templates are a macOS notion; elsewhere the icon is drawn as is.
         #[cfg(target_os = "macos")]
@@ -65,6 +70,33 @@ impl Tray {
 
 /// Routes clicks on the tray menu for as long as the app runs.
 pub fn listen(cx: &mut App) {
+    #[cfg(target_os = "linux")]
+    cx.spawn(async move |cx| {
+        loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+            if cx
+                .update(|_| {
+                    if gtk::is_initialized_main_thread() {
+                        let context = gtk::glib::MainContext::default();
+                        // Keep GTK's tray/D-Bus callbacks running even with no
+                        // GPUI window. Bound each turn to avoid starving GPUI.
+                        for _ in 0..32 {
+                            if !context.pending() {
+                                break;
+                            }
+                            context.iteration(false);
+                        }
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    })
+    .detach();
     let (tx, rx) = async_channel::unbounded();
     // The handler fires on the main thread from AppKit; hand events over to
     // the app's executor instead of acting from inside the callback.
@@ -79,7 +111,7 @@ pub fn listen(cx: &mut App) {
             } else if id == REFRESH_ID {
                 cx.update(crate::refresh)
             } else if id == RESTART_ID {
-                cx.update(|cx| cx.restart())
+                cx.update(crate::restart)
             } else if id == CHECK_UPDATES_ID {
                 cx.update(crate::check_for_updates)
             } else if id == INSTALL_ID {
