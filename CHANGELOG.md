@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.3](https://github.com/mattsverse/octowatch/compare/v0.4.2...v0.4.3) (2026-10-07)
+
+
+### Bug Fixes
+
+* **release:** build the DMG as APFS ([9ac985e](https://github.com/mattsverse/octowatch/commit/9ac985e4246440b7c1084f53ac710da9f8a44ebe))
+* **release:** build the DMG as APFS ([f4aa115](https://github.com/mattsverse/octowatch/commit/f4aa1155125ef44a7218347f1a7384d05701c9a6))
+
 ## [0.4.2](https://github.com/mattsverse/octowatch/compare/v0.4.1...v0.4.2) (2026-10-07)
 
 
