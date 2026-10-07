@@ -201,6 +201,8 @@ mod tests {
         futures_lite::future::block_on(async {
             let review = PendingReview {
                 host: crate::repository::default_host(),
+                account: "alice".into(),
+                account_id: 1,
                 repo: "test/repo".into(),
                 number: 1,
                 title: "Test review".into(),
@@ -212,25 +214,29 @@ mod tests {
             };
             let single = Target::Single(review.clone());
             let summary = Target::Summary;
-            let mut store = Store::default();
+            let mut store = Store {
+                available_accounts: ["alice".into()].into(),
+                local_repos: ["test/repo".into()].into(),
+                ..Store::default()
+            };
+            let checked_accounts = [("alice".into(), 1)].into();
             let mut delivery = Delivery::default();
-            let validated_hosts = [review.host.clone()].into();
-            store.reconcile(vec![review.clone()]);
+            store.reconcile(vec![review.clone()], &checked_accounts);
             for failure in ["denied", "failure"] {
-                let batch = delivery.begin(&store, &validated_hosts).unwrap();
+                let batch = delivery.begin(&store).unwrap();
                 let shown = send(0, "Contract test", failure, Some(single.action())).await;
                 assert!(shown.is_err());
-                delivery.complete(&mut store, &batch, false, &validated_hosts);
+                delivery.complete(&mut store, &batch, false);
                 assert_eq!(store.notification_queue.len(), 1);
             }
-            let batch = delivery.begin(&store, &validated_hosts).unwrap();
+            let batch = delivery.begin(&store).unwrap();
             let shown = send(0, "Contract test", "click:default", Some(single.action()))
                 .await
                 .unwrap();
-            delivery.complete(&mut store, &batch, true, &validated_hosts);
+            delivery.complete(&mut store, &batch, true);
             // A real D-Bus send has completed; no click was needed for acknowledgment.
-            store.reconcile(vec![review.clone()]);
-            assert!(delivery.begin(&store, &validated_hosts).is_none());
+            store.reconcile(vec![review.clone()], &checked_accounts);
+            assert!(delivery.begin(&store).is_none());
             let response = shown.response(|_| std::future::pending()).await;
             assert_eq!(
                 single.respond(response, &store),

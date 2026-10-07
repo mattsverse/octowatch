@@ -1,0 +1,23 @@
+{
+  "hosts": {
+    "github.com": [
+      {
+        "login": "alice",
+        "state": "error",
+        "active": true
+      },
+      {
+        "login": "bob",
+        "state": "success",
+        "active": false
+      }
+    ],
+    "enterprise.example.com": [
+      {
+        "login": "enterprise",
+        "state": "success",
+        "active": true
+      }
+    ]
+  }
+}

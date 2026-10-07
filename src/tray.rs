@@ -121,7 +121,10 @@ pub fn listen(cx: &mut App) {
                 cx.update(crate::install_update)
             } else if id == QUIT_ID {
                 cx.update(|cx| cx.quit())
-            } else if let Some(url) = id.strip_prefix(OPEN_PREFIX) {
+            } else if let Some((_, url)) = id
+                .strip_prefix(OPEN_PREFIX)
+                .and_then(|id| id.split_once(':'))
+            {
                 cx.update(|cx| cx.open_url(url))
             } else {
                 Ok(())
@@ -144,7 +147,12 @@ fn build_menu(pending: &[PendingReview], update: UpdateItem, muted: bool) -> Res
         ))?;
     }
     for pr in pending {
-        let mut label = format!("{}#{}: {}", pr.repo_label(), pr.number, truncate(&pr.title));
+        let mut label = format!(
+            "{}#{}: {}",
+            pr.request_label(),
+            pr.number,
+            truncate(&pr.title)
+        );
         if pr.rereview {
             label.push_str("  (re-review)");
         }
@@ -152,7 +160,7 @@ fn build_menu(pending: &[PendingReview], update: UpdateItem, muted: bool) -> Res
             label.push_str("  (draft)");
         }
         menu.append(&MenuItem::with_id(
-            format!("{OPEN_PREFIX}{}", pr.url),
+            format!("{OPEN_PREFIX}{}:{}", pr.account, pr.url),
             label,
             true,
             None,
