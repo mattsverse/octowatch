@@ -199,27 +199,39 @@ impl Store {
         }
     }
 
-    /// Replace only complete repository snapshots, retaining failed repos and
-    /// their snoozes. Repositories no longer watched still leave the queue.
+    /// Add confirmed requests even from incomplete checks. Only complete
+    /// snapshots can remove requests; incomplete checks cannot regress saved
+    /// timestamps or end snoozes without evidence of a newer request.
+    /// Repositories no longer watched still leave the queue.
     pub fn reconcile_repositories(
         &mut self,
         fetched: Vec<PendingReview>,
         completed: &HashSet<String>,
         watched: &HashSet<String>,
     ) -> Reconciled {
+        let known: HashMap<_, _> = self.pending.iter().map(|pr| (pr.key(), pr)).collect();
         let mut pending: Vec<_> = fetched
             .into_iter()
-            .filter(|pr| {
-                let repo = pr.repo.to_lowercase();
-                watched.contains(&repo) && completed.contains(&repo)
+            .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
+            .map(|pr| {
+                if !completed.contains(&pr.repo.to_lowercase())
+                    && let Some(previous) = known.get(&pr.key())
+                    && previous.requested_at > pr.requested_at
+                {
+                    return (*previous).clone();
+                }
+                pr
             })
             .collect();
+        let confirmed: HashSet<_> = pending.iter().map(PendingReview::key).collect();
         pending.extend(
             self.pending
                 .iter()
                 .filter(|pr| {
                     let repo = pr.repo.to_lowercase();
-                    watched.contains(&repo) && !completed.contains(&repo)
+                    watched.contains(&repo)
+                        && !completed.contains(&repo)
+                        && !confirmed.contains(&pr.key())
                 })
                 .cloned(),
         );
@@ -519,9 +531,9 @@ mod tests {
             ..Store::default()
         };
         let watched = HashSet::from(["o/failed".into(), "o/good".into()]);
-        // A partial fetch from the failed repository cannot overwrite it.
+        // A confirmed request with the same timestamp keeps its saved snooze.
         let result = store.reconcile_repositories(
-            vec![pr("o/failed", 1, Some(T2)), pr("o/good", 3, Some(T2))],
+            vec![pr("o/failed", 1, Some(T1)), pr("o/good", 3, Some(T2))],
             &HashSet::from(["o/good".into()]),
             &watched,
         );
@@ -544,6 +556,38 @@ mod tests {
         // or closure, and won't preserve old state as though it were an error.
         store.reconcile_repositories(vec![], &watched, &watched);
         assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn incomplete_check_adds_confirmed_requests_without_regressing_saved_timestamps() {
+        let mut store = Store {
+            pending: vec![pr("o/r", 1, Some(T2)), pr("o/r", 2, Some(T1))],
+            snoozed: vec![snooze("o/r", 1, Some(T2)), snooze("o/r", 2, Some(T1))],
+            ..Store::default()
+        };
+        let result = store.reconcile_repositories(
+            vec![
+                pr("o/r", 1, Some(T1)),
+                pr("o/r", 2, Some(T2)),
+                pr("o/r", 3, Some(T1)),
+            ],
+            &HashSet::new(),
+            &HashSet::from(["o/r".into()]),
+        );
+        assert_eq!(
+            store.pending,
+            vec![
+                pr("o/r", 1, Some(T2)),
+                pr("o/r", 2, Some(T2)),
+                pr("o/r", 3, Some(T1))
+            ]
+        );
+        assert_eq!(
+            result.fresh,
+            vec![pr("o/r", 2, Some(T2)), pr("o/r", 3, Some(T1))]
+        );
+        assert_eq!(store.snoozed, vec![snooze("o/r", 1, Some(T2))]);
+        assert!(result.snoozes_changed);
     }
 
     #[test]

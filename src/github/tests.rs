@@ -506,3 +506,79 @@ fn unavailable_nested_nodes_and_missing_history_timestamps_fail_safely() {
         assert_eq!(fetched.errors.len(), 1);
     }
 }
+
+#[test]
+fn unreadable_team_does_not_hide_a_confirmed_direct_request() {
+    let mut forbidden_lookups = 0;
+    let fetched = fetch_with(&HashSet::from(["o/r".into()]), "me", &mut |query, variables| {
+        let id = variables.iter().find(|(name, _)| *name == "id").map(|(_, value)| value.as_str());
+        let data = match query {
+            REPOSITORY_QUERY => repository(vec![
+                pr(1, vec![team("unreadable"), user("me")]),
+                pr(2, vec![team("unreadable")]),
+                pr(3, vec![team("readable")]),
+            ], None),
+            MEMBERS_QUERY if id == Some("unreadable") => {
+                forbidden_lookups += 1;
+                return Ok(json!({"data": {"node": {"members": null}}, "errors": [{"message": "membership forbidden"}]}).to_string());
+            }
+            MEMBERS_QUERY => json!({"node": {"members": page(vec![json!({"login": "me"})], None)}}),
+            HISTORY_QUERY => json!({"node": {"timelineItems": page(vec![
+                if id == Some("PR_1") {requested(user("me"), T1)} else {requested(team("readable"), T2)}
+            ], None)}}),
+            _ => panic!("unexpected query"),
+        };
+        Ok(json!({"data": data}).to_string())
+    }).unwrap();
+    assert_eq!(
+        fetched
+            .pending
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<Vec<_>>(),
+        vec![1, 3],
+        "confirmed direct and readable-team requests must reach the queue"
+    );
+    assert_eq!(
+        forbidden_lookups, 1,
+        "failed membership lookups should be cached for this poll"
+    );
+    assert!(
+        fetched.completed_repos.is_empty(),
+        "unknown teams must not authorize clearing saved requests"
+    );
+    assert!(fetched.errors[0].contains("membership forbidden"));
+
+    // Exercise the Store boundary too: positive results from this incomplete
+    // repository must enter the queue without discarding its uncertain request.
+    let mut saved = fetched.pending[0].clone();
+    saved.number = 2;
+    let mut store = crate::store::Store {
+        pending: vec![saved.clone()],
+        ..Default::default()
+    };
+    assert!(store.snooze(&saved.key(), 60, 1_000));
+    let result = store.reconcile_repositories(
+        fetched.pending,
+        &fetched.completed_repos,
+        &HashSet::from(["o/r".into()]),
+    );
+    assert_eq!(
+        store
+            .pending
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<HashSet<_>>(),
+        HashSet::from([1, 2, 3])
+    );
+    assert_eq!(
+        result
+            .fresh
+            .iter()
+            .map(|pr| pr.number)
+            .collect::<HashSet<_>>(),
+        HashSet::from([1, 3])
+    );
+    assert_eq!(store.snoozed.len(), 1);
+    assert_eq!(store.next_snooze_until(), Some(4_600));
+}

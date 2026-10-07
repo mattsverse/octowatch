@@ -5,7 +5,7 @@ mod store;
 mod tray;
 mod updater;
 
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{collections::HashSet, future::Future, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Local};
 use gpui::{
@@ -80,6 +80,8 @@ struct Octowatcher {
     update: Option<Update>,
     scan_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
+    /// Coalesces refreshes requested while a GitHub check is already running.
+    refresh_pending: bool,
     poll_task: Option<Task<()>>,
     /// Fires when the earliest snooze runs out.
     wake_task: Option<Task<()>>,
@@ -151,6 +153,7 @@ impl Octowatcher {
             update: None,
             scan_task: None,
             fetch_task: None,
+            refresh_pending: false,
             poll_task: None,
             wake_task: None,
             update_check: None,
@@ -261,16 +264,29 @@ impl Octowatcher {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh_with(
+            |watched| async move { github::fetch_awaiting_reviews(&watched) },
+            cx,
+        );
+    }
+
+    fn refresh_with<F, Fut>(&mut self, fetch: F, cx: &mut Context<Self>)
+    where
+        F: Fn(HashSet<String>) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = anyhow::Result<github::FetchedReviews>> + Send + 'static,
+    {
         // Scope the API request to enabled local repos after discovery finishes.
-        if self.repos.is_none() || self.fetch_task.is_some() {
+        if self.repos.is_none() {
             return;
         }
+        if self.fetch_task.is_some() {
+            self.refresh_pending = true;
+            return;
+        }
+        self.refresh_pending = false;
         let watched = self.watched_slugs();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { github::fetch_awaiting_reviews(&watched) })
-                .await;
+            let result = cx.background_executor().spawn(fetch(watched)).await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
                 this.last_checked = Some(Local::now());
@@ -283,6 +299,9 @@ impl Octowatcher {
                     Err(err) => this.fetch_error = Some(format!("{err:#}")),
                 }
                 cx.notify();
+                if std::mem::take(&mut this.refresh_pending) {
+                    this.refresh_with(fetch.clone(), cx);
+                }
             })
             .ok();
         }));
@@ -291,11 +310,15 @@ impl Octowatcher {
 
     /// Replaces the pending list with what GitHub reports now, keeping only
     /// enabled local repos. Complete snapshots remove reviewed, withdrawn or
-    /// closed requests; failed repos keep their saved queue and snoozes.
-    /// A request seen for the first time raises a notification.
+    /// closed requests; incomplete checks preserve uncertain saved state.
+    /// Confirmed requests enter the queue and raise notifications even when
+    /// another team's membership could not be checked.
     /// The first check after launch announces everything waiting instead.
     fn reconcile(&mut self, fetched: github::FetchedReviews, cx: &mut Context<Self>) {
         let watched = self.watched_slugs();
+        let can_announce_launch = !fetched.pending.is_empty()
+            || !fetched.completed_repos.is_empty()
+            || watched.is_empty();
         let reconciled =
             self.store
                 .reconcile_repositories(fetched.pending, &fetched.completed_repos, &watched);
@@ -309,7 +332,7 @@ impl Octowatcher {
         }
         if self.announced_launch {
             self.notify(reconciled.fresh, cx);
-        } else if !fetched.completed_repos.is_empty() || watched.is_empty() {
+        } else if can_announce_launch {
             self.announced_launch = true;
             self.announce_waiting(cx);
         }
@@ -1440,11 +1463,117 @@ mod snooze_tests {
             update: None,
             scan_task: None,
             fetch_task: None,
+            refresh_pending: false,
             poll_task: None,
             wake_task: None,
             update_check: None,
             _startup_and_updates: Task::ready(()),
         }
+    }
+
+    #[gpui::test]
+    fn enabling_repo_during_fetch_checks_it_without_waiting_for_a_poll(cx: &mut TestAppContext) {
+        use std::sync::{Arc, Mutex};
+
+        for fail_first in [false, true] {
+            let (view, cx) = cx.add_window_view(|_, _| {
+                let mut app = app_for_picker_test();
+                app.store.pending.clear();
+                app.store.disabled.insert("owner/new".into());
+                app.repos = Some(vec![
+                    LocalRepo {
+                        slug: "owner/old".into(),
+                        paths: vec![],
+                    },
+                    LocalRepo {
+                        slug: "owner/new".into(),
+                        paths: vec![],
+                    },
+                ]);
+                app
+            });
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (release, blocked) = async_channel::bounded::<()>(1);
+            let fetch = {
+                let calls = calls.clone();
+                move |watched| {
+                    let calls = calls.clone();
+                    let blocked = blocked.clone();
+                    async move {
+                        let first = {
+                            let mut calls = calls.lock().unwrap();
+                            calls.push(watched);
+                            calls.len() == 1
+                        };
+                        if first {
+                            blocked.recv().await.unwrap();
+                        }
+                        if first && fail_first {
+                            Err(anyhow::anyhow!("first check failed"))
+                        } else {
+                            Ok(github::FetchedReviews::default())
+                        }
+                    }
+                }
+            };
+            view.update(cx, |app, cx| app.refresh_with(fetch.clone(), cx));
+            cx.run_until_parked();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![HashSet::from(["owner/old".into()])]
+            );
+            // Reproduce the enable action's refresh while the first check is blocked.
+            view.update(cx, |app, cx| {
+                app.store.disabled.remove("owner/new");
+                app.refresh_with(fetch.clone(), cx);
+                // Several requests during one check should coalesce into one follow-up.
+                app.refresh_with(fetch.clone(), cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            release.try_send(()).unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![
+                    HashSet::from(["owner/old".into()]),
+                    HashSet::from(["owner/old".into(), "owner/new".into()]),
+                ],
+                "the newly enabled repo must be checked before another timer tick"
+            );
+            assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
+        }
+    }
+
+    #[gpui::test]
+    fn confirmed_requests_can_finish_launch_announcement_during_a_partial_check(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut app = app_for_picker_test();
+            app.announced_launch = false;
+            app.store.pending = vec![review(1)];
+            // No notification or persistence side effects: this request is
+            // already saved, snoozed, and unchanged by the partial response.
+            app.store
+                .snooze(&review(1).key(), 60, Local::now().timestamp());
+            app.repos = Some(vec![LocalRepo {
+                slug: "owner/repo".into(),
+                paths: vec![],
+            }]);
+            app
+        });
+        view.update(cx, |app, cx| {
+            app.reconcile(
+                github::FetchedReviews {
+                    pending: vec![review(1)],
+                    completed_repos: HashSet::new(),
+                    errors: vec!["unreadable team".into()],
+                },
+                cx,
+            )
+        });
+        assert!(view.read_with(cx, |app, _| app.announced_launch));
     }
 
     #[test]

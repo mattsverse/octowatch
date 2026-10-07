@@ -67,7 +67,7 @@ The window has three tabs.
 
 This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
 
-If GitHub can't completely check a repository, Octowatcher shows the error and keeps that repository's saved reviews and snoozes until a complete check succeeds. Other repositories continue updating. The saved list may be out of date while an error is shown. Large repositories or long review histories take more API requests to check; GitHub rate-limit errors also preserve the saved list.
+If GitHub can't completely check a repository, Octowatcher shows the error and keeps unchecked saved reviews and snoozes until a complete check succeeds. Confirmed requests still enter the queue when some team memberships can't be checked, so an unreadable team doesn't hide a direct request. Other repositories continue updating. The saved list may be out of date while an error is shown. Large repositories or long review histories take more API requests to check; GitHub rate-limit errors also preserve the saved list.
 
 If a team request and your review have exactly the same timestamp, the request stays visible: Octowatcher can't prove which happened first.
 
@@ -82,6 +82,8 @@ A snoozed pull request leaves the tray. In the window it stays listed, dimmed, w
 The scan goes up to five levels deep. It skips hidden folders and `node_modules`, `target`, `vendor`, `build`, `dist` and `Library`.
 
 **GitHub repositories found** lists every repository that has at least one clone in those folders, with the paths of its clones. Click a repository to switch between **watching** and **off**. Reviews from repositories that are off don't show up and don't notify you.
+
+Enabling a repository checks it right away. If a GitHub check is already running, Octowatcher checks the updated repository list as soon as that check finishes.
 
 Octowatcher reads the remotes from each clone's `.git/config` and understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them.
 

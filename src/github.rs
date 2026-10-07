@@ -93,8 +93,8 @@ pub fn viewer_login() -> Result<String> {
     Ok(LOGIN.get_or_init(|| login).clone())
 }
 
-/// Only complete repository snapshots may remove saved requests. A failed
-/// repository keeps its prior queue and snoozes while other repos can update.
+/// Confirmed requests can enter the queue even when some team lookups fail.
+/// Only complete repository snapshots may remove saved requests.
 #[derive(Default)]
 pub struct FetchedReviews {
     pub pending: Vec<PendingReview>,
@@ -123,6 +123,7 @@ pub fn fetch_awaiting_reviews(repos: &HashSet<String>) -> Result<FetchedReviews>
 
 type Variables = Vec<(&'static str, String)>;
 type Api<'a> = dyn FnMut(&str, Variables) -> Result<String> + 'a;
+type Memberships = HashMap<String, std::result::Result<bool, String>>;
 
 fn fetch_with(repos: &HashSet<String>, me: &str, api: &mut Api<'_>) -> Result<FetchedReviews> {
     let mut fetched = FetchedReviews::default();
@@ -131,13 +132,19 @@ fn fetch_with(repos: &HashSet<String>, me: &str, api: &mut Api<'_>) -> Result<Fe
     let mut repos: Vec<_> = repos.iter().collect();
     repos.sort();
     for repo in repos {
-        match fetch_repo(repo, me, &mut memberships, api) {
+        let mut errors = Vec::new();
+        match fetch_repo(repo, me, &mut memberships, &mut errors, api) {
             Ok(pending) => {
                 fetched.pending.extend(pending);
-                fetched.completed_repos.insert(repo.to_lowercase());
+                if errors.is_empty() {
+                    fetched.completed_repos.insert(repo.to_lowercase());
+                }
             }
-            Err(err) => fetched.errors.push(format!("{repo}: {err:#}")),
+            Err(err) => errors.push(format!("{err:#}")),
         }
+        fetched
+            .errors
+            .extend(errors.into_iter().map(|error| format!("{repo}: {error}")));
     }
     Ok(fetched)
 }
@@ -145,7 +152,8 @@ fn fetch_with(repos: &HashSet<String>, me: &str, api: &mut Api<'_>) -> Result<Fe
 fn fetch_repo(
     repo: &str,
     me: &str,
-    memberships: &mut HashMap<String, bool>,
+    memberships: &mut Memberships,
+    errors: &mut Vec<String>,
     api: &mut Api<'_>,
 ) -> Result<Vec<PendingReview>> {
     let (owner, name) = repo.split_once('/').context("invalid repository slug")?;
@@ -190,16 +198,17 @@ fn fetch_repo(
                         relevant.insert(reviewer.key().unwrap());
                     }
                     Reviewer::Team { id } => {
-                        let member = match memberships.get(id) {
-                            Some(member) => *member,
-                            None => {
-                                let member = is_member(id, me, api)?;
-                                memberships.insert(id.clone(), member);
-                                member
+                        // An unreadable team does not negate a known direct or
+                        // other team request. Report uncertainty so this repo
+                        // cannot clear saved state, but keep checking known targets.
+                        match memberships.entry(id.clone()).or_insert_with(|| {
+                            is_member(id, me, api).map_err(|err| format!("{err:#}"))
+                        }) {
+                            Ok(true) => {
+                                relevant.insert(reviewer.key().unwrap());
                             }
-                        };
-                        if member {
-                            relevant.insert(reviewer.key().unwrap());
+                            Ok(false) => {}
+                            Err(err) => errors.push(format!("PR #{}: team {id}: {err}", pr.number)),
                         }
                     }
                     _ => {}
