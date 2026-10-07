@@ -1,11 +1,17 @@
 //! Presentation policy shared by setup, the header, and review empty states.
 
-use crate::github::{Check, Readiness};
-use crate::store::{PendingReview, Store};
+#[cfg(test)]
+use crate::github::Check;
+use crate::github::{FetchResults, Readiness};
+#[cfg(test)]
+use crate::store::PendingReview;
+use crate::store::Store;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 pub struct SyncHealth {
     pub readiness: Readiness,
+    pub hosts: BTreeMap<String, Readiness>,
     pub error: Option<String>,
     /// Disk caches and results against a previous folder list are unverified.
     pub verified: bool,
@@ -50,37 +56,73 @@ impl ReviewsStatus {
 }
 
 impl SyncHealth {
+    /// Reconcile identity per host even when its review query fails. Aggregate
+    /// success advances only when every enabled host completed this sync.
+    pub fn apply_hosts(
+        &mut self,
+        fetched: &FetchResults,
+        store: &mut Store,
+        now: i64,
+    ) -> BTreeSet<String> {
+        let mut changed = BTreeSet::new();
+        for (host, readiness) in &fetched.readiness {
+            if let Readiness::Ready(login) = readiness
+                && store.activate_host_account(host, login)
+            {
+                changed.insert(host.clone());
+            }
+        }
+        self.hosts = fetched.readiness.clone();
+        self.readiness = self
+            .hosts
+            .get("github.com")
+            .or_else(|| self.hosts.values().next())
+            .cloned()
+            .unwrap_or_default();
+        self.error = (!fetched.errors.is_empty()).then(|| fetched.errors.join("\n"));
+        self.connection_failed =
+            self.hosts
+                .values()
+                .any(|ready| matches!(ready, Readiness::Offline))
+                || fetched.errors.iter().any(|error| {
+                    crate::github::is_connection_error(&anyhow::anyhow!(error.clone()))
+                });
+        self.verified = !self.hosts.is_empty()
+            && self.error.is_none()
+            && fetched.successful_hosts.len() == self.hosts.len();
+        if self.verified {
+            store.last_successful_sync = Some(now);
+        }
+        changed
+    }
+
     /// Only a complete review result advances success. Account invalidation
     /// happens before the result, so a failed query cannot leave another
     /// account's cache (or snoozes) active.
+    #[cfg(test)]
     pub fn apply(
         &mut self,
         check: Check,
         store: &mut Store,
         now: i64,
     ) -> (Option<Vec<PendingReview>>, bool) {
-        let changed_account = match &check.readiness {
-            Readiness::Ready(login) => store.activate_account(login),
-            _ => false,
-        };
-        self.readiness = check.readiness;
-        match check.reviews {
+        let mut results = FetchResults::default();
+        results
+            .readiness
+            .insert("github.com".into(), check.readiness);
+        let fetched = match check.reviews {
             Ok(reviews) => {
-                self.error = None;
-                self.connection_failed = false;
-                self.verified = true;
-                store.last_successful_sync = Some(now);
-                (Some(reviews), changed_account)
+                results.successful_hosts.insert("github.com".into());
+                results.reviews = reviews.clone();
+                Some(reviews)
             }
-            Err(err) => {
-                self.connection_failed = crate::github::is_connection_error(&err);
-                self.error = Some(format!("{err:#}"));
-                if changed_account {
-                    self.verified = false;
-                }
-                (None, changed_account)
+            Err(error) => {
+                results.errors.push(format!("{error:#}"));
+                None
             }
-        }
+        };
+        let changed = self.apply_hosts(&results, store, now);
+        (fetched, changed.contains("github.com"))
     }
 
     pub fn status(
@@ -148,6 +190,87 @@ mod tests {
         }"#).unwrap();
         store.poll_minutes = 2;
         store
+    }
+
+    #[test]
+    fn partial_host_failure_keeps_cache_and_success_time_until_all_hosts_recover() {
+        let mut store = cached_store();
+        let public = store.pending[0].clone();
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        store.activate_host_account(&enterprise.host, "enterprise-viewer");
+        store.pending.push(enterprise.clone());
+        store.last_successful_sync = Some(100);
+        let mut health = SyncHealth::default();
+        let partial = FetchResults {
+            readiness: [
+                ("github.com".into(), Readiness::Ready("alice".into())),
+                (enterprise.host.clone(), Readiness::Offline),
+            ]
+            .into(),
+            successful_hosts: ["github.com".into()].into(),
+            reviews: Vec::new(),
+            errors: vec!["github.example.com: dial tcp: network is unreachable".into()],
+        };
+        assert!(health.apply_hosts(&partial, &mut store, 200).is_empty());
+        store.reconcile_hosts(
+            partial.reviews,
+            &partial.successful_hosts,
+            &[public.repository(), enterprise.repository()].into(),
+        );
+        assert_eq!(store.pending, vec![enterprise.clone()]);
+        assert_eq!(store.last_successful_sync, Some(100));
+        assert!(!health.verified);
+        let recovered = FetchResults {
+            readiness: [
+                ("github.com".into(), Readiness::Ready("alice".into())),
+                (
+                    enterprise.host.clone(),
+                    Readiness::Ready("enterprise-viewer".into()),
+                ),
+            ]
+            .into(),
+            successful_hosts: ["github.com".into(), enterprise.host].into(),
+            ..FetchResults::default()
+        };
+        assert!(health.apply_hosts(&recovered, &mut store, 300).is_empty());
+        assert_eq!(store.last_successful_sync, Some(300));
+        assert!(health.verified);
+        assert!(health.error.is_none());
+    }
+
+    #[test]
+    fn enterprise_account_change_preserves_public_cache_and_legacy_identity() {
+        let mut store = cached_store();
+        let public = store.pending[0].clone();
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        store.activate_host_account(&enterprise.host, "old-viewer");
+        store.pending.push(enterprise.clone());
+        store.queue_notifications(&[public.clone(), enterprise.clone()]);
+        let fetched = FetchResults {
+            readiness: [(
+                enterprise.host.clone(),
+                Readiness::Ready("new-viewer".into()),
+            )]
+            .into(),
+            errors: vec!["github.example.com: review query failed".into()],
+            ..FetchResults::default()
+        };
+        let changed = SyncHealth::default().apply_hosts(&fetched, &mut store, 200);
+        assert_eq!(changed, [enterprise.host.clone()].into());
+        assert_eq!(store.pending, vec![public]);
+        assert_eq!(store.snoozed.len(), 1);
+        assert_eq!(store.notification_queue.len(), 1);
+        assert_eq!(store.sync_account.as_deref(), Some("alice"));
+        let restored: Store =
+            serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        assert_eq!(restored.sync_accounts[&enterprise.host], "new-viewer");
+        assert_eq!(restored.sync_account.as_deref(), Some("alice"));
     }
 
     #[test]

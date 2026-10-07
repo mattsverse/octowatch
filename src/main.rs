@@ -2,6 +2,7 @@ mod discovery;
 mod github;
 mod health;
 mod notifications;
+mod repository;
 mod review_notifications;
 mod store;
 mod theme;
@@ -9,7 +10,7 @@ mod tray;
 mod updater;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
     time::Duration,
 };
@@ -24,6 +25,7 @@ use gpui::{
 use discovery::LocalRepo;
 use health::{ReviewsStatus, SyncHealth};
 use notifications::Response;
+use repository::RepositoryId;
 use review_notifications::{Batch, Delivery, ReviewAction, Target};
 use store::{PendingReview, Store};
 use theme::{Appearance, Palette};
@@ -67,7 +69,7 @@ struct Octowatcher {
     load_warning: Option<String>,
     permission: notifications::Permission,
     /// The one PR whose duration picker is open; never persisted as a default.
-    snooze_picker: Option<(String, u64)>,
+    snooze_picker: Option<(RepositoryId, u64)>,
     /// Each source keeps its own error, so a successful GitHub check doesn't
     /// hide a tray, save, permission or delivery error.
     tray_error: Option<String>,
@@ -75,12 +77,14 @@ struct Octowatcher {
     notification_error: Option<String>,
     notifications_ready: bool,
     /// Whether the first successful poll has validated the cached review list.
-    announced_launch: bool,
+    announced_hosts: BTreeSet<String>,
+    scan_error: Option<String>,
     /// Retained until the launch batch is accepted, including after failures.
     launch_summary: bool,
     review_delivery: Delivery,
     /// Old-account delivery and action callbacks cannot affect a new session.
     review_account_generation: u64,
+    review_account_changes: BTreeMap<String, u64>,
     notification_tasks: HashMap<usize, Task<()>>,
     tray: Option<Tray>,
     update: Option<Update>,
@@ -191,10 +195,12 @@ impl Octowatcher {
             save_error: None,
             notification_error: None,
             notifications_ready: !cfg!(target_os = "macos"),
-            announced_launch: false,
+            announced_hosts: BTreeSet::new(),
+            scan_error: None,
             launch_summary: true,
             review_delivery: Delivery::default(),
             review_account_generation: 0,
+            review_account_changes: BTreeMap::new(),
             notification_tasks: HashMap::new(),
             tray,
             update: None,
@@ -270,11 +276,16 @@ impl Octowatcher {
     }
 
     /// Notification actions keep using the global default.
-    fn snooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+    fn snooze(&mut self, key: (RepositoryId, u64), cx: &mut Context<Self>) {
         self.snooze_for_minutes(key, self.store.snooze_minutes, cx);
     }
 
-    fn snooze_for_minutes(&mut self, key: (String, u64), minutes: u64, cx: &mut Context<Self>) {
+    fn snooze_for_minutes(
+        &mut self,
+        key: (RepositoryId, u64),
+        minutes: u64,
+        cx: &mut Context<Self>,
+    ) {
         self.snooze_picker = None;
         if self.store.snooze(&key, minutes, Local::now().timestamp()) {
             self.snoozes_changed(cx);
@@ -283,7 +294,7 @@ impl Octowatcher {
         }
     }
 
-    fn unsnooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+    fn unsnooze(&mut self, key: (RepositoryId, u64), cx: &mut Context<Self>) {
         self.store.unsnooze(&key);
         self.snoozes_changed(cx);
     }
@@ -337,15 +348,28 @@ impl Octowatcher {
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             let scan = cx
                 .background_executor()
-                .spawn(async move { discovery::discover(&roots) })
+                .spawn(async move {
+                    github::known_hosts().map(|hosts| discovery::discover(&roots, &hosts))
+                })
                 .await;
             this.update(cx, |this, cx| {
-                this.repos = Some(scan.repos);
-                this.folder_issues = scan.issues;
                 this.scan_task = None;
-                // Results fetched against the old repo list are stale.
-                this.fetch_task = None;
-                this.refresh(cx);
+                match scan {
+                    Ok(scan) => {
+                        this.scan_error = None;
+                        this.repos = Some(scan.repos);
+                        this.folder_issues = scan.issues;
+                        // Results fetched against the old repo list are stale.
+                        this.fetch_task = None;
+                        this.refresh(cx);
+                    }
+                    Err(err) => {
+                        this.health.readiness = github::classify_failure(&err);
+                        this.health.hosts.clear();
+                        this.scan_error = Some(format!("{err:#}"));
+                    }
+                }
+                cx.notify();
             })
             .ok();
         }));
@@ -355,35 +379,37 @@ impl Octowatcher {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.check_permission(cx);
-        // Filtering needs the repo list, and the scan refreshes once it's done.
-        if self.repos.is_none() || self.scan_task.is_some() || self.fetch_task.is_some() {
+        // Retry first-run host discovery as well as an existing review check.
+        if self.scan_task.is_none() && (self.repos.is_none() || self.scan_error.is_some()) {
+            self.rescan(cx);
             return;
         }
+        // Filtering needs the repo list, and the scan refreshes once it's done.
+        if self.scan_task.is_some() || self.fetch_task.is_some() {
+            return;
+        }
+        let hosts = self
+            .watched_repositories()
+            .into_iter()
+            .map(|id| id.host)
+            .collect();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { github::check() })
+                .spawn(async move { github::fetch_awaiting_reviews(&hosts) })
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
-                let (fetched, changed_account) =
+                let changed =
                     this.health
-                        .apply(result, &mut this.store, Local::now().timestamp());
-                if changed_account {
+                        .apply_hosts(&result, &mut this.store, Local::now().timestamp());
+                if !changed.is_empty() {
                     this.dismiss_stale_snooze_picker();
-                    this.reset_review_account();
+                    this.reset_review_accounts(&changed);
                     this.schedule_wake(cx);
-                    this.sync_tray();
                 }
-                match fetched {
-                    Some(fetched) => {
-                        this.reconcile(fetched, cx);
-                        // Account and success time persist even for an unchanged list.
-                        this.save();
-                    }
-                    None if changed_account => this.save(),
-                    None => {}
-                }
+                this.reconcile(result, cx);
+                this.save();
                 this.sync_tray();
                 cx.notify();
             })
@@ -419,19 +445,21 @@ impl Octowatcher {
     /// enabled local repos. A PR that drops out (reviewed, request removed,
     /// closed) is gone; one seen for the first time raises a notification.
     /// The first check after launch announces everything waiting instead.
-    fn reconcile(&mut self, fetched: Vec<PendingReview>, cx: &mut Context<Self>) {
-        let watched = self.watched_slugs();
-        let fetched: Vec<PendingReview> = fetched
-            .into_iter()
-            .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
+    fn reconcile(&mut self, fetched: github::FetchResults, cx: &mut Context<Self>) {
+        let watched = self.watched_repositories();
+        let first_hosts: BTreeSet<String> = fetched
+            .successful_hosts
+            .difference(&self.announced_hosts)
+            .cloned()
             .collect();
-        let reconciled = self.store.reconcile(fetched);
+        let reconciled =
+            self.store
+                .reconcile_hosts(fetched.reviews, &fetched.successful_hosts, &watched);
         self.dismiss_stale_snooze_picker();
-        let first_check = !self.announced_launch;
+        let first_check = !first_hosts.is_empty();
         if first_check {
-            self.announced_launch = true;
             // Preserve launch summaries, but keep suppressed drafts queued.
-            self.store.queue_startup_notifications();
+            self.store.queue_startup_notifications(&first_hosts);
             if self.store.notification_queue.is_empty() {
                 self.launch_summary = false;
             }
@@ -442,27 +470,38 @@ impl Octowatcher {
             self.save();
             self.sync_tray();
         }
-        self.deliver_reviews(cx);
+        if !fetched.successful_hosts.is_empty() {
+            self.announced_hosts.extend(fetched.successful_hosts);
+            self.deliver_reviews(cx);
+        }
     }
 
     /// Sends eligible, undelivered review events in one batch. A failed send
     /// stays persisted and is attempted at the next successful GitHub poll.
     fn deliver_reviews(&mut self, cx: &mut Context<Self>) {
         // Validate cached requests against GitHub before any launch delivery.
-        if !self.announced_launch || !self.notifications_ready {
+        if self.announced_hosts.is_empty() || !self.notifications_ready {
             return;
         }
-        let Some(batch) = self.review_delivery.begin(&self.store) else {
+        let Some(batch) = self
+            .review_delivery
+            .begin(&self.store, &self.announced_hosts)
+        else {
             return;
         };
         self.send_review_batch(batch, cx);
     }
 
-    fn reset_review_account(&mut self) {
-        self.announced_launch = false;
+    fn reset_review_accounts(&mut self, changed: &BTreeSet<String>) {
+        self.announced_hosts.retain(|host| !changed.contains(host));
         self.launch_summary = true;
-        self.review_delivery = Delivery::default();
+        // Keep any bounded in-flight send's gate: resetting it could duplicate
+        // an unaffected host's alert before OS acceptance is acknowledged.
         self.review_account_generation = self.review_account_generation.wrapping_add(1);
+        for host in changed {
+            self.review_account_changes
+                .insert(host.clone(), self.review_account_generation);
+        }
     }
 
     fn send_review_batch(&mut self, batch: Batch, cx: &mut Context<Self>) {
@@ -507,14 +546,16 @@ impl Octowatcher {
         batch: &Batch,
         delivered: bool,
     ) -> Option<Batch> {
-        if generation != self.review_account_generation {
-            return None;
-        }
-        let next = self
-            .review_delivery
-            .complete(&mut self.store, batch, delivered);
+        // Notice sequences are never reset on account changes. An old batch
+        // can acknowledge unaffected notices, but cannot consume newly queued
+        // events for the changed account. Its gate stayed locked until now.
+        let next =
+            self.review_delivery
+                .complete(&mut self.store, batch, delivered, &self.announced_hosts);
         if delivered {
-            self.launch_summary = false;
+            if generation == self.review_account_generation {
+                self.launch_summary = false;
+            }
             self.save();
         }
         next
@@ -526,7 +567,17 @@ impl Octowatcher {
         target: &Target,
         response: Response,
     ) -> Option<ReviewAction> {
-        (generation == self.review_account_generation)
+        let current = match target {
+            Target::Single(pr) => {
+                self.review_account_changes
+                    .get(&pr.host)
+                    .copied()
+                    .unwrap_or(0)
+                    <= generation
+            }
+            Target::Summary => generation == self.review_account_generation,
+        };
+        current
             .then(|| target.respond(response, &self.store))
             .flatten()
     }
@@ -624,26 +675,24 @@ impl Octowatcher {
         true
     }
 
-    fn watched_slugs(&self) -> HashSet<String> {
+    fn watched_repositories(&self) -> HashSet<RepositoryId> {
         self.repos
             .iter()
             .flatten()
-            .filter(|repo| self.store.is_enabled(&repo.slug))
-            .map(|repo| repo.slug.to_lowercase())
+            .filter(|repo| self.store.is_enabled(&repo.id))
+            .map(|repo| repo.id.clone())
             .collect()
     }
 
-    fn toggle_repo(&mut self, slug: &str, cx: &mut Context<Self>) {
-        let key = slug.to_lowercase();
+    fn toggle_repo(&mut self, repository: &RepositoryId, cx: &mut Context<Self>) {
+        let key = repository.clone();
         if self.store.disabled.remove(&key) {
             self.health.verified = false;
             self.save();
             self.refresh(cx);
         } else {
             self.store.disabled.insert(key.clone());
-            self.store
-                .pending
-                .retain(|pr| pr.repo.to_lowercase() != key);
+            self.store.pending.retain(|pr| pr.repository() != key);
             self.store.prune_notifications();
             self.save();
             self.sync_tray();
@@ -935,6 +984,7 @@ impl Octowatcher {
         [
             &self.load_warning,
             &self.health.error,
+            &self.scan_error,
             &self.save_error,
             &self.tray_error,
             &self.notification_error,
@@ -948,10 +998,10 @@ impl Octowatcher {
         self.health.status(
             &self.store,
             Local::now().timestamp(),
-            self.repos.is_none() || self.scan_task.is_some(),
+            (self.repos.is_none() && self.scan_error.is_none()) || self.scan_task.is_some(),
             self.fetch_task.is_some(),
-            self.watched_slugs().len(),
-            !self.folder_issues.is_empty(),
+            self.watched_repositories().len(),
+            !self.folder_issues.is_empty() || self.scan_error.is_some(),
         )
     }
 }
@@ -962,7 +1012,7 @@ fn waiting_text(prs: &[PendingReview]) -> (String, String) {
         n => format!("You have {n} pending reviews"),
     };
     let body = match prs {
-        [pr] => format!("{}#{}: {}", pr.repo, pr.number, pr.title),
+        [pr] => format!("{}#{}: {}", pr.repo_label(), pr.number, pr.title),
         many => pr_list(many),
     };
     (summary, body)
@@ -976,7 +1026,7 @@ fn notification_text(prs: &[PendingReview]) -> (String, String) {
                 pr.author,
                 if pr.rereview { "re-review" } else { "review" }
             ),
-            format!("{}#{}: {}", pr.repo, pr.number, pr.title),
+            format!("{}#{}: {}", pr.repo_label(), pr.number, pr.title),
         ),
         many => (
             format!("{} pull requests need your review", many.len()),
@@ -987,7 +1037,7 @@ fn notification_text(prs: &[PendingReview]) -> (String, String) {
 
 fn pr_list(prs: &[PendingReview]) -> String {
     prs.iter()
-        .map(|pr| format!("{}#{}", pr.repo, pr.number))
+        .map(|pr| format!("{}#{}", pr.repo_label(), pr.number))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1034,17 +1084,75 @@ impl Octowatcher {
         }
     }
 
+    fn github_readiness_text(&self, host: &str, readiness: &github::Readiness) -> String {
+        let cached = self.store.sync_accounts.get(host).or_else(|| {
+            (host == "github.com")
+                .then_some(self.store.sync_account.as_ref())
+                .flatten()
+        });
+        let previous = cached
+            .map(|login| format!(" Last verified account: @{login}."))
+            .unwrap_or_default();
+        match readiness {
+            github::Readiness::Checking => {
+                format!("{host}: checking GitHub CLI and active account…")
+            }
+            github::Readiness::Missing => format!(
+                "{host}: GitHub CLI not found. Install gh 2.81+, run gh auth login --hostname {host}, then Rescan."
+            ),
+            github::Readiness::NotRunnable => format!(
+                "{host}: GitHub CLI could not start. Check its installation and executable permissions, then Rescan."
+            ),
+            github::Readiness::SignedOut => format!(
+                "{host}: authentication needs attention. Run gh auth login --hostname {host}, then Refresh."
+            ),
+            github::Readiness::Offline => format!(
+                "{host}: cannot be reached. Check your connection or proxy, then Refresh.{previous}"
+            ),
+            github::Readiness::Unavailable => format!(
+                "{host}: account readiness could not be verified. Check connection, CLI version and server compatibility, then Refresh or Rescan.{previous}"
+            ),
+            github::Readiness::Ready(login) => format!(
+                "{host}: GitHub CLI ready · active account @{login}.{}",
+                if self.health.error.is_some() {
+                    " Some review checks failed; cached results may be stale."
+                } else {
+                    ""
+                }
+            ),
+        }
+    }
+
     fn render_health(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let github = match &self.health.readiness {
-            github::Readiness::Checking => "Checking GitHub CLI and active github.com account…".into(),
-            github::Readiness::Missing => "GitHub CLI not found. Install gh, run gh auth login --hostname github.com in a terminal, then Refresh.".into(),
-            github::Readiness::NotRunnable => "GitHub CLI could not start. Check its installation and executable permissions, then Refresh.".into(),
-            github::Readiness::SignedOut => "GitHub CLI is available; authentication needs attention. Run gh auth login --hostname github.com in a terminal, then Refresh.".into(),
-            github::Readiness::Offline => format!("GitHub CLI is available; GitHub cannot be reached (offline or network error). Check your connection or proxy, then Refresh.{}", self.store.sync_account.as_ref().map(|login| format!(" Last verified account: @{login}.")).unwrap_or_default()),
-            github::Readiness::Unavailable => format!("GitHub CLI is available; account readiness could not be verified. Check your connection, proxy, or GitHub availability, then Refresh.{}", self.store.sync_account.as_ref().map(|login| format!(" Last verified account: @{login}.")).unwrap_or_default()),
-            github::Readiness::Ready(login) => format!("GitHub CLI ready · active account @{login} on github.com.{}", if self.health.error.is_some() { " Review sync failed; cached reviews may be stale." } else { "" }),
+        let github = if self.health.hosts.is_empty() {
+            self.github_readiness_text("github.com", &self.health.readiness)
+        } else {
+            self.health
+                .hosts
+                .iter()
+                .map(|(host, readiness)| self.github_readiness_text(host, readiness))
+                .collect::<Vec<_>>()
+                .join("\n")
         };
-        let folders = if self.repos.is_none() || self.scan_task.is_some() {
+        let login_host = self
+            .health
+            .hosts
+            .iter()
+            .find(|(_, readiness)| matches!(readiness, github::Readiness::SignedOut))
+            .map(|(host, _)| host.as_str())
+            .unwrap_or("github.com");
+        let needs_login = matches!(
+            self.health.readiness,
+            github::Readiness::Missing | github::Readiness::SignedOut
+        ) || self
+            .health
+            .hosts
+            .values()
+            .any(|ready| matches!(ready, github::Readiness::SignedOut));
+        let login_command = format!("gh auth login --hostname {login_host}");
+        let folders = if self.scan_error.is_some() {
+            "Host discovery failed. Fix GitHub CLI setup, then Rescan.".into()
+        } else if self.repos.is_none() || self.scan_task.is_some() {
             "Scanning watched folders…".into()
         } else if self.store.roots.is_empty() {
             "No watched folders. Add a folder containing GitHub clones.".into()
@@ -1056,12 +1164,12 @@ impl Octowatcher {
         } else if self.repos.as_ref().is_some_and(Vec::is_empty) {
             "No GitHub clones found. Add a project folder or clone a repository there, then Rescan."
                 .into()
-        } else if self.watched_slugs().is_empty() {
+        } else if self.watched_repositories().is_empty() {
             "Every discovered repository is off. Enable a repository in Repositories.".into()
         } else {
             format!(
                 "{} repositories enabled in {} watched folder(s).",
-                self.watched_slugs().len(),
+                self.watched_repositories().len(),
                 self.store.roots.len()
             )
         };
@@ -1093,7 +1201,7 @@ impl Octowatcher {
             .child(section_title("Setup & health", theme))
             .child(health_row("GitHub", github, theme))
             .when(matches!(self.health.readiness, github::Readiness::Missing), |s| s.child(button("install-gh", "Install GitHub CLI", theme).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.open_url("https://cli.github.com/")))))
-            .when(matches!(self.health.readiness, github::Readiness::Missing | github::Readiness::SignedOut), |s| s.child(button("copy-login", "Copy login command", theme).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("gh auth login --hostname github.com".into()))))))
+            .when(needs_login, |s| s.child(button("copy-login", "Copy login command", theme).on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(login_command.clone()))))))
             .child(health_row("Watched folders", folders, theme))
             .child(div().flex().flex_wrap().gap_2()
                 .child(button("health-folders", "Manage folders", theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| { this.tab = Tab::Repositories; this.snooze_picker = None; cx.notify(); })))
@@ -1379,7 +1487,7 @@ impl Octowatcher {
                                     .gap_2()
                                     .text_xs()
                                     .text_color(rgb(theme.secondary_text))
-                                    .child(format!("{}#{}", pr.repo, pr.number))
+                                    .child(format!("{}#{}", pr.repo_label(), pr.number))
                                     .children(badge.map(|(label, color)| pill(label, color)))
                                     .when(pr.is_draft, |s| {
                                         s.child(pill("draft", theme.muted_text))
@@ -1473,8 +1581,8 @@ impl Octowatcher {
                 )
             })
             .children(repos.iter().enumerate().map(|(ix, repo)| {
-                let enabled = self.store.is_enabled(&repo.slug);
-                let slug = repo.slug.clone();
+                let enabled = self.store.is_enabled(&repo.id);
+                let id = repo.id.clone();
                 let paths = repo
                     .paths
                     .iter()
@@ -1499,7 +1607,7 @@ impl Octowatcher {
                             .flex_col()
                             .min_w_0()
                             .when(!enabled, |s| s.text_color(rgb(theme.muted_text)))
-                            .child(repo.slug.clone())
+                            .child(repo.id.to_string())
                             .child(
                                 div()
                                     .text_xs()
@@ -1514,7 +1622,7 @@ impl Octowatcher {
                         pill("off", theme.muted_text)
                     })
                     .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&slug, cx)),
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&id, cx)),
                     )
             }));
 
@@ -1958,6 +2066,7 @@ mod snooze_tests {
 
     fn review(number: u64) -> PendingReview {
         PendingReview {
+            host: repository::default_host(),
             repo: "owner/repo".into(),
             number,
             title: format!("Review {number}"),
@@ -1985,7 +2094,7 @@ mod snooze_tests {
                 ..Store::default()
             },
             repos: Some(vec![LocalRepo {
-                slug: "owner/repo".into(),
+                id: RepositoryId::new("github.com", "owner/repo"),
                 paths: Vec::new(),
             }]),
             tab: Tab::Reviews,
@@ -2002,10 +2111,12 @@ mod snooze_tests {
             save_error: None,
             notification_error: None,
             notifications_ready: true,
-            announced_launch: true,
+            announced_hosts: [repository::default_host()].into(),
+            scan_error: None,
             launch_summary: false,
             review_delivery: Delivery::default(),
             review_account_generation: 0,
+            review_account_changes: BTreeMap::new(),
             notification_tasks: HashMap::new(),
             tray: None,
             update: None,
@@ -2055,7 +2166,10 @@ mod snooze_tests {
         app.store.queue_notifications(&[review(1)]);
         app.store.notifications_muted = false;
         let old_generation = app.review_account_generation;
-        let old_batch = app.review_delivery.begin(&app.store).unwrap();
+        let old_batch = app
+            .review_delivery
+            .begin(&app.store, &app.announced_hosts)
+            .unwrap();
         let old_target = Target::for_reviews(&old_batch.reviews);
 
         app.health.apply(
@@ -2066,22 +2180,31 @@ mod snooze_tests {
             &mut app.store,
             200,
         );
-        app.reset_review_account();
+        app.reset_review_accounts(&[repository::default_host()].into());
         assert!(app.store.notification_queue.is_empty());
-        assert!(!app.announced_launch);
+        assert!(app.announced_hosts.is_empty());
         assert!(app.launch_summary);
         assert!(!app.store.notify_drafts);
         // The same PR can be requested by both accounts. Old callbacks must
         // neither snooze it nor unlock or consume the new account's batch.
         app.store.pending = vec![review(1)];
+        app.announced_hosts.insert(repository::default_host());
         app.store.queue_notifications(&[review(1)]);
-        let new_batch = app.review_delivery.begin(&app.store).unwrap();
         assert!(
-            app.complete_review_batch(old_generation, &old_batch, true)
+            app.review_delivery
+                .begin(&app.store, &app.announced_hosts)
+                .is_none(),
+            "retain the in-flight send until its bounded acceptance callback"
+        );
+        let new_batch = app
+            .complete_review_batch(old_generation, &old_batch, true)
+            .unwrap();
+        assert_eq!(app.store.notification_queue, new_batch.notices);
+        assert!(
+            app.review_delivery
+                .begin(&app.store, &app.announced_hosts)
                 .is_none()
         );
-        assert_eq!(app.store.notification_queue, new_batch.notices);
-        assert!(app.review_delivery.begin(&app.store).is_none());
         assert_eq!(
             app.review_action(
                 old_generation,
@@ -2105,6 +2228,52 @@ mod snooze_tests {
         assert!(app.store.notification_queue.is_empty());
     }
 
+    #[test]
+    fn account_switch_keeps_unaffected_host_delivery_and_actions_working() {
+        let mut app = app_for_picker_test();
+        app.store.recovery_blocked = Some("test state must not be written".into());
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            ..review(1)
+        };
+        app.store.pending.push(enterprise.clone());
+        app.announced_hosts.insert(enterprise.host.clone());
+        app.store
+            .queue_notifications(&[review(1), enterprise.clone()]);
+        let generation = app.review_account_generation;
+        let old_batch = app
+            .review_delivery
+            .begin(&app.store, &app.announced_hosts)
+            .unwrap();
+        app.store
+            .activate_host_account(&enterprise.host, "new-viewer");
+        app.reset_review_accounts(&[enterprise.host.clone()].into());
+        assert!(app.announced_hosts.contains("github.com"));
+        assert!(!app.announced_hosts.contains(&enterprise.host));
+        assert!(
+            app.review_delivery
+                .begin(&app.store, &app.announced_hosts)
+                .is_none(),
+            "account switching must not duplicate a healthy host's in-flight alert"
+        );
+        assert!(
+            app.complete_review_batch(generation, &old_batch, true)
+                .is_none()
+        );
+        assert!(
+            app.store.notification_queue.is_empty(),
+            "accepted public alert is acknowledged"
+        );
+        assert_eq!(
+            app.review_action(generation, &Target::Single(review(1)), Response::Clicked),
+            Some(ReviewAction::OpenPr(review(1).url))
+        );
+        assert_eq!(
+            app.review_action(generation, &Target::Single(enterprise), Response::Clicked),
+            None
+        );
+    }
+
     #[gpui::test]
     fn queued_delivery_waits_for_permission_startup_and_launch_validation(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, _| app_for_picker_test());
@@ -2115,13 +2284,17 @@ mod snooze_tests {
             assert!(app.notification_tasks.is_empty());
             assert_eq!(app.store.notification_queue.len(), 1);
             app.notifications_ready = true;
-            app.announced_launch = false;
+            app.announced_hosts.clear();
             app.deliver_reviews(cx);
             assert!(app.notification_tasks.is_empty());
             assert_eq!(app.store.notification_queue.len(), 1);
-            // No delivery gate was acquired while startup was blocked.
+            // Once this host validates, no gate was left acquired by startup.
+            app.announced_hosts.insert(repository::default_host());
             assert_eq!(
-                app.review_delivery.begin(&app.store).unwrap().reviews,
+                app.review_delivery
+                    .begin(&app.store, &app.announced_hosts)
+                    .unwrap()
+                    .reviews,
                 vec![review(1)]
             );
         });
@@ -2208,12 +2381,15 @@ mod snooze_tests {
             assert!(app.store.snoozed.is_empty());
             assert_eq!(app.tray_reviews().len(), 2);
             assert!(app.wake(cx).is_empty());
-            let batch = app.review_delivery.begin(&app.store).unwrap();
+            let batch = app
+                .review_delivery
+                .begin(&app.store, &app.announced_hosts)
+                .unwrap();
             assert_eq!(batch.reviews, vec![review(1)]);
             // A failed native send retains the reminder for recovery.
             assert!(
                 app.review_delivery
-                    .complete(&mut app.store, &batch, false)
+                    .complete(&mut app.store, &batch, false, &app.announced_hosts)
                     .is_none()
             );
             assert_eq!(app.store.notification_queue, batch.notices);
@@ -2234,6 +2410,39 @@ mod snooze_tests {
             assert_eq!(app.wake(cx), vec![review(1)]);
             assert!(app.wake(cx).is_empty());
         });
+    }
+
+    #[gpui::test]
+    fn picker_keeps_matching_pr_numbers_on_different_hosts_separate(cx: &mut TestAppContext) {
+        let public = review(1);
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            url: "https://github.example.com/owner/repo/pull/1".into(),
+            ..public.clone()
+        };
+        let enterprise_key = enterprise.key();
+        let (view, cx) = cx.add_window_view(|_, _| {
+            let mut app = app_for_picker_test();
+            app.store.pending = vec![public.clone(), enterprise];
+            app
+        });
+        click(cx, "snooze-0");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.snooze_picker.clone()),
+            Some(public.key())
+        );
+        click(cx, "snooze-1");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.snooze_picker.clone()),
+            Some(enterprise_key.clone())
+        );
+        // Snoozing the public counterpart must leave the Enterprise picker open.
+        view.update(cx, |v, _| {
+            v.store.snooze(&public.key(), 5, 1_000);
+            v.dismiss_stale_snooze_picker();
+            assert_eq!(v.snooze_picker, Some(enterprise_key));
+        });
+        assert_eq!(cx.opened_url(), None);
     }
 
     #[gpui::test]

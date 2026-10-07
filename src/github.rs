@@ -2,16 +2,22 @@
 //! and no token ever needs to be stored by the app.
 
 use std::{
-    io::{Read, Seek},
+    collections::{BTreeMap, BTreeSet},
+    io::{self, Read},
+    os::unix::{io::AsRawFd, process::CommandExt as _},
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, Command, Output, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
-use crate::store::PendingReview;
+use crate::{
+    repository::{PUBLIC_HOST, normalize_host},
+    store::PendingReview,
+};
 
 /// Search for open PRs, by someone else, where the viewer (or one of their
 /// teams) is a requested reviewer. GitHub drops the viewer from the request
@@ -47,6 +53,54 @@ query($q: String!, $me: String!) {
   }
 }
 "#;
+
+/// gh is the authority for configured hosts. Ask only for names, never tokens.
+/// JSON mode keeps hosts with expired credentials in the list, allowing their
+/// local clones and cached reviews to remain visible until authentication recovers.
+/// Unlike text mode, JSON mode exits successfully even for authentication errors
+/// (gh 2.81+: https://cli.github.com/manual/gh_auth_status).
+pub fn known_hosts() -> Result<Vec<String>> {
+    known_hosts_with(gh_request)
+}
+
+fn known_hosts_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Result<Vec<String>> {
+    check_cli_version(&run(&["--version"])?)?;
+    let output = run(&[
+        "auth",
+        "status",
+        "--active",
+        "--json",
+        "hosts",
+        "--jq",
+        ".hosts | keys",
+    ])
+    .context("could not discover GitHub hosts; run `gh auth status`")?;
+    parse_hosts(&output)
+}
+
+fn check_cli_version(output: &str) -> Result<()> {
+    let version = output
+        .strip_prefix("gh version ")
+        .and_then(|s| s.split_whitespace().next())
+        .context("could not determine GitHub CLI version; gh 2.81 or newer is required")?;
+    let version = semver::Version::parse(version).context("unexpected GitHub CLI version")?;
+    if version < semver::Version::new(2, 81, 0) {
+        bail!("GitHub CLI {version} is too old; install gh 2.81 or newer for host discovery");
+    }
+    Ok(())
+}
+
+fn parse_hosts(output: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = serde_json::from_str(output).context("unexpected gh host list")?;
+    let mut hosts = BTreeSet::from([PUBLIC_HOST.to_string()]);
+    for name in names {
+        let host = normalize_host(&name).with_context(|| {
+            format!("unsupported GitHub host {name:?}; use a bare hostname with standard HTTPS")
+        })?;
+        hosts.insert(host);
+    }
+    Ok(hosts.into_iter().collect())
+}
 
 /// Walk back only when the latest page omits the viewer's request. A bounded
 /// number of pages and an overall deadline keep pathological histories finite.
@@ -88,11 +142,65 @@ pub struct Check {
     pub reviews: Result<Vec<PendingReview>>,
 }
 
-/// Re-resolves the effective github.com account on every check. `gh` remains
-/// responsible for credentials, including environment-token precedence.
-pub fn check() -> Check {
+/// Reviews and readiness are isolated by host. `gh` remains responsible for
+/// credentials, including environment-token precedence.
+#[derive(Debug, Default)]
+pub struct FetchResults {
+    pub reviews: Vec<PendingReview>,
+    pub successful_hosts: BTreeSet<String>,
+    pub errors: Vec<String>,
+    pub readiness: BTreeMap<String, Readiness>,
+}
+
+/// Poll only hosts with enabled local repositories. Each failure is isolated.
+pub fn fetch_awaiting_reviews(hosts: &BTreeSet<String>) -> FetchResults {
+    if hosts.is_empty() {
+        return probe_readiness_with(PUBLIC_HOST, gh_request);
+    }
+    fetch_hosts_with(hosts, check_host)
+}
+
+fn probe_readiness_with(
+    host: &str,
+    mut run: impl FnMut(&[&str]) -> Result<String>,
+) -> FetchResults {
+    let mut results = FetchResults::default();
+    let readiness = match run(&["api", "--hostname", host, "user", "--jq", ".login"]) {
+        Ok(login) if !login.trim().is_empty() => Readiness::Ready(login.trim().into()),
+        result => {
+            let error = result
+                .err()
+                .unwrap_or_else(|| anyhow::anyhow!("GitHub returned no account"));
+            results.errors.push(format!("{host}: {error:#}"));
+            classify_failure(&error)
+        }
+    };
+    results.readiness.insert(host.to_string(), readiness);
+    results
+}
+
+fn fetch_hosts_with(
+    hosts: &BTreeSet<String>,
+    mut fetch: impl FnMut(&str) -> Check,
+) -> FetchResults {
+    let mut results = FetchResults::default();
+    for host in hosts {
+        let check = fetch(host);
+        results.readiness.insert(host.clone(), check.readiness);
+        match check.reviews {
+            Ok(reviews) => {
+                results.successful_hosts.insert(host.clone());
+                results.reviews.extend(reviews);
+            }
+            Err(err) => results.errors.push(format!("{host}: {err:#}")),
+        }
+    }
+    results
+}
+
+fn check_host(host: &str) -> Check {
     let started = Instant::now();
-    check_with(|args| {
+    check_host_with(host, |args| {
         let remaining = CHECK_TIMEOUT.saturating_sub(started.elapsed());
         if remaining.is_zero() {
             bail!(
@@ -106,8 +214,15 @@ pub fn check() -> Check {
     })
 }
 
-fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
-    let login = run(&["api", "--hostname", "github.com", "user", "--jq", ".login"]);
+#[cfg(test)]
+fn check_with(run: impl FnMut(&[&str]) -> Result<String>) -> Check {
+    check_host_with(PUBLIC_HOST, run)
+}
+
+fn check_host_with(host: &str, mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
+    let login = run(&["api", "--hostname", host, "user", "--jq", ".login"]).with_context(|| {
+        format!("could not read viewer; check `gh auth status --hostname {host}`")
+    });
     let me = match login {
         Ok(login) if !login.trim().is_empty() => login.trim().to_string(),
         result => {
@@ -125,7 +240,7 @@ fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
     let output = run(&[
         "api",
         "--hostname",
-        "github.com",
+        host,
         "graphql",
         "-f",
         &format!("query={QUERY}"),
@@ -138,13 +253,15 @@ fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
     let reviews = output.and_then(|output| {
         let response: Response =
             serde_json::from_str(&output).context("unexpected GitHub response")?;
-        if !response.data.viewer.login.eq_ignore_ascii_case(&me) {
-            readiness = Readiness::Ready(response.data.viewer.login);
+        check_graphql_errors(&response.errors)?;
+        let data = response.data.context("GitHub GraphQL response contained no data")?;
+        if !data.viewer.login.eq_ignore_ascii_case(&me) {
+            readiness = Readiness::Ready(data.viewer.login);
             bail!("GitHub account changed during the check. Refresh to check the active account.");
         }
         let mut pending = Vec::new();
         let mut pages = 0;
-        for mut pr in response.data.search.nodes.into_iter().flatten() {
+        for mut pr in data.search.nodes.into_iter().flatten() {
             while pr.needs_request_history(&me) {
                 if pages >= MAX_HISTORY_PAGES {
                     bail!("Review request history exceeded this check's pagination limit. Cached reviews remain unverified; Refresh to retry.");
@@ -152,7 +269,7 @@ fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
                 let cursor = pr.timeline_items.page_info.start_cursor.as_deref()
                     .context("GitHub omitted the review history cursor")?;
                 let output = run(&[
-                    "api", "--hostname", "github.com", "graphql",
+                    "api", "--hostname", host, "graphql",
                     "-f", &format!("query={HISTORY_QUERY}"),
                     "-f", &format!("id={}", pr.id),
                     "-f", &format!("before={cursor}"),
@@ -160,11 +277,14 @@ fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
                 pages += 1;
                 let response: HistoryResponse = serde_json::from_str(&output)
                     .context("unexpected GitHub review history response")?;
-                if !response.data.viewer.login.eq_ignore_ascii_case(&me) {
-                    readiness = Readiness::Ready(response.data.viewer.login);
+                check_graphql_errors(&response.errors)?;
+                let data = response.data.context("GitHub GraphQL history response contained no data")?;
+                if !data.viewer.login.eq_ignore_ascii_case(&me) {
+                    readiness = Readiness::Ready(data.viewer.login);
                     bail!("GitHub account changed during the check. Refresh to check the active account.");
                 }
-                let history = response.data.node.context("GitHub could not read the pull request history")?.timeline_items;
+                let history = data.node
+                    .context("GitHub could not read the pull request history")?.timeline_items;
                 if history.page_info.has_previous_page
                     && history.page_info.start_cursor.as_deref() == Some(cursor) {
                     bail!("GitHub review history pagination did not advance. Refresh to retry.");
@@ -172,7 +292,7 @@ fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
                 pr.timeline_items.nodes.extend(history.nodes);
                 pr.timeline_items.page_info = history.page_info;
             }
-            if let Some(pr) = pr.into_pending(&me) {
+            if let Some(pr) = pr.into_pending(host, &me) {
                 pending.push(pr);
             }
         }
@@ -190,14 +310,50 @@ fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Check {
     Check { readiness, reviews }
 }
 
-fn classify_failure(err: &anyhow::Error) -> Readiness {
+fn check_graphql_errors(errors: &[GraphQlError]) -> Result<()> {
+    if !errors.is_empty() {
+        bail!(
+            "GitHub GraphQL error: {}",
+            errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn fetch_host_with(
+    host: &str,
+    run: impl FnMut(&[&str]) -> Result<String>,
+) -> Result<Vec<PendingReview>> {
+    check_host_with(host, run).reviews
+}
+#[cfg(test)]
+fn parse_reviews(output: &str, host: &str, me: &str) -> Result<Vec<PendingReview>> {
+    check_host_with(host, |args| {
+        if args[3] == "user" {
+            Ok(me.into())
+        } else {
+            Ok(output.into())
+        }
+    })
+    .reviews
+}
+
+pub fn classify_failure(err: &anyhow::Error) -> Readiness {
     if err
         .downcast_ref::<std::io::Error>()
         .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
     {
         return Readiness::Missing;
     }
-    if err.to_string().starts_with("could not run `gh`") {
+    if err
+        .chain()
+        .any(|cause| cause.to_string().starts_with("could not run `gh`"))
+    {
         return Readiness::NotRunnable;
     }
     let message = format!("{err:#}").to_lowercase();
@@ -266,7 +422,7 @@ impl Pr {
                 .any(|request| concerns_me(&request.requested_reviewer, me))
     }
 
-    fn into_pending(self, me: &str) -> Option<PendingReview> {
+    fn into_pending(self, host: &str, me: &str) -> Option<PendingReview> {
         let requested_at = self.latest_request(me).map(str::to_owned);
         let author = self
             .author
@@ -300,6 +456,7 @@ impl Pr {
             return None;
         }
         Some(PendingReview {
+            host: host.to_ascii_lowercase(),
             repo: self.repository.name_with_owner,
             number: self.number,
             title: self.title,
@@ -313,61 +470,132 @@ impl Pr {
 }
 
 pub fn gh(args: &[&str]) -> Result<String> {
-    let mut command = Command::new(gh_binary());
-    command.args(args);
-    // Downloading an update needs a larger budget than a review/API check.
     let timeout = if args.starts_with(&["release", "download"]) {
         Duration::from_secs(10 * 60)
     } else {
         Duration::from_secs(30)
     };
-    run_command(&mut command, timeout)
+    let output = command_output(Command::new(gh_binary()).args(args), timeout)?;
+    gh_output(args, output)
 }
 
-/// Files drain output without pipe-buffer deadlocks or reader threads that
-/// might outlive a timed-out subprocess. Both platforms supported are Unix.
-fn run_command(command: &mut Command, timeout: Duration) -> Result<String> {
-    let mut stdout = tempfile::tempfile()?;
-    let mut stderr = tempfile::tempfile()?;
+/// A stalled CLI request must not prevent the remaining hosts from polling.
+/// Release downloads use `gh` above because large assets can take longer.
+fn gh_request(args: &[&str]) -> Result<String> {
+    let mut command = Command::new(gh_binary());
+    command.args(args);
+    let output = command_output(&mut command, Duration::from_secs(30))
+        .with_context(|| format!("gh {} request failed", args.first().unwrap_or(&"")))?;
+    gh_output(args, output)
+}
+
+fn gh_output(args: &[&str], output: Output) -> Result<String> {
+    if !output.status.success() {
+        bail!(
+            "gh {} failed: {}",
+            args.first().unwrap_or(&""),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Drain both pipes without blocking: GraphQL responses can exceed a pipe buffer,
+/// and descendants can keep a pipe open after the direct child exits. One deadline
+/// covers both process execution and pipe reads, with no reader threads to join.
+fn command_output(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
     let mut child = command
-        .stdin(Stdio::null())
-        .stdout(stdout.try_clone()?)
-        .stderr(stderr.try_clone()?)
+        .process_group(0)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_PAGER", "cat")
         .env_remove("GH_DEBUG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
-        .context("could not run `gh`; install the GitHub CLI and Refresh")?;
-    let started = Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(Duration::from_millis(20))
+        .context("could not run `gh`; is the GitHub CLI installed?")?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let result = (|| {
+        nonblocking(&stdout)?;
+        nonblocking(&stderr)?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (mut out_closed, mut err_closed) = (false, false);
+        let mut status = None;
+        loop {
+            if Instant::now() >= deadline {
+                bail!("GitHub CLI timed out after {} seconds", timeout.as_secs());
             }
-            result => {
-                child.kill().ok();
-                child.wait().ok();
-                if let Err(err) = result {
-                    return Err(err.into());
-                }
-                bail!(
-                    "GitHub CLI timed out after {} seconds. Check your connection and Refresh.",
-                    timeout.as_secs()
-                );
+            if !out_closed {
+                out_closed = drain_pipe(&mut stdout, &mut out)?;
             }
+            if !err_closed {
+                err_closed = drain_pipe(&mut stderr, &mut err)?;
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if out_closed
+                && err_closed
+                && let Some(status) = status
+            {
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-    };
-    if !status.success() {
-        stderr.rewind()?;
-        let mut message = String::new();
-        stderr.read_to_string(&mut message)?;
-        bail!("GitHub CLI failed: {}", message.trim());
+    })();
+    if result.is_err() {
+        terminate_request(&mut child);
     }
-    stdout.rewind()?;
-    let mut output = String::new();
-    stdout.read_to_string(&mut output)?;
-    Ok(output)
+    result
+}
+
+fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: the pipe owns this live descriptor throughout both fcntl calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Limit each drain so continuous output cannot starve stderr or the deadline.
+fn drain_pipe(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> io::Result<bool> {
+    let mut buffer = [0; 8192];
+    for _ in 0..16 {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn terminate_request(child: &mut Child) {
+    // SAFETY: process_group(0) gives this request its own group whose id is the
+    // child's pid; the negative id targets only it and its descendants.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    // Also kill the direct child if it changed groups, and reap it on every error.
+    child.kill().ok();
+    child.wait().ok();
+}
+
+fn run_command(command: &mut Command, timeout: Duration) -> Result<String> {
+    gh_output(&[], command_output(command, timeout)?)
 }
 
 /// Apps launched from Finder get a bare PATH, so look in the usual places too.
@@ -380,7 +608,13 @@ fn gh_binary() -> &'static str {
 
 #[derive(Deserialize)]
 struct Response {
-    data: Data,
+    data: Option<Data>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
+}
+#[derive(Deserialize)]
+struct GraphQlError {
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -425,7 +659,9 @@ struct PageInfo {
 
 #[derive(Deserialize)]
 struct HistoryResponse {
-    data: HistoryData,
+    data: Option<HistoryData>,
+    #[serde(default)]
+    errors: Vec<GraphQlError>,
 }
 
 #[derive(Deserialize)]
@@ -526,10 +762,14 @@ mod tests {
         store.reconcile(vec![
             serde_json::from_value::<Pr>(previous)
                 .unwrap()
-                .into_pending("alice")
+                .into_pending(PUBLIC_HOST, "alice")
                 .unwrap(),
         ]);
-        store.snooze(&("o/r".into(), 1), 30, 1_000);
+        store.snooze(
+            &(crate::repository::RepositoryId::new(PUBLIC_HOST, "o/r"), 1),
+            30,
+            1_000,
+        );
         let check = check_with(|args| {
             if args[3] == "user" {
                 return Ok("alice".into());
@@ -637,7 +877,7 @@ mod tests {
             store.last_successful_sync = Some(100);
             let previous = serde_json::from_value::<Pr>(busy_pr())
                 .unwrap()
-                .into_pending("alice")
+                .into_pending(PUBLIC_HOST, "alice")
                 .unwrap();
             store.reconcile(vec![previous.clone()]);
             store.snooze(&previous.key(), 30, 1_000);
@@ -766,5 +1006,264 @@ fi
             run_command(&mut Command::new(path), Duration::from_secs(5)).unwrap(),
             "recovered"
         );
+    }
+    use serde_json::json;
+
+    fn response(host: &str, viewer: &str) -> String {
+        json!({"data":{"viewer":{"login":viewer}, "search":{"nodes":[{
+            "id":"PR_test", "number":17,"title":"Review me","url":format!("https://{host}/owner/repo/pull/17"),
+            "isDraft":false,"author":{"login":"author"},"repository":{"nameWithOwner":"Owner/Repo"},
+            "reviewRequests":{"nodes":[{"requestedReviewer":{"__typename":"User","login":viewer}}]},
+            "reviews":{"nodes":[]},"timelineItems":{"nodes":[], "pageInfo":{"hasPreviousPage":false,"startCursor":null}}
+        }]}}})
+        .to_string()
+    }
+
+    #[test]
+    fn zero_repositories_still_resolves_cli_account_without_claiming_a_review_sync() {
+        let results = probe_readiness_with(PUBLIC_HOST, |args| {
+            assert_eq!(
+                args,
+                ["api", "--hostname", PUBLIC_HOST, "user", "--jq", ".login"]
+            );
+            Ok("alice\n".into())
+        });
+        assert_eq!(
+            results.readiness[PUBLIC_HOST],
+            Readiness::Ready("alice".into())
+        );
+        assert!(results.successful_hosts.is_empty());
+        assert!(results.reviews.is_empty());
+        let mut store = crate::store::Store::default();
+        let mut health = crate::health::SyncHealth::default();
+        health.apply_hosts(&results, &mut store, 100);
+        assert_eq!(store.last_successful_sync, None);
+        assert!(!health.verified);
+        let signed_out = probe_readiness_with(PUBLIC_HOST, |_| Err(anyhow::anyhow!("HTTP 401")));
+        assert_eq!(signed_out.readiness[PUBLIC_HOST], Readiness::SignedOut);
+    }
+
+    #[test]
+    fn discovers_configured_hosts_including_unhealthy_ones() {
+        // Auth status JSON can succeed even when one host's credentials fail.
+        // Host names, rather than successful account states, are the authority.
+        assert_eq!(
+            parse_hosts(r#"["GITHUB.EXAMPLE.COM","acme.ghe.com","github.com"]"#).unwrap(),
+            vec!["acme.ghe.com", "github.com", "github.example.com"]
+        );
+        assert_eq!(parse_hosts("[]").unwrap(), vec!["github.com"]);
+        for invalid in [
+            r#"["https://ghe.example"]"#,
+            r#"["ghe.example:8443"]"#,
+            r#"["-option"]"#,
+            "{}",
+        ] {
+            assert!(parse_hosts(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn requires_machine_readable_cli_version() {
+        assert!(
+            check_cli_version("gh version 2.81.0 (2025-10-01)\nhttps://github.com/cli/cli").is_ok()
+        );
+        assert!(check_cli_version("gh version 2.102.0 (2026-09-30)").is_ok());
+        let error = check_cli_version("gh version 2.80.0 (2025-09-23)").unwrap_err();
+        assert!(error.to_string().contains("2.81"));
+        assert!(check_cli_version("unrecognized version").is_err());
+    }
+
+    #[test]
+    fn routes_viewer_and_reviews_explicitly_for_each_host() {
+        let mut reviews = Vec::new();
+        for (host, viewer) in [
+            ("github.com", "public-user"),
+            ("github.example.com", "server-user"),
+            ("acme.ghe.com", "cloud-user"),
+        ] {
+            let mut calls = Vec::new();
+            reviews.extend(
+                check_host_with(host, |args| {
+                    calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+                    assert_eq!(&args[..3], ["api", "--hostname", host]);
+                    match args[3] {
+                        "user" => Ok(format!("{viewer}\n")),
+                        "graphql" => {
+                            assert!(args.contains(&format!("me={viewer}").as_str()));
+                            Ok(response(host, viewer))
+                        }
+                        _ => panic!("unexpected endpoint"),
+                    }
+                })
+                .reviews
+                .unwrap(),
+            );
+            assert_eq!(calls.len(), 2);
+        }
+        let keys: BTreeSet<_> = reviews.iter().map(PendingReview::key).collect();
+        assert_eq!(keys.len(), 3);
+        assert!(
+            reviews
+                .iter()
+                .all(|pr| pr.repo == "Owner/Repo" && pr.number == 17)
+        );
+    }
+
+    #[test]
+    fn authentication_and_schema_failures_do_not_become_empty_successes() {
+        let mut calls = 0;
+        let error = fetch_host_with("github.example.com", |_| {
+            calls += 1;
+            bail!("HTTP 401: bad credentials")
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(format!("{error:#}").contains("gh auth status --hostname github.example.com"));
+        assert!(fetch_host_with("github.com", |_| Ok("\n".into())).is_err());
+        for output in [
+            r#"{"errors":[{"message":"Field isDraft does not exist"}]}"#,
+            r#"{"data":{"search":{"nodes":[]}},"errors":[{"message":"permission denied"}]}"#,
+            r#"{"data":null}"#,
+        ] {
+            assert!(
+                parse_reviews(output, "github.example.com", "me").is_err(),
+                "{output}"
+            );
+        }
+        assert!(
+            parse_reviews(
+                r#"{"data":{"viewer":{"login":"me"},"search":{"nodes":[]}}}"#,
+                "github.example.com",
+                "me"
+            )
+            .unwrap()
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn host_failures_do_not_block_other_hosts() {
+        let hosts = BTreeSet::from([
+            "github.com".into(),
+            "github.example.com".into(),
+            "acme.ghe.com".into(),
+        ]);
+        let results = fetch_hosts_with(&hosts, |host| Check {
+            readiness: Readiness::Ready("me".into()),
+            reviews: if host == "github.example.com" {
+                Err(anyhow::anyhow!("unsupported GraphQL schema"))
+            } else {
+                parse_reviews(&response(host, "me"), host, "me")
+            },
+        });
+        assert_eq!(results.reviews.len(), 2);
+        assert_eq!(
+            results.successful_hosts,
+            BTreeSet::from(["github.com".into(), "acme.ghe.com".into()])
+        );
+        assert_eq!(
+            results.errors,
+            ["github.example.com: unsupported GraphQL schema"]
+        );
+    }
+
+    #[test]
+    fn host_discovery_requests_only_names_and_reports_cli_failures() {
+        let mut calls = 0;
+        let hosts = known_hosts_with(|args| {
+            calls += 1;
+            match args {
+                ["--version"] => Ok("gh version 2.81.0 (2025-10-01)".into()),
+                [
+                    "auth",
+                    "status",
+                    "--active",
+                    "--json",
+                    "hosts",
+                    "--jq",
+                    ".hosts | keys",
+                ] => Ok(r#"["github.example.com"]"#.into()),
+                _ => panic!("unexpected gh invocation: {args:?}"),
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(hosts, ["github.com", "github.example.com"]);
+        let error = known_hosts_with(|args| {
+            if args == ["--version"] {
+                Ok("gh version 2.81.0".into())
+            } else {
+                bail!("could not read configuration")
+            }
+        })
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("could not discover GitHub hosts"));
+    }
+
+    #[test]
+    fn cli_timeout_terminates_the_request_instead_of_blocking_polling() {
+        let started = Instant::now();
+        let error = command_output(
+            Command::new("/bin/sh").args(["-c", "exec sleep 5"]),
+            Duration::from_millis(30),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cli_timeout_does_not_wait_for_descendants_holding_pipes() {
+        for script in ["sleep 5 & exec sleep 5", "sleep 5 & exit 0"] {
+            let started = Instant::now();
+            let error = command_output(
+                Command::new("/bin/sh").args(["-c", script]),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{script}: {error}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{script}");
+            // A failed request must leave the next host free to run immediately.
+            let next = command_output(
+                Command::new("/bin/sh").args(["-c", "printf healthy"]),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(next.stdout, b"healthy");
+        }
+    }
+
+    #[test]
+    fn continuous_output_cannot_starve_the_cli_deadline() {
+        let started = Instant::now();
+        let error = command_output(
+            Command::new("/bin/sh").args(["-c", "yes stdout & yes stderr >&2 & wait"]),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn cli_output_drains_large_responses_and_preserves_failure_details() {
+        let output = command_output(
+            Command::new("/bin/sh").args(["-c", "printf 'bad credentials' >&2; exit 1"]),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let error = gh_output(&["api"], output).unwrap_err();
+        assert!(error.to_string().contains("bad credentials"));
+        let output = command_output(
+            Command::new("/bin/sh").args([
+                "-c",
+                "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2",
+            ]),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 131072);
+        assert_eq!(output.stderr.len(), 131072);
     }
 }
