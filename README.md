@@ -84,6 +84,18 @@ This tab sets how often Octowatcher checks GitHub: every 1, 2, 5, 10, 15, 30 or 
 
 It also sets how long a snooze lasts: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default is 5 minutes.
 
+### Keyboard access
+
+- **Tab / Shift+Tab** move forward or backward through the window's controls. A blue border shows focus, and content scrolls into view when you navigate to it.
+- **Enter / Space** activate the focused control: open a review, snooze or unsnooze it, switch a tab, toggle a repository, or pick a setting. Each review's Snooze button is a separate focus stop; activating it keeps you in Octowatcher.
+- **Left / Right** switch tabs when a tab has focus, wrapping at either end.
+- **Up / Down** move between reviews. **Home / End** move to the first or last review. If a Snooze button has focus, these keys move between the Snooze buttons instead.
+- **Command+R / Command+Q** on macOS, or **Control+R / Control+Q** on Linux, refresh reviews or quit.
+
+Focus follows the same review or repository when a background check reorders the list. If a focused control disappears, focus moves to a nearby remaining control. Empty and loading lists still allow navigation through the header and tabs.
+
+The current GPUI dependency (0.2.2) does not expose an accessibility tree or APIs for control roles, accessible names, selected states, or screen-reader announcements. Keyboard access is supported, but the custom window controls cannot currently be exposed to VoiceOver or Linux screen readers. Native menus and dialogs depend on platform support. Full assistive-technology support requires a framework change; this feature does not upgrade GPUI or change saved settings.
+
 ### Running in the background
 
 Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To get the window back, choose **Open Octowatcher** from the tray menu, or on macOS click the Dock icon. To stop the app, choose **Quit Octowatcher**.

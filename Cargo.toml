@@ -64,3 +64,6 @@ assets = [
     { source = "assets/icons/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/octowatcher.png", mode = "644" },
     { source = "assets/icons/512x512.png", dest = "/usr/share/icons/hicolor/512x512/apps/octowatcher.png", mode = "644" },
 ]
+
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
