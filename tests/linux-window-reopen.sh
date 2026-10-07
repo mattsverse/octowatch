@@ -45,7 +45,17 @@ wm_ready() { xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window 
 await wm_ready
 "$binary" --background >"$workspace/app.log" 2>&1 &
 app_pid=$!
-window_for_app() { xdotool search --onlyvisible --pid "$app_pid" 2>/dev/null | head -n 1; }
+window_for_app() {
+    local windows
+    windows=$(xdotool search --onlyvisible --pid "$app_pid" 2>/dev/null) || return 1
+    [[ -n $windows ]] || return 1
+    head -n 1 <<< "$windows"
+}
+only_one_visible_window() {
+    local windows
+    windows=$(xdotool search --onlyvisible --pid "$app_pid" 2>/dev/null) || return 1
+    [[ $(wc -l <<< "$windows") -eq 1 ]]
+}
 window_exists() { [[ -n $(window_for_app) ]]; }
 await test -s "$HOME/.octowatcher-instance/instance.lock"
 # Allow the cold launch to finish initialization on the virtual display.
@@ -56,7 +66,7 @@ kill -0 "$app_pid"
 [[ -z $(window_for_app) ]]
 "$binary"
 await window_exists
-old=$(window_for_app)
+old=$(await window_for_app)
 # The actual WM Close action invokes our minimize-on-close handler.
 wmctrl -ic "$(printf '0x%x' "$old")"
 is_minimized() { xprop -id "$old" WM_STATE 2>/dev/null | grep -q Iconic; }
@@ -74,13 +84,24 @@ restored() {
 }
 await restored
 kill -0 "$app_pid"
-[[ $(xdotool search --onlyvisible --pid "$app_pid" | wc -l) -eq 1 ]]
+await only_one_visible_window
 # Test the native minimize button path too, without invoking Close.
-old=$(window_for_app)
+old=$(await window_for_app)
 xdotool windowminimize "$old"
 await is_minimized
 "$binary"
 await restored
 kill -0 "$app_pid"
-[[ $(xdotool search --onlyvisible --pid "$app_pid" | wc -l) -eq 1 ]]
-echo 'PASS: quiet cold launch, Close and native minimize reopen in the same process'
+await only_one_visible_window
+# Quit must stop the owner and leave its instance lock available for restart.
+current=$(await window_for_app)
+xdotool windowactivate --sync "$current"
+xdotool key --clearmodifiers ctrl+q
+process_exited() { ! kill -0 "$app_pid" 2>/dev/null; }
+await process_exited
+wait "$app_pid"
+"$binary" >"$workspace/app.log" 2>&1 &
+app_pid=$!
+await window_exists
+await only_one_visible_window
+echo 'PASS: quiet startup, duplicate handoff, Close/minimize, Quit and restart'

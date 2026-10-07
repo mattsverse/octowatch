@@ -83,7 +83,7 @@ Repository choices include the host, so matching owner/repository names on diffe
 
 The list shows **X of Y reviews**. The Reviews tab keeps the total count, including snoozed PRs. Search and filters only change this window's list: they do not change watched repositories, the tray's awake count/list, or notifications. Your view choices survive refreshes, tab changes, and closing/reopening the window, and reset when you restart the app.
 
-Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. In short windows, the filter area scrolls while leaving space for reviews; keyboard focus scrolls each control into view. When no PRs match, the window shows a no-results message and a reset button.
+Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. If a Snooze picker is open, Escape cancels it first and keeps your filters. In short windows, the filter area scrolls while leaving space for reviews; keyboard focus scrolls each control into view. When no PRs match, the window shows a no-results message and a reset button.
 
 Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front, reopening the window if you closed it; its **Open Reviews** button does the same. Your current search and filters stay active. At each launch, Octowatcher summarizes eligible reviews as GitHub confirms them. An incomplete check can announce confirmed requests, while unchecked saved reviews and their undelivered alerts wait for confirmation. Reviews confirmed later can notify then; they do not need a new request.
 
@@ -155,6 +155,19 @@ Octowatcher observes at most 32 active notifications, with a one-hour action lif
 On macOS, this uses the system login item service. If approval is needed, allow Octowatcher in **System Settings → General → Login Items**. On Linux, it creates `~/.config/autostart/com.matteogassend.octowatcher.desktop` (or under `$XDG_CONFIG_HOME` when set). Keep an AppImage in a permanent location before enabling this setting; after moving or renaming it, Settings shows **Repair** instead of **On**. Click **Repair** to register its new path. Updates installed in place keep that path.
 
 Disabling startup in your desktop's login settings is respected; Octowatcher does not turn it back on when it starts. Deleting `state.json` resets app preferences but does not remove a system login registration; switch **Launch at login** off to remove it.
+
+### Keyboard access
+
+- **Tab / Shift+Tab** move forward or backward through the window's controls. A contrasting border shows focus in either theme, and content scrolls into view when you navigate to it. Settings starts with the System, Light and Dark appearance choices; changing appearance keeps focus on your choice.
+- **Enter / Space** activate the focused control: open a review, snooze or unsnooze it, switch a tab, toggle a repository, or pick a setting. Each review's Snooze button is a separate focus stop; activating it keeps you in Octowatcher.
+- To snooze with the keyboard, activate **Snooze…**, use **Tab / Shift+Tab** to choose a duration or **Cancel**, then press **Enter / Space**. **Escape** cancels the open picker without resetting your filters. With no picker open, it resets search and filters. Choosing or canceling returns focus to that review’s Snooze button, or a nearby remaining Snooze button if a filter hides that review. Snoozing a different review from a notification preserves your open picker and focus.
+- **Left / Right** switch tabs when a tab has focus, wrapping at either end.
+- **Up / Down** move between the reviews matching your search and filters. **Home / End** move to the first or last matching review. If a Snooze button has focus, these keys move between the Snooze buttons instead.
+- **Command+R / Command+Q** on macOS, or **Control+R / Control+Q** on Linux, refresh reviews or quit.
+
+Focus follows the same review or repository when a background check reorders the list. Matching repository names and PR numbers on different GitHub hosts have separate focus stops and actions. If a focused control disappears, focus moves to a nearby remaining control of the same type when possible, so review-card focus stays on a card and Snooze focus stays on Snooze. Empty and loading lists still allow navigation through the header and tabs.
+
+The current GPUI dependency (0.2.2) does not expose an accessibility tree or APIs for control roles, accessible names, selected states, or screen-reader announcements. Keyboard access is supported, but the custom window controls cannot currently be exposed to VoiceOver or Linux screen readers. Native menus and dialogs depend on platform support. Full assistive-technology support requires a framework change; this feature does not upgrade GPUI or change saved settings.
 
 ### Running in the background
 
