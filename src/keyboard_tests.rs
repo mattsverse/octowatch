@@ -321,3 +321,43 @@ fn platform_shortcuts_dispatch_without_activating_a_card(cx: &mut TestAppContext
     assert_eq!(quits.get(), 1);
     assert_eq!(cx.opened_url(), None);
 }
+
+#[gpui::test]
+fn bulk_removed_reviews_keep_activation_kind(cx: &mut TestAppContext) {
+    for snooze in [true, false] {
+        let (view, visual) = cx.add_window_view(fixture);
+        view.update(visual, |view, cx| {
+            view.store.pending = (1..=4).map(review).collect();
+            cx.notify();
+        });
+        visual.run_until_parked();
+        let original = if snooze {
+            Control::Snooze(key(4))
+        } else {
+            Control::Review(key(4))
+        };
+        focus(&view, original, visual);
+        // Removing rows before and at the focused row used to clamp a card's
+        // old absolute index to the surviving row's Snooze button.
+        view.update(visual, |view, cx| {
+            view.store.pending.retain(|pr| pr.number == 3);
+            cx.notify();
+        });
+        visual.run_until_parked();
+        let expected = if snooze {
+            Control::Snooze(key(3))
+        } else {
+            Control::Review(key(3))
+        };
+        assert_eq!(focused(&view, visual), Some(expected));
+        press(visual, "enter");
+        if snooze {
+            visual.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(3)).is_some()));
+            assert_eq!(visual.opened_url(), None);
+        } else {
+            visual.update(|_, cx| assert!(view.read(cx).store.snoozed.is_empty()));
+            assert_eq!(visual.opened_url(), Some(review(3).url));
+        }
+        visual.update(|window, _| window.remove_window());
+    }
+}

@@ -92,7 +92,7 @@ It also sets how long a snooze lasts: 5, 10, 15 or 30 minutes, or 1 or 2 hours. 
 - **Up / Down** move between reviews. **Home / End** move to the first or last review. If a Snooze button has focus, these keys move between the Snooze buttons instead.
 - **Command+R / Command+Q** on macOS, or **Control+R / Control+Q** on Linux, refresh reviews or quit.
 
-Focus follows the same review or repository when a background check reorders the list. If a focused control disappears, focus moves to a nearby remaining control. Empty and loading lists still allow navigation through the header and tabs.
+Focus follows the same review or repository when a background check reorders the list. If a focused control disappears, focus moves to a nearby remaining control of the same type when possible, so review-card focus stays on a card and Snooze focus stays on Snooze. Empty and loading lists still allow navigation through the header and tabs.
 
 The current GPUI dependency (0.2.2) does not expose an accessibility tree or APIs for control roles, accessible names, selected states, or screen-reader announcements. Keyboard access is supported, but the custom window controls cannot currently be exposed to VoiceOver or Linux screen readers. Native menus and dialogs depend on platform support. Full assistive-technology support requires a framework change; this feature does not upgrade GPUI or change saved settings.
 

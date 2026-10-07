@@ -59,6 +59,22 @@ impl Keyboard {
             .as_ref()
             .filter(|key| !order.contains(key))
             .map(|key| {
+                // Cards and Snooze buttons alternate in tab order. Recover by
+                // position among controls of the same kind so a refresh cannot
+                // silently change what Enter/Space will do.
+                let same_kind = |candidate: &&Control| {
+                    std::mem::discriminant(*candidate) == std::mem::discriminant(key)
+                };
+                let peers: Vec<_> = order.iter().filter(same_kind).collect();
+                if !peers.is_empty() {
+                    let index = self
+                        .order
+                        .iter()
+                        .filter(same_kind)
+                        .position(|old| old == key)
+                        .unwrap_or(0);
+                    return Some(peers[index.min(peers.len() - 1)].clone());
+                }
                 let index = self.order.iter().position(|old| old == key).unwrap_or(0);
                 order.get(index.min(order.len().saturating_sub(1))).cloned()
             });
