@@ -8,6 +8,7 @@ pub enum State {
     Off,
     On,
     NeedsApproval,
+    NeedsRepair,
     Unavailable(String),
 }
 
@@ -203,12 +204,12 @@ mod platform {
     }
 
     pub fn status() -> Result<State> {
-        if executable()?.is_none() {
+        let Some(executable) = executable()? else {
             return Ok(State::Unavailable(
                 "Available for installed packages and AppImages. Move the app to a permanent location first.".into(),
             ));
-        }
-        linux::status_at(&entry()?)
+        };
+        linux::status_at(&entry()?, &executable)
     }
 
     pub fn set_enabled(enabled: bool) -> Result<State> {
@@ -251,7 +252,7 @@ mod linux {
         .then(|| current.to_path_buf()))
     }
 
-    pub fn status_at(entry: &Path) -> Result<State> {
+    pub fn status_at(entry: &Path, executable: &Path) -> Result<State> {
         let contents = match fs::read_to_string(entry) {
             Ok(contents) => contents,
             Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(State::Off),
@@ -261,7 +262,7 @@ mod linux {
         // group, so an unrelated action doesn't accidentally disable startup.
         let mut main_group = false;
         let mut application = false;
-        let mut command = false;
+        let mut command = None;
         for line in contents.lines().map(str::trim) {
             if line.starts_with('[') {
                 main_group = line == "[Desktop Entry]";
@@ -271,15 +272,19 @@ mod linux {
                         return Ok(State::Off);
                     }
                     ("Type", "Application") => application = true,
-                    ("Exec", value) if !value.is_empty() => command = true,
+                    ("Exec", value) if !value.is_empty() => command = Some(value),
                     _ => {}
                 }
             }
         }
-        Ok(if application && command {
-            State::On
-        } else {
-            State::Off
+        Ok(match (application, command) {
+            (true, Some(command))
+                if command == format!("{} --background", desktop_exec(executable)?) =>
+            {
+                State::On
+            }
+            (true, Some(_)) => State::NeedsRepair,
+            _ => State::Off,
         })
     }
 
@@ -335,21 +340,45 @@ mod linux {
             let directory = tempfile::tempdir().unwrap();
             let entry = directory.path().join("autostart/octowatcher.desktop");
             let executable = Path::new("/home/user/My Apps/Octowatcher.AppImage");
-            assert_eq!(status_at(&entry).unwrap(), State::Off);
+            assert_eq!(status_at(&entry, executable).unwrap(), State::Off);
             set_at(&entry, executable, true).unwrap();
-            assert_eq!(status_at(&entry).unwrap(), State::On);
+            assert_eq!(status_at(&entry, executable).unwrap(), State::On);
             let contents = fs::read_to_string(&entry).unwrap();
             assert!(
                 contents
                     .contains("Exec=\"/home/user/My Apps/Octowatcher.AppImage\" --background\n")
             );
             fs::write(&entry, format!("{contents}Hidden=true\n")).unwrap();
-            assert_eq!(status_at(&entry).unwrap(), State::Off);
+            assert_eq!(status_at(&entry, executable).unwrap(), State::Off);
             set_at(&entry, executable, true).unwrap();
-            assert_eq!(status_at(&entry).unwrap(), State::On);
+            assert_eq!(status_at(&entry, executable).unwrap(), State::On);
             set_at(&entry, executable, false).unwrap();
             set_at(&entry, executable, false).unwrap();
-            assert_eq!(status_at(&entry).unwrap(), State::Off);
+            assert_eq!(status_at(&entry, executable).unwrap(), State::Off);
+        }
+
+        #[test]
+        fn moved_appimage_needs_explicit_repair_without_overriding_disable() {
+            let directory = tempfile::tempdir().unwrap();
+            let entry = directory.path().join("autostart/octowatcher.desktop");
+            let old = directory.path().join("Old %f.AppImage");
+            let new = directory.path().join("New $ name.AppImage");
+            fs::write(&old, "image").unwrap();
+            set_at(&entry, &old, true).unwrap();
+            assert_eq!(status_at(&entry, &old).unwrap(), State::On);
+            fs::rename(&old, &new).unwrap();
+            assert_eq!(status_at(&entry, &new).unwrap(), State::NeedsRepair);
+            assert!(!State::NeedsRepair.requested());
+            let stale = fs::read_to_string(&entry).unwrap();
+            // A status read never silently re-registers the running copy.
+            assert_eq!(fs::read_to_string(&entry).unwrap(), stale);
+            fs::write(&entry, format!("{stale}Hidden=true\n")).unwrap();
+            assert_eq!(status_at(&entry, &new).unwrap(), State::Off);
+            fs::write(&entry, stale).unwrap();
+            set_at(&entry, &new, true).unwrap();
+            assert_eq!(status_at(&entry, &new).unwrap(), State::On);
+            set_at(&entry, &new, false).unwrap();
+            assert_eq!(status_at(&entry, &new).unwrap(), State::Off);
         }
 
         #[test]
@@ -366,18 +395,19 @@ mod linux {
         fn failed_registration_preserves_entry_and_incomplete_entries_are_off() {
             let directory = tempfile::tempdir().unwrap();
             let entry = directory.path().join("autostart/octowatcher.desktop");
-            set_at(&entry, Path::new("/usr/bin/octowatcher"), true).unwrap();
+            let executable = Path::new("/usr/bin/octowatcher");
+            set_at(&entry, executable, true).unwrap();
             let previous = fs::read_to_string(&entry).unwrap();
             assert!(set_at(&entry, Path::new("/apps/bad\npath"), true).is_err());
             assert_eq!(fs::read_to_string(&entry).unwrap(), previous);
             fs::write(&entry, "[Desktop Entry]\nType=Application\n").unwrap();
-            assert_eq!(status_at(&entry).unwrap(), State::Off);
+            assert_eq!(status_at(&entry, executable).unwrap(), State::Off);
             fs::write(
                 &entry,
                 format!("{previous}X-GNOME-Autostart-enabled = false\n"),
             )
             .unwrap();
-            assert_eq!(status_at(&entry).unwrap(), State::Off);
+            assert_eq!(status_at(&entry, executable).unwrap(), State::Off);
         }
 
         #[test]

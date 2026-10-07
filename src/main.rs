@@ -1142,6 +1142,7 @@ impl Octowatcher {
                                         match state {
                                             login::State::On => "On",
                                             login::State::NeedsApproval => "Awaiting approval",
+                                            login::State::NeedsRepair => "Repair",
                                             _ => "Off",
                                         },
                                     )
@@ -1162,6 +1163,13 @@ impl Octowatcher {
                         row.child(
                             div().text_xs().text_color(rgb(theme::PEACH)).child(
                                 "Allow Octowatcher in System Settings → General → Login Items.",
+                            ),
+                        )
+                    })
+                    .when(self.login_state == login::State::NeedsRepair, |row| {
+                        row.child(
+                            div().text_xs().text_color(rgb(theme::PEACH)).child(
+                                "The startup command has changed. Repair it to start this copy at login.",
                             ),
                         )
                     })
@@ -1436,16 +1444,26 @@ pub fn show_window(cx: &mut App) {
     let view = cx.global::<MainView>().0.clone();
     view.update(cx, |this, cx| this.refresh_login_status(cx));
     cx.activate(true);
-    if let Some(window) = cx.windows().first() {
+    let existing = cx.windows().first().copied();
+    #[cfg(not(target_os = "linux"))]
+    if let Some(window) = existing {
         window
             .update(cx, |_, window, _| window.activate_window())
             .ok();
         return;
     }
     let bounds = Bounds::centered(None, size(px(560.), px(680.)), cx);
+    let window_bounds = WindowBounds::Windowed(bounds);
+    // GPUI has no unminimize API on Linux, and activation alone can leave a
+    // minimized surface hidden. Replace the native window, preserving the
+    // shared view/state and bounds. Open first: zero windows stops GPUI Linux.
+    #[cfg(target_os = "linux")]
+    let window_bounds = existing
+        .and_then(|window| window.update(cx, |_, window, _| window.window_bounds()).ok())
+        .unwrap_or(window_bounds);
     cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(window_bounds),
             app_id: Some("octowatcher".into()),
             ..Default::default()
         },
@@ -1463,4 +1481,8 @@ pub fn show_window(cx: &mut App) {
         },
     )
     .unwrap();
+    #[cfg(target_os = "linux")]
+    if let Some(window) = existing {
+        window.update(cx, |_, window, _| window.remove_window()).ok();
+    }
 }

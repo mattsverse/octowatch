@@ -19,6 +19,7 @@ semver = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tray-icon = "0.26"
+tempfile = "3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = "0.3.1"
@@ -30,9 +31,6 @@ notify-rust = "4.18"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
-
-[dev-dependencies]
-tempfile = "3"
 
 [package.metadata.bundle]
 name = "Octowatcher"

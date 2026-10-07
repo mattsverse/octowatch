@@ -87,7 +87,7 @@ It also sets how long a snooze lasts: 5, 10, 15 or 30 minutes, or 1 or 2 hours. 
 
 **Launch at login** is off by default. Switch it on to start Octowatcher quietly in the tray when you sign in. It is available for signed macOS release apps installed in `/Applications` or `~/Applications` on macOS 13 or later, and for Linux `.deb`, `.rpm`, and AppImage installs. Development binaries show this setting as unavailable; older macOS versions can still launch and run Octowatcher normally.
 
-On macOS, this uses the system login item service. If approval is needed, allow Octowatcher in **System Settings → General → Login Items**. On Linux, it creates `~/.config/autostart/com.matteogassend.octowatcher.desktop` (or under `$XDG_CONFIG_HOME` when set). Keep an AppImage in a permanent location before enabling this setting; after moving or renaming it, turn launch at login off and back on to register its new path. Updates installed in place keep that path.
+On macOS, this uses the system login item service. If approval is needed, allow Octowatcher in **System Settings → General → Login Items**. On Linux, it creates `~/.config/autostart/com.matteogassend.octowatcher.desktop` (or under `$XDG_CONFIG_HOME` when set). Keep an AppImage in a permanent location before enabling this setting; after moving or renaming it, Settings shows **Repair** instead of **On**. Click **Repair** to register its new path. Updates installed in place keep that path.
 
 Disabling startup in your desktop's login settings is respected; Octowatcher does not turn it back on when it starts. Deleting `state.json` resets app preferences but does not remove a system login registration; switch **Launch at login** off to remove it.
 
@@ -95,7 +95,7 @@ Disabling startup in your desktop's login settings is respected; Octowatcher doe
 
 Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To get the window back, choose **Open Octowatcher** from the tray menu, or on macOS click the Dock icon. To stop the app, choose **Quit Octowatcher**.
 
-On Linux, **Close** minimizes the window and leaves its taskbar entry available. GPUI's Linux backend otherwise exits when the last window is destroyed. Opening Octowatcher again asks the desktop to restore the window; Wayland desktops may only mark it as needing attention, in which case use its taskbar entry. On macOS, Close removes the window as before.
+On Linux, **Close** minimizes the window and leaves its taskbar entry available. GPUI's Linux backend otherwise exits when the last window is destroyed. Opening Octowatcher again creates a visible window with the same app state and window bounds. The desktop controls whether it receives keyboard focus. On macOS, Close removes the window as before.
 
 There is one running instance per user, even if you launch another copy or start it from a terminal. An ordinary launch brings back that instance's window; a login launch leaves it quietly in the background. This prevents duplicate checks, notifications, and simultaneous state writes. **Quit Octowatcher** stops it until you open it again or next sign in, without disabling launch at login. Restarting after an update opens the new version's window.
 
@@ -142,6 +142,16 @@ On macOS, notification permission and delivery require a signed `.app` bundle; t
 cargo install cargo-bundle
 cargo bundle --release
 ```
+
+On Linux, an isolated X11 window lifecycle check verifies Close, minimize, and reopening the running process:
+
+```sh
+sudo apt install xvfb openbox xdotool wmctrl x11-utils dbus-x11
+cargo build --locked
+tests/linux-window-reopen.sh target/debug/octowatcher
+```
+
+It starts its own virtual display and uses temporary settings. Wayland compositor behavior still needs a desktop check.
 
 ## Releasing
 

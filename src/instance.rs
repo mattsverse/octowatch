@@ -5,7 +5,7 @@ use std::{
     fs::{self, DirBuilder, File, OpenOptions, TryLockError},
     io::{self, Read, Write},
     os::unix::{
-        fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
+        fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -27,6 +27,7 @@ pub struct Instance {
     // Dropping the descriptor (or exiting/crashing) releases the OS lock.
     _lock: File,
     socket: PathBuf,
+    _socket_directory: tempfile::TempDir,
     stopped: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     pub reopen: async_channel::Receiver<()>,
@@ -36,23 +37,10 @@ impl Instance {
     /// `None` means another process accepted this launch. Quiet login launches
     /// don't raise its window; ordinary launches queue a reopen request.
     pub fn acquire(background: bool) -> Result<Option<Self>> {
-        // A short, stable socket path also works when HOME is too long for a
-        // Unix socket. The private directory prevents other users sending IPC.
-        // SAFETY: geteuid takes no arguments and has no preconditions.
-        let uid = unsafe { libc::geteuid() };
-        let directory = PathBuf::from(format!("/tmp/octowatcher-{uid}"));
-        match DirBuilder::new().mode(0o700).create(&directory) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(err) => return Err(err.into()),
-        }
-        let metadata = fs::symlink_metadata(&directory)?;
-        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-            bail!(
-                "{} must be a private directory owned by you",
-                directory.display()
-            );
-        }
+        // Other users cannot reserve a name inside our home directory. Keep
+        // this independent of XDG_CONFIG_HOME and the executable's location.
+        let home = dirs::home_dir().context("no home directory for instance lock")?;
+        let directory = private_directory(&home)?;
         Self::acquire_in(&directory, background)
     }
 
@@ -65,11 +53,10 @@ impl Instance {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW)
             .open(directory.join("instance.lock"))?;
-        let socket = directory.join("instance.sock");
         let deadline = Instant::now() + TIMEOUT;
         loop {
             match lock.try_lock() {
-                Ok(()) => return Self::own(lock, socket).map(Some),
+                Ok(()) => return Self::own(lock).map(Some),
                 Err(TryLockError::Error(err)) => return Err(err.into()),
                 Err(TryLockError::WouldBlock) => {}
             }
@@ -79,7 +66,7 @@ impl Instance {
             }
             // The first process may still be binding its socket. If it dies,
             // try_lock above lets this launch take over instead.
-            match send_reopen(&socket) {
+            match read_socket(&lock).and_then(|socket| send_reopen(&socket)) {
                 Ok(()) => return Ok(None),
                 Err(err) if Instant::now() >= deadline => {
                     return Err(err)
@@ -90,14 +77,20 @@ impl Instance {
         }
     }
 
-    fn own(lock: File, socket: PathBuf) -> Result<Self> {
-        // Only the lock owner removes a stale socket left after a crash.
-        match fs::remove_file(&socket) {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
+    fn own(lock: File) -> Result<Self> {
+        // The lock lives in HOME; the random private socket directory keeps
+        // Unix socket paths short even with a very long home directory.
+        if let Ok(stale) = read_socket(&lock) {
+            cleanup_socket(&stale);
         }
+        let socket_directory = tempfile::Builder::new()
+            .prefix("octowatcher-ipc-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir_in(fs::canonicalize("/tmp")?)?;
+        let socket = socket_directory.path().join("instance.sock");
         let listener = UnixListener::bind(&socket).context("could not bind instance socket")?;
+        lock.set_len(0)?;
+        lock.write_all_at(socket.as_os_str().as_encoded_bytes(), 0)?;
         let (sender, reopen) = async_channel::unbounded();
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_stopped = stopped.clone();
@@ -135,10 +128,75 @@ impl Instance {
         Ok(Self {
             _lock: lock,
             socket,
+            _socket_directory: socket_directory,
             stopped,
             worker: Some(worker),
             reopen,
         })
+    }
+}
+
+fn current_uid() -> libc::uid_t {
+    // SAFETY: geteuid has no arguments or preconditions.
+    unsafe { libc::geteuid() }
+}
+
+fn private_directory(home: &Path) -> Result<PathBuf> {
+    // Validate the parent too: a private leaf in a shared writable directory
+    // could already have been reserved by another local user.
+    let uid = current_uid();
+    let parent = fs::metadata(home)?;
+    if !parent.is_dir() || parent.uid() != uid || parent.mode() & 0o022 != 0 {
+        bail!(
+            "the instance lock needs a home directory owned by you and not writable by other users"
+        );
+    }
+    let directory = home.join(".octowatcher-instance");
+    match DirBuilder::new().mode(0o700).create(&directory) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(err) => return Err(err.into()),
+    }
+    let metadata = fs::symlink_metadata(&directory)?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        bail!(
+            "{} must be a private directory owned by you",
+            directory.display()
+        );
+    }
+    Ok(directory)
+}
+
+fn read_socket(lock: &File) -> io::Result<PathBuf> {
+    let mut contents = [0; 256];
+    let size = lock.read_at(&mut contents, 0)?;
+    let path = std::str::from_utf8(&contents[..size])
+        .map_err(|_| io::Error::other("invalid instance socket path"))?;
+    if path.is_empty() {
+        return Err(io::Error::other("instance socket is not ready"));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn cleanup_socket(socket: &Path) {
+    let Some(directory) = socket.parent() else {
+        return;
+    };
+    // Only remove the exact private socket directory we create, never an
+    // arbitrary path from a stale lock file. remove_dir refuses nonempty dirs.
+    if socket
+        .file_name()
+        .is_some_and(|name| name == "instance.sock")
+        && directory.parent() == fs::canonicalize("/tmp").ok().as_deref()
+        && directory
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("octowatcher-ipc-"))
+        && fs::symlink_metadata(directory).is_ok_and(|metadata| {
+            metadata.is_dir() && metadata.uid() == current_uid() && metadata.mode() & 0o077 == 0
+        })
+    {
+        fs::remove_file(socket).ok();
+        fs::remove_dir(directory).ok();
     }
 }
 
@@ -267,16 +325,49 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         result.unwrap();
-        assert!(directory.path().join("instance.sock").exists());
+        let stale =
+            read_socket(&File::open(directory.path().join("instance.lock")).unwrap()).unwrap();
+        assert!(stale.exists());
         let restarted = Instance::acquire_in(directory.path(), false)
             .unwrap()
             .unwrap();
+        assert!(!stale.exists());
         assert!(
             Instance::acquire_in(directory.path(), false)
                 .unwrap()
                 .is_none()
         );
         assert_eq!(restarted.reopen.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn lock_is_private_and_long_home_does_not_lengthen_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("long-home".repeat(20));
+        fs::create_dir(&home).unwrap();
+        let directory = private_directory(&home).unwrap();
+        assert!(directory.starts_with(&home));
+        assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
+        let owner = Instance::acquire_in(&directory, false).unwrap().unwrap();
+        assert!(owner.socket.as_os_str().len() < 100);
+        assert_eq!(
+            fs::metadata(owner.socket.parent().unwrap()).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert!(Instance::acquire_in(&directory, false).unwrap().is_none());
+        assert_eq!(owner.reopen.try_recv(), Ok(()));
+    }
+
+    #[test]
+    fn refuses_shared_parent_and_symlinked_private_directory() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(private_directory(home.path()).is_err());
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        symlink(target.path(), home.path().join(".octowatcher-instance")).unwrap();
+        assert!(private_directory(home.path()).is_err());
     }
 
     fn wait_for(path: &Path) {
