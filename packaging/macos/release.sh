@@ -99,6 +99,11 @@ ln -s /Applications "$work_dir/dmg/Applications"
 hdiutil create -ov -volname Octowatcher -fs HFS+ -format UDZO \
     -srcfolder "$work_dir/dmg" "$dmg"
 codesign --force --sign "$identity" --keychain "$keychain" --timestamp "$dmg"
+# TEMP: diagnose notarytool rejecting the DMG
+sw_vers; xcode-select -p; xcrun notarytool --version
+ls -l "$dmg"; file "$dmg"
+hdiutil imageinfo "$dmg" | head -20
+tail -c 512 "$dmg" | xxd | head -4   # UDIF trailer should start with "koly"
 notarize "$dmg"
 xcrun stapler staple "$dmg"
 xcrun stapler validate "$dmg"
