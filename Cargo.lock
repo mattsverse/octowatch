@@ -4147,6 +4147,7 @@ dependencies = [
  "async-channel 2.5.0",
  "chrono",
  "dirs 7.0.0",
+ "futures-lite 2.6.1",
  "gpui",
  "libc",
  "mac-usernotifications",

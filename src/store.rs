@@ -26,6 +26,14 @@ pub struct Store {
     pub snooze_minutes: u64,
     /// Reviews the user put aside for now.
     pub snoozed: Vec<Snooze>,
+    /// Review alerts are muted; polling and the queue stay active.
+    pub notifications_muted: bool,
+    /// Drafts stay in the queue regardless of this delivery preference.
+    pub notify_drafts: bool,
+    /// Review events not yet accepted by the desktop notification service.
+    pub notification_queue: Vec<ReviewNotice>,
+    /// Distinguishes a snooze reminder from an earlier delivery of the same request.
+    pub notification_sequence: u64,
     /// System appearance or a persistent light/dark override.
     pub appearance: Appearance,
 }
@@ -39,6 +47,10 @@ impl Default for Store {
             poll_minutes: 2,
             snooze_minutes: 5,
             snoozed: Vec::new(),
+            notifications_muted: false,
+            notify_drafts: true,
+            notification_queue: Vec::new(),
+            notification_sequence: 0,
             appearance: Appearance::default(),
         }
     }
@@ -75,6 +87,27 @@ impl PendingReview {
     }
 }
 
+/// A delivery event, independently persisted from the current review list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewNotice {
+    #[serde(default = "default_host")]
+    pub host: String,
+    pub repo: String,
+    pub number: u64,
+    pub requested_at: Option<String>,
+    pub sequence: u64,
+}
+
+impl ReviewNotice {
+    pub fn key(&self) -> (RepositoryId, u64) {
+        (RepositoryId::new(&self.host, &self.repo), self.number)
+    }
+
+    pub fn matches(&self, pr: &PendingReview) -> bool {
+        self.key() == pr.key() && self.requested_at == pr.requested_at
+    }
+}
+
 /// A pending review hidden from the list and the tray until `until`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snooze {
@@ -102,6 +135,7 @@ pub struct Reconciled {
     pub fresh: Vec<PendingReview>,
     pub pending_changed: bool,
     pub snoozes_changed: bool,
+    pub notifications_changed: bool,
 }
 
 impl Store {
@@ -157,12 +191,14 @@ impl Store {
         };
         self.snoozed.retain(|s| s.key() != *key);
         self.snoozed.push(snooze);
+        self.discard_notification(key);
         true
     }
 
     /// Brings a PR back without treating it as an expired snooze.
     pub fn unsnooze(&mut self, key: &(RepositoryId, u64)) {
         self.snoozed.retain(|s| s.key() != *key);
+        self.discard_notification(key);
     }
 
     pub fn next_snooze_until(&self) -> Option<i64> {
@@ -197,19 +233,90 @@ impl Store {
         self.reconcile(fetched)
     }
 
+    /// Retains at most one undelivered event per PR. Re-enqueuing a reminder
+    /// advances its generation so an older in-flight send cannot consume it.
+    pub fn queue_notifications(&mut self, prs: &[PendingReview]) {
+        for pr in prs {
+            self.discard_notification(&pr.key());
+            self.notification_sequence = self.notification_sequence.wrapping_add(1);
+            self.notification_queue.push(ReviewNotice {
+                host: pr.repository().host,
+                repo: pr.repo.to_lowercase(),
+                number: pr.number,
+                requested_at: pr.requested_at.clone(),
+                sequence: self.notification_sequence,
+            });
+        }
+    }
+
+    /// Seed each host's first successful poll after launch, including suppressed drafts.
+    pub fn queue_startup_notifications(&mut self, hosts: &BTreeSet<String>) {
+        let awake = self
+            .awake()
+            .into_iter()
+            .filter(|pr| hosts.contains(&pr.repository().host))
+            .collect::<Vec<_>>();
+        self.queue_notifications(&awake);
+    }
+
+    pub fn discard_notification(&mut self, key: &(RepositoryId, u64)) {
+        self.notification_queue
+            .retain(|notice| notice.key() != *key);
+    }
+
+    /// Resolved/disabled requests also leave the delivery queue. Titles and
+    /// draft status are read from the current review list at each attempt.
+    pub fn prune_notifications(&mut self) {
+        self.notification_queue
+            .retain(|notice| self.pending.iter().any(|pr| notice.matches(pr)));
+    }
+
+    pub fn notifications_due(&self) -> Vec<(ReviewNotice, PendingReview)> {
+        if self.notifications_muted {
+            return Vec::new();
+        }
+        self.pending
+            .iter()
+            .filter_map(|pr| {
+                if self.snooze_for(pr).is_some() || (pr.is_draft && !self.notify_drafts) {
+                    return None;
+                }
+                let notice = self
+                    .notification_queue
+                    .iter()
+                    .find(|notice| notice.matches(pr))?;
+                Some((notice.clone(), pr.clone()))
+            })
+            .collect()
+    }
+
+    /// Delivery is acknowledged on OS acceptance, before any user interaction.
+    pub fn mark_delivered(&mut self, notices: &[ReviewNotice]) {
+        self.notification_queue
+            .retain(|notice| !notices.contains(notice));
+    }
+
     /// Replaces the pending list with what GitHub reports now, newest first.
     /// A PR that drops out (reviewed, request removed, closed) is gone, and
     /// so is its snooze.
     pub fn reconcile(&mut self, mut fetched: Vec<PendingReview>) -> Reconciled {
-        fetched.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
-
-        // A request is new when the PR wasn't listed, or when it was asked
-        // again after the request already on file.
         let known: HashMap<_, _> = self
             .pending
             .iter()
             .map(|pr| (pr.key(), pr.requested_at.clone()))
             .collect();
+        // GitHub returns only a bounded timeline of request events. A missing
+        // timestamp on a still-pending PR is not evidence of a new request;
+        // keep its known identity, undelivered notice, and snooze deadline.
+        for pr in &mut fetched {
+            if pr.requested_at.is_none() {
+                pr.requested_at = known.get(&pr.key()).cloned().flatten();
+            }
+        }
+        fetched.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
+
+        // A request is new when the PR wasn't listed, or when it was asked
+        // again after the request already on file.
         let fresh: Vec<PendingReview> = fetched
             .iter()
             .filter(|pr| match known.get(&pr.key()) {
@@ -230,10 +337,15 @@ impl Store {
 
         let pending_changed = fetched != self.pending;
         self.pending = fetched;
+        let notifications_before = self.notification_queue.clone();
+        self.prune_notifications();
+        self.queue_notifications(&fresh);
+        let notifications_changed = self.notification_queue != notifications_before;
         Reconciled {
             fresh,
             pending_changed,
             snoozes_changed,
+            notifications_changed,
         }
     }
 
@@ -244,11 +356,14 @@ impl Store {
             .into_iter()
             .partition(|s| s.until <= now);
         self.snoozed = remaining;
-        self.pending
+        let woken: Vec<_> = self
+            .pending
             .iter()
             .filter(|pr| expired.iter().any(|s| s.key() == pr.key()))
             .cloned()
-            .collect()
+            .collect();
+        self.queue_notifications(&woken);
+        woken
     }
 }
 
@@ -309,7 +424,7 @@ mod tests {
 
     #[test]
     fn invalid_appearance_preserves_the_rest_of_the_store() {
-        let original = Store {
+        let mut original = Store {
             roots: vec!["/projects".into()],
             disabled: [
                 RepositoryId::new("github.com", "o/off"),
@@ -318,6 +433,7 @@ mod tests {
             .into(),
             pending: vec![
                 pr("o/r", 1, Some(T1)),
+                pr("o/r", 2, Some(T1)),
                 PendingReview {
                     host: "github.example.com".into(),
                     ..pr("o/r", 1, Some(T1))
@@ -332,8 +448,11 @@ mod tests {
             ],
             poll_minutes: 15,
             snooze_minutes: 30,
+            notifications_muted: true,
+            notify_drafts: false,
             ..Store::default()
         };
+        original.queue_notifications(&[pr("o/r", 2, Some(T1))]);
         for appearance in [
             serde_json::json!("high_contrast"),
             serde_json::Value::Null,
@@ -497,8 +616,34 @@ mod tests {
         assert_eq!(store.take_expired(1_300), store.pending);
     }
 
-    /// Pins how `reconcile` behaves today. Some rows (`None` to `Some`, and
-    /// `Some` to `None`) record current behaviour, not necessarily intended.
+    #[test]
+    fn missing_request_timestamp_preserves_snooze_until_newer_request_or_withdrawal() {
+        let review = pr("Owner/Repo", 1, Some(T1));
+        let mut store = Store {
+            pending: vec![review.clone()],
+            ..Store::default()
+        };
+        store.snooze(&review.key(), 5, 1_000);
+        let deadline = store.snoozed[0].clone();
+        let result = store.reconcile(vec![pr("Owner/Repo", 1, None)]);
+        assert!(result.fresh.is_empty());
+        assert!(!result.pending_changed);
+        assert!(!result.snoozes_changed);
+        assert_eq!(store.pending, vec![review.clone()]);
+        assert_eq!(store.snoozed, vec![deadline]);
+        let newer = pr("Owner/Repo", 1, Some(T2));
+        assert_eq!(
+            store.reconcile(vec![newer.clone()]).fresh,
+            vec![newer.clone()]
+        );
+        assert!(store.snoozed.is_empty());
+        store.snooze(&newer.key(), 5, 1_000);
+        store.reconcile(vec![]);
+        assert!(store.snoozed.is_empty());
+        assert!(store.notification_queue.is_empty());
+    }
+
+    /// Pins request freshness and snooze reconciliation.
     #[test]
     fn reconciles_requests_and_snoozes() {
         struct Case {
@@ -545,16 +690,6 @@ mod tests {
                 snoozed: vec![snooze("o/r", 1, None)],
                 fetched: vec![pr("o/r", 1, Some(T1))],
                 fresh: vec![1],
-                pending_changed: true,
-                snoozes_kept: 0,
-            },
-            Case {
-                // Freshness compares with `>`, the snooze retain with `==`.
-                name: "Some to None is not fresh but ends the snooze",
-                pending: vec![pr("o/r", 1, Some(T1))],
-                snoozed: vec![snooze("o/r", 1, Some(T1))],
-                fetched: vec![pr("o/r", 1, None)],
-                fresh: vec![],
                 pending_changed: true,
                 snoozes_kept: 0,
             },
@@ -664,6 +799,27 @@ mod tests {
         assert_eq!(woken, vec![1]);
         assert_eq!(store.snoozed.len(), 1);
         assert_eq!(store.snoozed[0].number, 2);
+    }
+
+    #[test]
+    fn legacy_notification_queue_defaults_to_public_host_and_preserves_delivery_state() {
+        let legacy = r#"{
+            "notifications_muted":true,"notify_drafts":false,"notification_sequence":42,
+            "pending":[{"repo":"owner/repo","number":7,"title":"Review","url":"https://github.com/owner/repo/pull/7","author":"someone","is_draft":false,"rereview":false,"requested_at":null}],
+            "notification_queue":[{"repo":"owner/repo","number":7,"requested_at":null,"sequence":42}]
+        }"#;
+        let store: Store = serde_json::from_str(legacy).unwrap();
+        assert!(store.notifications_muted);
+        assert!(!store.notify_drafts);
+        assert_eq!(store.notification_sequence, 42);
+        assert_eq!(store.notification_queue[0].host, "github.com");
+        assert!(store.notification_queue[0].matches(&store.pending[0]));
+        assert!(!store.notification_queue[0].matches(&PendingReview {
+            host: "github.example.com".into(),
+            ..store.pending[0].clone()
+        }));
+        let saved: Store = serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(saved.notification_queue, store.notification_queue);
     }
 
     #[test]
