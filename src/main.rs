@@ -82,6 +82,7 @@ struct Octowatcher {
     announced_accounts: BTreeSet<String>,
     account_errors: BTreeMap<String, String>,
     repo_errors: BTreeMap<(String, String), String>,
+    access_cache: github::AccessCache,
     tray: Option<Tray>,
     update: Option<Update>,
     scan_task: Option<Task<()>>,
@@ -155,6 +156,7 @@ impl Octowatcher {
             announced_accounts: BTreeSet::new(),
             account_errors: BTreeMap::new(),
             repo_errors: BTreeMap::new(),
+            access_cache: github::AccessCache::default(),
             tray,
             update: None,
             scan_task: None,
@@ -265,11 +267,17 @@ impl Octowatcher {
                 this.scan_task = None;
                 // Results fetched against the old repo list are stale.
                 this.fetch_task = None;
-                this.refresh(cx);
+                this.force_refresh(cx);
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    fn force_refresh(&mut self, cx: &mut Context<Self>) {
+        self.fetch_task = None;
+        self.access_cache = github::AccessCache::default();
+        self.refresh(cx);
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
@@ -278,12 +286,12 @@ impl Octowatcher {
             return;
         }
         let repos: Vec<_> = self.watched_slugs().into_iter().collect();
-        let disabled_accounts = self.store.disabled_accounts.clone();
-        let repo_accounts = self.store.repo_accounts.clone();
+        let preferences = self.store.clone();
+        let cache = self.access_cache.clone();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { github::poll(&repos, &disabled_accounts, &repo_accounts) })
+                .spawn(async move { github::poll(&repos, preferences, cache) })
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
@@ -291,6 +299,7 @@ impl Octowatcher {
                 match result {
                     Ok(poll) => this.reconcile(poll, cx),
                     Err(err) => {
+                        this.access_cache = github::AccessCache::default();
                         this.fetch_error = Some(format!("{err:#}"));
                         this.store.available_accounts.clear();
                         this.dismiss_stale_snooze_picker();
@@ -323,6 +332,13 @@ impl Octowatcher {
         self.account_errors.clear();
         self.repo_errors.clear();
         self.store.available_accounts.clear();
+        self.store.unavailable_repos.clear();
+        self.access_cache = poll.access_cache;
+        for account in &poll.accounts {
+            if let Some(id) = account.account_id {
+                self.store.record_account(&account.login, id);
+            }
+        }
         let found: BTreeSet<_> = poll
             .accounts
             .iter()
@@ -353,6 +369,12 @@ impl Octowatcher {
             }
             match check.reviews {
                 Ok(reviews) => {
+                    self.store.unavailable_repos.extend(
+                        reviews
+                            .unavailable_repos
+                            .into_iter()
+                            .map(|repo| (reviews.account_id, repo)),
+                    );
                     checked_accounts.insert(account.clone(), reviews.account_id);
                     self.store.available_accounts.insert(account);
                     fetched.extend(reviews.pending);
@@ -491,7 +513,7 @@ impl Octowatcher {
         self.save();
         self.sync_tray();
         self.schedule_wake(cx);
-        self.refresh(cx);
+        self.force_refresh(cx);
         cx.notify();
     }
 
@@ -504,29 +526,20 @@ impl Octowatcher {
     }
 
     fn toggle_account(&mut self, account: &str, cx: &mut Context<Self>) {
-        let account = account.to_lowercase();
-        if !self.store.disabled_accounts.remove(&account) {
-            self.store.disabled_accounts.insert(account.clone());
-        }
-        self.store.available_accounts.remove(&account);
+        self.store.toggle_account(account);
+        self.store
+            .available_accounts
+            .remove(&account.to_lowercase());
         self.scope_changed(cx);
     }
 
     fn toggle_repo_account(&mut self, repo: &str, account: &str, cx: &mut Context<Self>) {
-        let allowed = self
-            .store
-            .repo_accounts
-            .entry(repo.to_lowercase())
-            .or_insert_with(|| self.store.known_accounts.clone());
-        let account = account.to_lowercase();
-        if !allowed.remove(&account) {
-            allowed.insert(account);
-        }
+        self.store.toggle_repo_account(repo, account);
         self.scope_changed(cx);
     }
 
     fn all_repo_accounts(&mut self, repo: &str, cx: &mut Context<Self>) {
-        self.store.repo_accounts.remove(&repo.to_lowercase());
+        self.store.reset_repo_accounts(repo);
         self.scope_changed(cx);
     }
 
@@ -901,7 +914,7 @@ impl Octowatcher {
                             .gap_3()
                             .child(div().text_xs().text_color(rgb(theme::MUTED)).child(status))
                             .child(button("refresh", "Refresh").on_click(cx.listener(
-                                |this, _: &ClickEvent, _, cx| this.refresh(cx),
+                                |this, _: &ClickEvent, _, cx| this.force_refresh(cx),
                             ))),
                     ),
             )
@@ -1235,7 +1248,7 @@ impl Octowatcher {
         ix: usize,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let selected = self.store.repo_accounts.get(&repo.to_lowercase());
+        let all = self.store.all_repo_accounts(repo);
         let slug = repo.to_string();
         div()
             .flex()
@@ -1254,7 +1267,7 @@ impl Octowatcher {
                     .gap_2()
                     .child(
                         button(("all-accounts", ix), "All enabled accounts")
-                            .when(selected.is_none(), |s| {
+                            .when(all, |s| {
                                 s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE))
                             })
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1267,8 +1280,7 @@ impl Octowatcher {
                             .iter()
                             .enumerate()
                             .map(|(ai, account)| {
-                                let enabled =
-                                    selected.is_none_or(|allowed| allowed.contains(account));
+                                let enabled = self.store.repo_account_selected(repo, account);
                                 let account = account.clone();
                                 let slug = repo.to_string();
                                 div()
@@ -1292,14 +1304,21 @@ impl Octowatcher {
                             }),
                     ),
             )
-            .when(selected.is_some_and(|accounts| accounts.is_empty()), |s| {
-                s.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(theme::MUTED))
-                        .child("No accounts selected."),
-                )
-            })
+            .when(
+                !all && !self
+                    .store
+                    .known_accounts
+                    .iter()
+                    .any(|account| self.store.repo_account_selected(repo, account)),
+                |s| {
+                    s.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme::MUTED))
+                            .child("No accounts selected."),
+                    )
+                },
+            )
     }
 
     fn render_accounts(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1557,7 +1576,7 @@ impl Global for MainView {}
 /// Checks GitHub for review requests now, from the tray or the app menu.
 pub fn refresh(cx: &mut App) {
     let view = cx.global::<MainView>().0.clone();
-    view.update(cx, |this, cx| this.refresh(cx));
+    view.update(cx, |this, cx| this.force_refresh(cx));
 }
 
 /// Checks for a new release now, from the tray.
@@ -1701,6 +1720,7 @@ mod snooze_tests {
             announced_accounts: BTreeSet::from(["alice".into()]),
             account_errors: BTreeMap::new(),
             repo_errors: BTreeMap::new(),
+            access_cache: github::AccessCache::default(),
             tray: None,
             update: None,
             scan_task: None,

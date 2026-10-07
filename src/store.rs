@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 /// Everything that survives a restart, saved as JSON in the platform config dir.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Store {
     /// Folders scanned for local git clones.
@@ -25,6 +25,11 @@ pub struct Store {
     pub snoozed: Vec<Snooze>,
     /// Saved gh accounts seen before, including accounts since signed out.
     pub known_accounts: BTreeSet<String>,
+    /// Verified login aliases used to migrate older name-based preferences.
+    pub account_ids: BTreeMap<String, u64>,
+    pub disabled_account_ids: BTreeSet<u64>,
+    pub repo_account_ids: BTreeMap<String, BTreeSet<u64>>,
+    /// Legacy preferences are bound to IDs as their accounts are verified.
     pub disabled_accounts: BTreeSet<String>,
     /// Missing entry means all enabled accounts; an empty set means none.
     pub repo_accounts: BTreeMap<String, BTreeSet<String>>,
@@ -34,6 +39,9 @@ pub struct Store {
     /// Discovered repos in this session, never trusted across a restart.
     #[serde(skip)]
     pub local_repos: BTreeSet<String>,
+    /// Failed repository checks keep their cache hidden in this session.
+    #[serde(skip)]
+    pub unavailable_repos: BTreeSet<(u64, String)>,
 }
 
 impl Default for Store {
@@ -46,10 +54,14 @@ impl Default for Store {
             snooze_minutes: 5,
             snoozed: Vec::new(),
             known_accounts: BTreeSet::new(),
+            account_ids: BTreeMap::new(),
+            disabled_account_ids: BTreeSet::new(),
+            repo_account_ids: BTreeMap::new(),
             disabled_accounts: BTreeSet::new(),
             repo_accounts: BTreeMap::new(),
             available_accounts: BTreeSet::new(),
             local_repos: BTreeSet::new(),
+            unavailable_repos: BTreeSet::new(),
         }
     }
 }
@@ -144,24 +156,147 @@ impl Store {
         store
             .snoozed
             .retain(|s| !s.account.is_empty() && s.account_id != 0);
+        // Existing account-aware state already carries verified user IDs.
+        for (login, id) in store
+            .pending
+            .iter()
+            .map(|pr| (&pr.account, pr.account_id))
+            .chain(store.snoozed.iter().map(|s| (&s.account, s.account_id)))
+        {
+            store.account_ids.entry(login.to_lowercase()).or_insert(id);
+        }
+        store.migrate_account_preferences();
         Ok(store)
     }
 
+    fn migrate_account_preferences(&mut self) {
+        self.disabled_accounts.retain(|login| {
+            if let Some(id) = self.account_ids.get(login) {
+                self.disabled_account_ids.insert(*id);
+                false
+            } else {
+                true
+            }
+        });
+        for (repo, names) in &mut self.repo_accounts {
+            let ids = self.repo_account_ids.entry(repo.clone()).or_default();
+            names.retain(|login| {
+                if let Some(id) = self.account_ids.get(login) {
+                    ids.insert(*id);
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    /// Record a verified identity before applying any monitoring choices.
+    /// Keep aliases for stale gh config names, but display the current login.
+    pub fn record_account(&mut self, login: &str, id: u64) {
+        let login = login.to_lowercase();
+        self.migrate_account_preferences();
+        self.account_ids.insert(login.clone(), id);
+        self.migrate_account_preferences();
+        self.known_accounts
+            .retain(|name| name == &login || self.account_ids.get(name) != Some(&id));
+        self.known_accounts.insert(login.clone());
+        for pr in self.pending.iter_mut().filter(|pr| pr.account_id == id) {
+            pr.account = login.clone();
+        }
+        for snooze in self.snoozed.iter_mut().filter(|s| s.account_id == id) {
+            snooze.account = login.clone();
+        }
+    }
+
     pub fn account_enabled(&self, account: &str) -> bool {
-        !self.disabled_accounts.contains(&account.to_lowercase())
+        let account = account.to_lowercase();
+        !self.disabled_accounts.contains(&account)
+            && self
+                .account_ids
+                .get(&account)
+                .is_none_or(|id| !self.disabled_account_ids.contains(id))
+    }
+
+    pub fn toggle_account(&mut self, account: &str) {
+        let account = account.to_lowercase();
+        if let Some(id) = self.account_ids.get(&account) {
+            if !self.disabled_account_ids.remove(id) {
+                self.disabled_account_ids.insert(*id);
+            }
+            self.disabled_accounts.remove(&account);
+        } else if !self.disabled_accounts.remove(&account) {
+            self.disabled_accounts.insert(account);
+        }
+    }
+
+    pub fn all_repo_accounts(&self, repo: &str) -> bool {
+        let repo = repo.to_lowercase();
+        !self.repo_accounts.contains_key(&repo) && !self.repo_account_ids.contains_key(&repo)
+    }
+
+    pub fn repo_account_selected(&self, repo: &str, account: &str) -> bool {
+        let repo = repo.to_lowercase();
+        let account = account.to_lowercase();
+        self.all_repo_accounts(&repo)
+            || self
+                .repo_accounts
+                .get(&repo)
+                .is_some_and(|names| names.contains(&account))
+            || self.account_ids.get(&account).is_some_and(|id| {
+                self.repo_account_ids
+                    .get(&repo)
+                    .is_some_and(|ids| ids.contains(id))
+            })
+    }
+
+    pub fn toggle_repo_account(&mut self, repo: &str, account: &str) {
+        let repo = repo.to_lowercase();
+        let account = account.to_lowercase();
+        if self.all_repo_accounts(&repo) {
+            let ids = self
+                .known_accounts
+                .iter()
+                .filter_map(|name| self.account_ids.get(name).copied())
+                .collect();
+            let names = self
+                .known_accounts
+                .iter()
+                .filter(|name| !self.account_ids.contains_key(*name))
+                .cloned()
+                .collect();
+            self.repo_account_ids.insert(repo.clone(), ids);
+            self.repo_accounts.insert(repo.clone(), names);
+        }
+        if let Some(id) = self.account_ids.get(&account) {
+            let allowed = self.repo_account_ids.entry(repo).or_default();
+            if !allowed.remove(id) {
+                allowed.insert(*id);
+            }
+        } else {
+            let allowed = self.repo_accounts.entry(repo).or_default();
+            if !allowed.remove(&account) {
+                allowed.insert(account);
+            }
+        }
+    }
+
+    pub fn reset_repo_accounts(&mut self, repo: &str) {
+        self.repo_accounts.remove(&repo.to_lowercase());
+        self.repo_account_ids.remove(&repo.to_lowercase());
     }
 
     pub fn monitors(&self, account: &str, repo: &str) -> bool {
         self.account_enabled(account)
             && self.is_enabled(repo)
-            && self
-                .repo_accounts
-                .get(&repo.to_lowercase())
-                .is_none_or(|accounts| accounts.contains(&account.to_lowercase()))
+            && self.repo_account_selected(repo, account)
     }
 
     pub fn visible(&self, pr: &PendingReview) -> bool {
-        self.available_accounts.contains(&pr.account.to_lowercase())
+        !self
+            .unavailable_repos
+            .contains(&(pr.account_id, pr.repo.to_lowercase()))
+            && self.available_accounts.contains(&pr.account.to_lowercase())
             && self.local_repos.contains(&pr.repo.to_lowercase())
             && self.monitors(&pr.account, &pr.repo)
     }
@@ -256,8 +391,10 @@ impl Store {
             self.pending
                 .iter()
                 .filter(|pr| {
-                    !checked_accounts.contains_key(&pr.account.to_lowercase())
-                        && !checked_accounts.values().any(|id| *id == pr.account_id)
+                    self.unavailable_repos
+                        .contains(&(pr.account_id, pr.repo.to_lowercase()))
+                        || (!checked_accounts.contains_key(&pr.account.to_lowercase())
+                            && !checked_accounts.values().any(|id| *id == pr.account_id))
                 })
                 .cloned(),
         );
@@ -313,7 +450,11 @@ impl Store {
         let (expired, remaining): (Vec<Snooze>, Vec<Snooze>) = std::mem::take(&mut self.snoozed)
             .into_iter()
             .partition(|s| {
-                s.until <= now && self.available_accounts.contains(&s.account.to_lowercase())
+                s.until <= now
+                    && self.available_accounts.contains(&s.account.to_lowercase())
+                    && !self
+                        .unavailable_repos
+                        .contains(&(s.account_id, s.repo.to_lowercase()))
             });
         self.snoozed = remaining;
         self.pending
@@ -663,6 +804,55 @@ mod tests {
         assert_eq!((store.poll_minutes, store.snooze_minutes), (15, 30));
         assert!(store.pending.is_empty());
         assert!(store.snoozed.is_empty());
+    }
+
+    #[test]
+    fn login_preferences_migrate_to_ids_and_do_not_follow_a_reused_login() {
+        let mut json: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        json["disabled_accounts"] = serde_json::json!(["alice"]);
+        json["repo_accounts"] = serde_json::json!({"owner/repo": ["alice"], "owner/paused": []});
+        let mut store = Store::from_json(&json.to_string()).unwrap();
+        assert!(store.disabled_account_ids.contains(&1));
+        assert!(store.disabled_accounts.is_empty());
+        store.record_account("alice-renamed", 1);
+        store.record_account("alice", 99);
+        assert!(!store.account_enabled("alice-renamed"));
+        assert!(store.account_enabled("alice"));
+        assert!(store.repo_account_selected("owner/repo", "alice-renamed"));
+        assert!(!store.repo_account_selected("owner/repo", "alice"));
+        assert!(!store.all_repo_accounts("owner/paused"));
+        store.toggle_account("alice-renamed");
+        assert!(store.account_enabled("alice-renamed"));
+        store.toggle_repo_account("owner/repo", "alice-renamed");
+        assert!(!store.repo_account_selected("owner/repo", "alice-renamed"));
+        store.reset_repo_accounts("owner/repo");
+        assert!(store.all_repo_accounts("owner/repo"));
+    }
+
+    #[test]
+    fn unverified_preferences_bind_only_when_an_account_is_verified() {
+        let mut store = Store::from_json(
+            r#"{
+            "known_accounts":["alice","bob"], "disabled_accounts":["alice"],
+            "repo_accounts":{"owner/repo":["alice"]}
+        }"#,
+        )
+        .unwrap();
+        assert!(!store.account_enabled("alice"));
+        assert!(store.disabled_account_ids.is_empty());
+        store.record_account("alice", 1);
+        store.record_account("bob", 2);
+        store.record_account("alice-renamed", 1);
+        assert!(!store.account_enabled("alice-renamed"));
+        assert!(store.repo_account_selected("owner/repo", "alice-renamed"));
+        assert!(!store.repo_account_selected("owner/repo", "bob"));
+        store.reset_repo_accounts("owner/repo");
+        store.toggle_repo_account("owner/repo", "bob");
+        assert!(store.repo_account_selected("owner/repo", "alice-renamed"));
+        assert!(!store.repo_account_selected("owner/repo", "bob"));
     }
 
     #[test]
