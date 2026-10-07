@@ -7,7 +7,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::discovery::LocalRepo;
+use crate::{discovery::LocalRepo, theme::Appearance};
 
 /// Everything that survives a restart, saved as JSON in the platform config dir.
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,10 +23,12 @@ pub struct Store {
     pub pending: Vec<PendingReview>,
     /// Minutes between checks of GitHub for review requests.
     pub poll_minutes: u64,
-    /// Minutes a snoozed review stays hidden.
+    /// Default minutes a snoozed review stays hidden.
     pub snooze_minutes: u64,
     /// Reviews the user put aside for now.
     pub snoozed: Vec<Snooze>,
+    /// System appearance or a persistent light/dark override.
+    pub appearance: Appearance,
 }
 
 impl Default for Store {
@@ -39,6 +41,7 @@ impl Default for Store {
             poll_minutes: 2,
             snooze_minutes: 5,
             snoozed: Vec::new(),
+            appearance: Appearance::default(),
         }
     }
 }
@@ -130,6 +133,31 @@ impl Store {
         self.snoozed.iter().find(|snooze| snooze.key() == key)
     }
 
+    /// Snoozes only this PR for the chosen duration, leaving the default alone.
+    pub fn snooze(&mut self, key: &(String, u64), minutes: u64, now: i64) -> bool {
+        let Some(pr) = self.pending.iter().find(|pr| pr.key() == *key) else {
+            return false;
+        };
+        let snooze = Snooze {
+            repo: key.0.clone(),
+            number: key.1,
+            until: now + minutes as i64 * 60,
+            requested_at: pr.requested_at.clone(),
+        };
+        self.snoozed.retain(|s| s.key() != *key);
+        self.snoozed.push(snooze);
+        true
+    }
+
+    /// Brings a PR back without treating it as an expired snooze.
+    pub fn unsnooze(&mut self, key: &(String, u64)) {
+        self.snoozed.retain(|s| s.key() != *key);
+    }
+
+    pub fn next_snooze_until(&self) -> Option<i64> {
+        self.snoozed.iter().map(|s| s.until).min()
+    }
+
     /// Pending reviews that aren't snoozed.
     pub fn awake(&self) -> Vec<PendingReview> {
         self.pending
@@ -217,6 +245,83 @@ fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PendingReview, Snooze, Store};
+    use crate::theme::Appearance;
+
+    #[test]
+    fn legacy_settings_default_to_system_without_losing_state() {
+        let original = Store {
+            roots: vec!["/projects".into()],
+            disabled: ["o/off".into()].into(),
+            pending: vec![pr("o/r", 1, Some(T1))],
+            snoozed: vec![snooze("o/r", 1, Some(T1))],
+            poll_minutes: 15,
+            snooze_minutes: 30,
+            ..Store::default()
+        };
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("appearance");
+        let restored: Store = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.appearance, Appearance::System);
+        assert_eq!(restored.roots, original.roots);
+        assert_eq!(restored.disabled, original.disabled);
+        assert_eq!(restored.pending, original.pending);
+        assert_eq!(restored.snoozed, original.snoozed);
+        assert_eq!(restored.poll_minutes, 15);
+        assert_eq!(restored.snooze_minutes, 30);
+    }
+
+    #[test]
+    fn appearance_choices_survive_state_serialization() {
+        for (appearance, value) in [
+            (Appearance::System, "system"),
+            (Appearance::Light, "light"),
+            (Appearance::Dark, "dark"),
+        ] {
+            let store = Store {
+                appearance,
+                ..Store::default()
+            };
+            let json = serde_json::to_vec_pretty(&store).unwrap();
+            let restored: Store = serde_json::from_slice(&json).unwrap();
+            assert_eq!(restored.appearance, appearance);
+            assert_eq!(serde_json::to_value(store).unwrap()["appearance"], value);
+        }
+    }
+
+    #[test]
+    fn invalid_appearance_preserves_the_rest_of_the_store() {
+        let original = Store {
+            roots: vec!["/projects".into()],
+            disabled: ["o/off".into()].into(),
+            pending: vec![pr("o/r", 1, Some(T1))],
+            snoozed: vec![snooze("o/r", 1, Some(T1))],
+            poll_minutes: 15,
+            snooze_minutes: 30,
+            ..Store::default()
+        };
+        for appearance in [
+            serde_json::json!("high_contrast"),
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::json!(2.5),
+            serde_json::json!([]),
+            serde_json::json!(["dark"]),
+            serde_json::json!({"light": null}),
+        ] {
+            let mut saved = serde_json::to_value(&original).unwrap();
+            saved["appearance"] = appearance.clone();
+            let restored: Store = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap())
+                .unwrap_or_else(|error| panic!("appearance {appearance}: {error}"));
+            assert_eq!(restored.appearance, Appearance::System);
+            // The next save must retain all existing data, normalizing only the
+            // unsupported preference to the safe default.
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+    }
 
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
         PendingReview {
@@ -242,6 +347,92 @@ mod tests {
 
     const T1: &str = "2026-01-01T00:00:00Z";
     const T2: &str = "2026-01-02T00:00:00Z";
+
+    #[test]
+    fn independent_durations_survive_restart_and_expire_in_deadline_order() {
+        let long = pr("Owner/Repo", 1, Some(T1));
+        let short = pr("Owner/Repo", 2, Some(T1));
+        let mut store = Store {
+            pending: vec![long.clone(), short.clone()],
+            snooze_minutes: 15,
+            ..Store::default()
+        };
+        assert!(store.snooze(&long.key(), 120, 1_000));
+        assert!(store.snooze(&short.key(), 5, 1_000));
+        assert_eq!(store.snooze_minutes, 15);
+        assert!(store.awake().is_empty());
+        assert_eq!(store.next_snooze_until(), Some(1_300));
+
+        // The production save/load format retains absolute deadlines and requests.
+        let json = serde_json::to_vec(&store).unwrap();
+        let mut restarted: Store = serde_json::from_slice(&json).unwrap();
+        assert_eq!(restarted.snoozed, store.snoozed);
+        assert_eq!(restarted.snooze_minutes, 15);
+        assert!(!restarted.reconcile(store.pending.clone()).snoozes_changed);
+        assert!(restarted.take_expired(1_299).is_empty());
+        assert_eq!(restarted.take_expired(1_300), vec![short.clone()]);
+        assert_eq!(restarted.awake(), vec![short]);
+        assert_eq!(restarted.next_snooze_until(), Some(8_200));
+        assert!(restarted.take_expired(8_199).is_empty());
+        assert_eq!(restarted.take_expired(8_200), vec![long]);
+        assert_eq!(restarted.next_snooze_until(), None);
+
+        // Starting after both deadlines also wakes both reviews in one batch.
+        let mut overdue: Store = serde_json::from_slice(&json).unwrap();
+        assert_eq!(overdue.take_expired(9_000), store.pending);
+        assert!(overdue.snoozed.is_empty());
+    }
+
+    #[test]
+    fn resnooze_replaces_deadline_and_unsnooze_does_not_wake_it_again() {
+        let review = pr("o/r", 1, Some(T1));
+        let mut store = Store {
+            pending: vec![review.clone()],
+            ..Store::default()
+        };
+        assert!(store.snooze(&review.key(), 120, 1_000));
+        assert!(store.snooze(&review.key(), 10, 1_000));
+        assert_eq!(store.snoozed.len(), 1);
+        assert_eq!(store.next_snooze_until(), Some(1_600));
+        store.snooze_minutes = 30;
+        assert_eq!(store.next_snooze_until(), Some(1_600));
+        store.unsnooze(&review.key());
+        assert_eq!(store.awake(), vec![review]);
+        assert!(store.take_expired(10_000).is_empty());
+        assert_eq!(store.next_snooze_until(), None);
+        assert!(!store.snooze(&("o/r".into(), 2), 5, 1_000));
+        assert!(store.snoozed.is_empty());
+    }
+
+    #[test]
+    fn rerequest_cancels_only_its_snooze_and_retargets_the_next_wake() {
+        let mut store = Store {
+            pending: vec![pr("o/r", 1, Some(T1)), pr("o/r", 2, Some(T1))],
+            ..Store::default()
+        };
+        assert!(store.snooze(&("o/r".into(), 1), 5, 1_000));
+        assert!(store.snooze(&("o/r".into(), 2), 60, 1_000));
+        let fresh = pr("o/r", 1, Some(T2));
+        let result = store.reconcile(vec![fresh.clone(), pr("o/r", 2, Some(T1))]);
+        assert!(result.snoozes_changed);
+        assert_eq!(result.fresh, vec![fresh.clone()]);
+        assert_eq!(store.awake(), vec![fresh]);
+        assert_eq!(store.next_snooze_until(), Some(4_600));
+        assert!(store.take_expired(1_300).is_empty());
+        assert_eq!(store.take_expired(4_600), vec![pr("o/r", 2, Some(T1))]);
+    }
+
+    #[test]
+    fn loads_existing_snooze_format_and_missing_settings_defaults() {
+        let mut store: Store = serde_json::from_str(
+            r#"{"snoozed":[{"repo":"o/r","number":1,"until":1300,"requested_at":null}]}"#,
+        )
+        .unwrap();
+        assert_eq!(store.snooze_minutes, 5);
+        assert_eq!(store.next_snooze_until(), Some(1_300));
+        store.pending = vec![pr("o/r", 1, None)];
+        assert_eq!(store.take_expired(1_300), store.pending);
+    }
 
     /// Pins how `reconcile` behaves today. Some rows (`None` to `Some`, and
     /// `Some` to `None`) record current behaviour, not necessarily intended.
@@ -391,6 +582,10 @@ mod tests {
         });
         let saved = serde_json::to_string(&store).unwrap();
         let restored: Store = serde_json::from_str(&saved).unwrap();
+        let mut incompatible = serde_json::to_value(&restored).unwrap();
+        incompatible["appearance"] = serde_json::json!({"unsupported": true});
+        let restored: Store = serde_json::from_value(incompatible).unwrap();
+        assert_eq!(restored.discovered, store.discovered);
         let mut scan = discover(&restored.roots);
         scan.retain_unavailable(&restored.discovered);
         assert_eq!(scan.repos, store.discovered);
