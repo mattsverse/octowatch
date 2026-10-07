@@ -40,6 +40,9 @@ fn fixture(window: &mut Window, cx: &mut Context<Octowatcher>) -> Octowatcher {
         save_error: None,
         notification_error: None,
         announced_launch: true,
+        launch_summary: false,
+        review_delivery: Delivery::default(),
+        notification_tasks: HashMap::new(),
         tray: None,
         update: None,
         scan_task: None,
@@ -192,6 +195,17 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
     }
     press(cx, "space");
     cx.update(|_, cx| assert_eq!(view.read(cx).store.snooze_minutes, 120));
+    press(cx, "tab");
+    assert_eq!(focused(&view, cx), Some(Control::MuteNotifications));
+    press(cx, "space");
+    cx.update(|_, cx| assert!(view.read(cx).store.notifications_muted));
+    press(cx, "enter");
+    cx.update(|_, cx| assert!(!view.read(cx).store.notifications_muted));
+    press(cx, "tab space");
+    assert_eq!(focused(&view, cx), Some(Control::NotifyDrafts));
+    cx.update(|_, cx| assert!(!view.read(cx).store.notify_drafts));
+    press(cx, "enter");
+    cx.update(|_, cx| assert!(view.read(cx).store.notify_drafts));
     press(cx, "tab");
     assert_eq!(focused(&view, cx), Some(Control::TestNotification));
     cx.update(|_, cx| {
@@ -410,6 +424,53 @@ fn bulk_removed_reviews_keep_activation_kind(cx: &mut TestAppContext) {
         }
         visual.update(|window, _| window.remove_window());
     }
+}
+
+#[gpui::test]
+fn notification_snooze_preserves_unrelated_picker_and_focus(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(fixture);
+    focus(&view, Control::Snooze(key(1)), cx);
+    press(cx, "enter tab tab");
+    let duration = Control::SnoozeDuration(key(1), 10);
+    assert_eq!(focused(&view, cx), Some(duration.clone()));
+
+    // Exercise the same application handler as a native notification action.
+    for number in [2, 99] {
+        view.update(cx, |view, cx| view.snooze(key(number), cx));
+        cx.run_until_parked();
+        assert_eq!(focused(&view, cx), Some(duration.clone()));
+        cx.update(|_, cx| {
+            let view = view.read(cx);
+            assert_eq!(view.snooze_picker, Some(key(1)));
+            assert!(view.store.snooze_for(&review(1)).is_none());
+            assert!(view.store.snooze_for(&review(2)).is_some());
+            assert_eq!(view.store.snoozed.len(), 1);
+        });
+    }
+    let before = Local::now().timestamp();
+    press(cx, "space");
+    let after = Local::now().timestamp();
+    assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
+    cx.update(|_, cx| {
+        let view = view.read(cx);
+        assert!(view.snooze_picker.is_none());
+        let until = view.store.snooze_for(&review(1)).unwrap().until;
+        assert!((before + 10 * 60..=after + 10 * 60).contains(&until));
+        assert_eq!(view.store.snoozed.len(), 2);
+    });
+    assert_eq!(cx.opened_url(), None);
+
+    // A notification for the picker’s own review must dismiss it and return
+    // focus to the trigger, whose action has now become Unsnooze.
+    press(cx, "enter space tab");
+    assert_eq!(focused(&view, cx), Some(Control::SnoozeDuration(key(1), 5)));
+    view.update(cx, |view, cx| view.snooze(key(1), cx));
+    cx.run_until_parked();
+    assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
+    cx.update(|_, cx| assert!(view.read(cx).snooze_picker.is_none()));
+    press(cx, "space");
+    cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_none()));
+    assert_eq!(cx.opened_url(), None);
 }
 
 #[gpui::test]

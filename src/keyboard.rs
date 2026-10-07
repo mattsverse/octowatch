@@ -28,6 +28,8 @@ pub(crate) enum Control {
     Appearance(Appearance),
     Poll(u64),
     SnoozeMinutes(u64),
+    MuteNotifications,
+    NotifyDrafts,
     TestNotification,
 }
 

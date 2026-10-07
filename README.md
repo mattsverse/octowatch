@@ -10,6 +10,9 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Notifies you about new requests only.** You get one notification when a review is requested, and another if you are asked to re-review after you've already left a review. A pull request leaves the list once you review it, the request is withdrawn, or the PR is closed.
 - **Includes team requests.** It counts requests made to a team you belong to. The request clears once you review, even if the rest of the team hasn't.
 - **Snoozes a review for later.** Snooze a pull request from its notification or from the window. It leaves the tray until the snooze runs out, then notifies you again. A new review request on it ends the snooze early.
+- **Lets you mute review alerts.** Polling and the queue keep updating while muted. Resume when you're ready to get one catch-up alert for undelivered requests still waiting.
+- **Lets you choose draft alerts.** Drafts always stay in the queue; switch their notifications off to wait until they're ready for review.
+- **Opens reviews from notifications.** Click a single-review notification to open its PR, or a summary to open the Reviews tab.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
 - **Follows your desktop appearance.** Use System, Light or Dark in Settings. System is the default, and your choice survives restarts.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
@@ -67,6 +70,8 @@ The window has three tabs.
 
 This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
 
+Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front; its **Open Reviews** button does the same. After the first successful GitHub check at each launch, Octowatcher summarizes the eligible reviews already waiting.
+
 **Snooze…** opens a duration picker for that pull request: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default from Settings is marked; choose a duration to snooze, or **Cancel** to leave the review waiting. Each choice applies only to that snooze and doesn't change the default. Only one picker is open at a time.
 
 A snoozed pull request leaves the tray. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new review request ends its snooze early. A new notification about a single pull request also has a **Snooze** button, which uses the Settings default. One that covers several pull requests doesn't. Each snooze's deadline survives a restart.
@@ -91,11 +96,19 @@ This tab sets how often Octowatcher checks GitHub: every 1, 2, 5, 10, 15, 30 or 
 
 It also sets the default snooze length: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default is 5 minutes. Changing it affects future snoozes, including notification actions, and leaves existing snooze deadlines unchanged.
 
+**Mute review notifications** silences review alerts until you choose **Resume review notifications**. You can also mute or resume from the tray menu. This setting survives restarts. GitHub checks, the review list, tray counts, and snooze timers continue updating. Resume sends one catch-up notification for undelivered requests still pending, excluding snoozed reviews and suppressed drafts. A snooze that expires while muted becomes visible immediately and joins that catch-up alert. Already delivered alerts can still be clicked; a send already in progress may finish. Update alerts and **Send test notification** remain available while review alerts are muted.
+
+**Notify about drafts** defaults to **On** to preserve existing behavior. When **Off**, drafts remain visible in Reviews and the tray, but their alerts wait until the PR becomes ready for review. The same request is announced only once: making an already-announced draft ready doesn't send another alert. Switching this preference back **On** releases undelivered draft alerts, subject to mute and snooze.
+
+Failed review deliveries remain queued, including across restarts, and retry after a successful GitHub check. Reviews found during a send are delivered as soon as that send succeeds, without waiting for another check or a click. If GitHub's bounded request timeline omits a still-pending review's timestamp, Octowatcher keeps its last known request identity, alert, and snooze. Resolved, withdrawn, or disabled-repository requests leave the delivery queue. Acceptance by the desktop notification service counts as delivery; no click or dismissal is needed. Focus mode and desktop notification settings can still hide an accepted alert. A crash between acceptance and saving state, or a service that accepts a request after the 15-second send timeout, can cause a retry of an already delivered alert.
+
+Octowatcher observes at most 32 active notifications, with a one-hour action lifetime, to avoid accumulating tasks and connections. Extra review alerts stay queued until an observer frees capacity or a later successful check. Linux desktops vary in support for notification buttons and body clicks; the Reviews tab and tray remain available.
+
 ### Keyboard access
 
 - **Tab / Shift+Tab** move forward or backward through the window's controls. A contrasting border shows focus in either theme, and content scrolls into view when you navigate to it. Settings starts with the System, Light and Dark appearance choices; changing appearance keeps focus on your choice.
 - **Enter / Space** activate the focused control: open a review, snooze or unsnooze it, switch a tab, toggle a repository, or pick a setting. Each review's Snooze button is a separate focus stop; activating it keeps you in Octowatcher.
-- To snooze with the keyboard, activate **Snooze…**, use **Tab / Shift+Tab** to choose a duration or **Cancel**, then press **Enter / Space**. **Escape** cancels the open picker. Choosing or canceling returns focus to that review’s Snooze button.
+- To snooze with the keyboard, activate **Snooze…**, use **Tab / Shift+Tab** to choose a duration or **Cancel**, then press **Enter / Space**. **Escape** cancels the open picker. Choosing or canceling returns focus to that review’s Snooze button. Snoozing a different review from a notification preserves your open picker and focus.
 - **Left / Right** switch tabs when a tab has focus, wrapping at either end.
 - **Up / Down** move between reviews. **Home / End** move to the first or last review. If a Snooze button has focus, these keys move between the Snooze buttons instead.
 - **Command+R / Command+Q** on macOS, or **Control+R / Control+Q** on Linux, refresh reviews or quit.
@@ -110,7 +123,9 @@ Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To
 
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories, check interval, snooze length and appearance), your snoozes, and the current review list for the repositories you watch to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories, check interval, snooze length, appearance, review mute and draft preference), your snoozes, the current review list, and undelivered review alerts to one JSON file. Existing state files keep their settings and snoozes; new notification preferences default to unmuted with draft alerts on.
+
+The file lives at:
 
 | Platform | Path |
 | --- | --- |
@@ -121,7 +136,7 @@ Delete this file to reset Octowatcher. Everything it sends to GitHub goes throug
 
 ## Troubleshooting
 
-- **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then restart the app.
+- **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then use **Send test notification** or wait for the next successful GitHub check. Octowatcher checks permission before each send.
 - **"could not run `gh`; is the GitHub CLI installed?"**: install the GitHub CLI, or put it in one of the folders listed under [Requirements](#requirements).
 - **"gh api failed: …"**: run `gh auth status` in a terminal, and `gh auth login` if you're logged out.
 - **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. Then click **Rescan**.
@@ -149,6 +164,27 @@ On macOS, notification permission and delivery require a signed `.app` bundle; t
 cargo install cargo-bundle
 cargo bundle --release
 ```
+
+## Testing notifications
+
+Run the behavioral tests with `cargo test --locked`. They cover persisted delivery retries, repeated polls, startup summaries, mute/resume, draft transitions, action routing, and snooze expiration without contacting GitHub or the desktop notification service.
+
+On Linux, an additional opt-in test exercises actual D-Bus sends, injected permission/send failures and recovery, advertised body clicks, Snooze, summary actions, dismissal, and observer timeout against a fake notification service. Install `python3-dbus`, `python3-gi`, and `dbus-daemon`, then run:
+
+```sh
+tests/test-linux-notifications.sh
+```
+
+The script creates an isolated session bus and does not send notifications to your desktop. This checks the service contract; it doesn't prove how a particular desktop renders or routes notification actions.
+
+Native desktop checks still need a signed macOS `.app` or a Linux desktop with a notification service:
+
+- Check a single-review body click, **Snooze**, and a summary body click/**Open Reviews** from a different tab with the window closed.
+- Deny notification permission on macOS (or stop the Linux notification service), fetch a new request, restore permission/service, and refresh. The pending request should notify once; another refresh before any click should not duplicate it.
+- Mute, receive requests, resolve one, and restart. Polling/counts should stay current, mute should persist, and Resume should announce only eligible requests still waiting.
+- Turn draft alerts off, request review on a draft, and mark it ready without requesting again. It should stay listed throughout and notify once when ready. With draft alerts on, marking an announced draft ready should not notify again.
+- Snooze, let it expire both while active and while muted, and confirm one reminder or inclusion in the resume catch-up alert. Unsnooze should remain silent.
+- Dismiss alerts, use macOS **Clear All**, and leave alerts untouched past their action lifetime. Verify observer/connection counts remain bounded and new queued alerts can be delivered.
 
 ## Releasing
 
