@@ -1,11 +1,11 @@
 name: Preview
 
-# Builds unsigned bundles for a pull request carrying the `preview` label,
-# and comments their download links. Opt-in, since the macOS runner is the
-# expensive part of CI.
+# Adding the `preview` label to a pull request builds unsigned bundles once,
+# comments their download links, then removes the label: pushes never rebuild,
+# since the macOS runner is the expensive part of CI. Label again to rebuild.
 on:
   pull_request:
-    types: [labeled, synchronize, reopened]
+    types: [labeled]
 
 permissions:
   contents: read
@@ -19,13 +19,10 @@ env:
 
 jobs:
   macos:
-    # Branches of this repository only: once labeled, a fork's pushes would
-    # otherwise start builds on our runners. On `labeled`, only the preview
-    # label itself starts a build.
+    # Branches of this repository only, so no fork's code runs on our runners.
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      contains(github.event.pull_request.labels.*.name, 'preview') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'preview')
+      github.event.label.name == 'preview'
     runs-on: blacksmith-6vcpu-macos-15
     outputs:
       artifact-url: ${{ steps.upload.outputs.artifact-url }}
@@ -50,8 +47,7 @@ jobs:
   linux:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      contains(github.event.pull_request.labels.*.name, 'preview') &&
-      (github.event.action != 'labeled' || github.event.label.name == 'preview')
+      github.event.label.name == 'preview'
     runs-on: blacksmith-4vcpu-ubuntu-2204
     outputs:
       artifact-url: ${{ steps.upload.outputs.artifact-url }}
@@ -67,14 +63,18 @@ jobs:
             target/release/bundle/appimage/*.AppImage
           retention-days: 7
 
-  comment:
+  finish:
     needs: [macos, linux]
+    # Also after a failed build, so the label comes off either way. Not after a
+    # cancelled one: the run that cancelled it removes the label itself.
+    if: ${{ !cancelled() && needs.macos.result != 'skipped' }}
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     steps:
       # One comment per PR, found by its marker and edited on every build.
-      - env:
+      - if: needs.macos.result == 'success' && needs.linux.result == 'success'
+        env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
@@ -87,7 +87,7 @@ jobs:
           body="$marker
           ### Preview bundles
 
-          Built from ${SHA:0:7} in [this run]($RUN_URL). Links expire on $(date -u -d '+7 days' +%Y-%m-%d).
+          Built from ${SHA:0:7} in [this run]($RUN_URL). Links expire on $(date -u -d '+7 days' +%Y-%m-%d). Add the \`preview\` label again to rebuild.
 
           - **macOS** (Apple Silicon): [macos-preview.zip]($MACOS_URL). Unsigned, so clear the quarantine before opening: \`xattr -dr com.apple.quarantine Octowatcher.app\`
           - **Linux** (.deb and AppImage): [linux-preview.zip]($LINUX_URL)"
@@ -98,3 +98,10 @@ jobs:
           else
             gh api "repos/$REPO/issues/$PR/comments" -f body="$body" > /dev/null
           fi
+      # Runs even if commenting failed; tolerates a label already taken off by hand.
+      - if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh api -X DELETE "repos/$REPO/issues/$PR/labels/preview" > /dev/null || true
