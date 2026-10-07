@@ -252,15 +252,23 @@ impl Store {
     /// A PR that drops out (reviewed, request removed, closed) is gone, and
     /// so is its snooze.
     pub fn reconcile(&mut self, mut fetched: Vec<PendingReview>) -> Reconciled {
-        fetched.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
-
-        // A request is new when the PR wasn't listed, or when it was asked
-        // again after the request already on file.
         let known: HashMap<_, _> = self
             .pending
             .iter()
             .map(|pr| (pr.key(), pr.requested_at.clone()))
             .collect();
+        // GitHub returns only a bounded timeline of request events. A missing
+        // timestamp on a still-pending PR is not evidence of a new request;
+        // keep its known identity, undelivered notice, and snooze deadline.
+        for pr in &mut fetched {
+            if pr.requested_at.is_none() {
+                pr.requested_at = known.get(&pr.key()).cloned().flatten();
+            }
+        }
+        fetched.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
+
+        // A request is new when the PR wasn't listed, or when it was asked
+        // again after the request already on file.
         let fresh: Vec<PendingReview> = fetched
             .iter()
             .filter(|pr| match known.get(&pr.key()) {
@@ -434,8 +442,34 @@ mod tests {
         assert_eq!(store.take_expired(1_300), store.pending);
     }
 
-    /// Pins how `reconcile` behaves today. Some rows (`None` to `Some`, and
-    /// `Some` to `None`) record current behaviour, not necessarily intended.
+    #[test]
+    fn missing_request_timestamp_preserves_snooze_until_newer_request_or_withdrawal() {
+        let review = pr("Owner/Repo", 1, Some(T1));
+        let mut store = Store {
+            pending: vec![review.clone()],
+            ..Store::default()
+        };
+        store.snooze(&review.key(), 5, 1_000);
+        let deadline = store.snoozed[0].clone();
+        let result = store.reconcile(vec![pr("Owner/Repo", 1, None)]);
+        assert!(result.fresh.is_empty());
+        assert!(!result.pending_changed);
+        assert!(!result.snoozes_changed);
+        assert_eq!(store.pending, vec![review.clone()]);
+        assert_eq!(store.snoozed, vec![deadline]);
+        let newer = pr("Owner/Repo", 1, Some(T2));
+        assert_eq!(
+            store.reconcile(vec![newer.clone()]).fresh,
+            vec![newer.clone()]
+        );
+        assert!(store.snoozed.is_empty());
+        store.snooze(&newer.key(), 5, 1_000);
+        store.reconcile(vec![]);
+        assert!(store.snoozed.is_empty());
+        assert!(store.notification_queue.is_empty());
+    }
+
+    /// Pins request freshness and snooze reconciliation.
     #[test]
     fn reconciles_requests_and_snoozes() {
         struct Case {
@@ -482,16 +516,6 @@ mod tests {
                 snoozed: vec![snooze("o/r", 1, None)],
                 fetched: vec![pr("o/r", 1, Some(T1))],
                 fresh: vec![1],
-                pending_changed: true,
-                snoozes_kept: 0,
-            },
-            Case {
-                // Freshness compares with `>`, the snooze retain with `==`.
-                name: "Some to None is not fresh but ends the snooze",
-                pending: vec![pr("o/r", 1, Some(T1))],
-                snoozed: vec![snooze("o/r", 1, Some(T1))],
-                fetched: vec![pr("o/r", 1, None)],
-                fresh: vec![],
                 pending_changed: true,
                 snoozes_kept: 0,
             },

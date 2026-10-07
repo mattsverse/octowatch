@@ -21,7 +21,7 @@ use gpui::{
 
 use discovery::LocalRepo;
 use notifications::Response;
-use review_notifications::{Delivery, ReviewAction, Target};
+use review_notifications::{Batch, Delivery, ReviewAction, Target};
 use store::{PendingReview, Store};
 use tray::{Tray, UpdateItem};
 use updater::Release;
@@ -357,6 +357,10 @@ impl Octowatcher {
         let Some(batch) = self.review_delivery.begin(&self.store) else {
             return;
         };
+        self.send_review_batch(batch, cx);
+    }
+
+    fn send_review_batch(&mut self, batch: Batch, cx: &mut Context<Self>) {
         let target = Target::for_reviews(&batch.reviews);
         let (summary, body) = if self.launch_summary {
             waiting_text(&batch.reviews)
@@ -370,11 +374,15 @@ impl Octowatcher {
             Some(action),
             cx,
             move |this, delivered, cx| {
-                this.review_delivery
+                let next = this
+                    .review_delivery
                     .complete(&mut this.store, &batch, delivered);
                 if delivered {
                     this.launch_summary = false;
                     this.save();
+                }
+                if let Some(next) = next {
+                    this.send_review_batch(next, cx);
                 }
                 cx.notify();
             },
@@ -473,6 +481,11 @@ impl Octowatcher {
                     respond(this, response, cx);
                 }
                 this.notification_tasks.remove(&slot);
+                // Successful observers also free bounded sender capacity.
+                // A failed send waits for a later poll or explicit resume.
+                if accepted {
+                    this.deliver_reviews(cx);
+                }
                 cx.notify();
             })
             .ok();
