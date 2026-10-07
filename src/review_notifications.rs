@@ -429,15 +429,45 @@ mod tests {
         let mut store = Store::default();
         let mut delivery = Delivery::default();
         store.reconcile(vec![review.clone()]);
-        store.snoozed.push(snooze(&review, 100));
+        assert!(store.snooze(&review.key(), 5, 0));
         assert!(delivery.begin(&store).is_none());
         // Unsnooze reveals the review and cancels any undelivered alert.
-        store.snoozed.clear();
-        store.discard_notification(&review.key());
+        store.unsnooze(&review.key());
         store.reconcile(vec![review]);
         assert_eq!(store.awake().len(), 1);
         assert!(delivery.begin(&store).is_none());
         assert!(store.take_expired(100).is_empty());
+    }
+
+    #[test]
+    fn per_review_snoozes_cancel_queued_alerts_and_resume_only_expired_reminders() {
+        let short = pr(1, false);
+        let long = pr(2, false);
+        let mut store = Store {
+            notifications_muted: true,
+            ..Store::default()
+        };
+        let mut delivery = Delivery::default();
+        store.reconcile(vec![short.clone(), long.clone()]);
+        assert_eq!(store.notification_queue.len(), 2);
+        assert!(store.snooze(&short.key(), 5, 1_000));
+        assert!(store.snooze(&long.key(), 120, 1_000));
+        assert!(store.notification_queue.is_empty());
+        store = round_trip(&store);
+        assert_eq!(store.take_expired(1_300), vec![short.clone()]);
+        assert!(delivery.begin(&store).is_none());
+        store.notifications_muted = false;
+        let batch = delivery.begin(&store).unwrap();
+        assert_eq!(batch.reviews, vec![short]);
+        delivery.complete(&mut store, &batch, true);
+        assert!(delivery.begin(&store).is_none());
+        assert_eq!(store.take_expired(8_200), vec![long.clone()]);
+        let batch = delivery.begin(&store).unwrap();
+        assert_eq!(batch.reviews, vec![long]);
+        delivery.complete(&mut store, &batch, true);
+        assert!(store.take_expired(9_000).is_empty());
+        assert!(delivery.begin(&store).is_none());
+        assert_eq!(store.snooze_minutes, 5);
     }
 
     #[test]
