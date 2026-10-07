@@ -11,7 +11,7 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::theme;
+use crate::theme::Palette;
 
 actions!(
     review_search_input,
@@ -117,6 +117,7 @@ impl EditBuffer {
 }
 
 pub struct SearchInput {
+    palette: Palette,
     focus: FocusHandle,
     buffer: EditBuffer,
     layout: Option<ShapedLine>,
@@ -130,12 +131,24 @@ impl EventEmitter<Changed> for SearchInput {}
 impl SearchInput {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
+            palette: Palette::DARK,
             focus: cx.focus_handle().tab_stop(true),
             buffer: EditBuffer::default(),
             layout: None,
             bounds: None,
             scroll_x: px(0.),
             selecting: false,
+        }
+    }
+
+    pub fn palette(&self) -> Palette {
+        self.palette
+    }
+
+    pub fn set_palette(&mut self, palette: Palette, cx: &mut Context<Self>) {
+        if self.palette != palette {
+            self.palette = palette;
+            cx.notify();
         }
     }
 
@@ -361,6 +374,7 @@ impl EntityInputHandler for SearchInput {
 
 impl Render for SearchInput {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.palette;
         let input = cx.entity();
         let painted_input = input.clone();
         div()
@@ -372,12 +386,12 @@ impl Render for SearchInput {
             .tab_stop(true)
             .cursor(CursorStyle::IBeam)
             .border_1()
-            .border_color(rgb(theme::MUTED))
+            .border_color(rgb(theme.border))
             .rounded_md()
-            .bg(rgb(theme::SURFACE))
+            .bg(rgb(theme.surface))
             .px_2()
             .py_2()
-            .focus(|s| s.border_color(rgb(theme::ACCENT)))
+            .focus(|s| s.border_color(rgb(theme.focus)))
             .on_action(cx.listener(Self::left))
             .on_action(cx.listener(Self::right))
             .on_action(cx.listener(Self::select_left))
@@ -426,7 +440,7 @@ impl Render for SearchInput {
                                 len: text.len(),
                                 font: style.font(),
                                 color: if empty {
-                                    rgb(theme::SUBTEXT).into()
+                                    rgb(theme.secondary_text).into()
                                 } else {
                                     style.color
                                 },
@@ -509,7 +523,7 @@ impl Render for SearchInput {
                                                         bounds.bottom(),
                                                     ),
                                                 ),
-                                                rgba(0x89b4fa40),
+                                                rgba((theme.accent << 8) | 0x40),
                                             ));
                                         } else {
                                             window.paint_quad(fill(
@@ -520,7 +534,7 @@ impl Render for SearchInput {
                                                     ),
                                                     size(px(1.), bounds.size.height),
                                                 ),
-                                                rgb(theme::ACCENT),
+                                                rgb(theme.accent),
                                             ));
                                         }
                                     }

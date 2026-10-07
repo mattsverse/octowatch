@@ -41,6 +41,25 @@ pub struct ReviewFilters {
     pub snooze: SnoozeFilter,
 }
 
+enum SearchTerm {
+    Text(String),
+    Number(Option<u64>),
+}
+
+impl SearchTerm {
+    fn parse(term: &str) -> Self {
+        if let Some(number) = term.strip_prefix('#') {
+            Self::Number(
+                (!number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+                    .then(|| number.parse().ok())
+                    .flatten(),
+            )
+        } else {
+            Self::Text(term.to_lowercase())
+        }
+    }
+}
+
 /// Normalized search fields live for one version of the pending queue. Typing
 /// a query scans these values without allocating lowercase strings per PR.
 struct SearchableReview {
@@ -121,7 +140,7 @@ impl ReviewFilterCache {
         let terms: Vec<_> = filters
             .query
             .split_whitespace()
-            .map(str::to_lowercase)
+            .map(SearchTerm::parse)
             .collect();
         self.visible = Rc::new(
             self.reviews
@@ -148,13 +167,10 @@ impl ReviewFilterCache {
                             SnoozeFilter::Awake => !asleep,
                             SnoozeFilter::Snoozed => asleep,
                         }
-                        && terms.iter().all(|term| {
-                            if let Some(number) = term.strip_prefix('#') {
-                                !number.is_empty()
-                                    && number.bytes().all(|b| b.is_ascii_digit())
-                                    && number.parse::<u64>().ok() == Some(pr.key.1)
-                            } else {
-                                pr.fields.iter().any(|field| field.contains(term))
+                        && terms.iter().all(|term| match term {
+                            SearchTerm::Number(number) => *number == Some(pr.key.1),
+                            SearchTerm::Text(text) => {
+                                pr.fields.iter().any(|field| field.contains(text))
                             }
                         });
                     matches.then_some(ix)
