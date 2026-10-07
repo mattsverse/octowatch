@@ -69,6 +69,7 @@ struct Octowatcher {
     /// Each source keeps its own error, so a successful GitHub check doesn't
     /// hide a tray, save, permission or delivery error.
     fetch_error: Option<String>,
+    scan_issues: Vec<discovery::ScanIssue>,
     tray_error: Option<String>,
     save_error: Option<String>,
     notification_error: Option<String>,
@@ -140,6 +141,7 @@ impl Octowatcher {
             tab: Tab::Reviews,
             last_checked: None,
             fetch_error: None,
+            scan_issues: Vec::new(),
             tray_error,
             save_error: None,
             notification_error: None,
@@ -239,20 +241,51 @@ impl Octowatcher {
         self.notify(woken, cx);
     }
 
-    /// Rediscovers local clones, then checks GitHub again.
+    /// Rediscovers local checkouts off the UI thread, then checks GitHub.
+    /// Repeated requests coalesce; changed roots are rescanned before applying.
     fn rescan(&mut self, cx: &mut Context<Self>) {
+        if self.scan_task.is_some() {
+            return;
+        }
         let roots = self.store.roots.clone();
+        let previous = self.store.discovered.clone();
         self.scan_task = Some(cx.spawn(async move |this, cx| {
-            let repos = cx
+            let scan_roots = roots.clone();
+            let scan = cx
                 .background_executor()
-                .spawn(async move { discovery::discover(&roots) })
+                .spawn(async move {
+                    let mut scan = discovery::discover(&scan_roots);
+                    let previous = discovery::within_roots(&previous, &scan_roots);
+                    scan.retain_unavailable(&previous);
+                    scan
+                })
                 .await;
             this.update(cx, |this, cx| {
-                this.repos = Some(repos);
                 this.scan_task = None;
-                // Results fetched against the old repo list are stale.
-                this.fetch_task = None;
-                this.refresh(cx);
+                if roots != this.store.roots {
+                    this.rescan(cx);
+                    return;
+                }
+                this.scan_issues = scan.issues;
+                if this.store.discovered != scan.repos {
+                    this.store.discovered = scan.repos.clone();
+                    this.save();
+                }
+                this.repos = Some(scan.repos);
+                // Remove reviews for vanished repos even if GitHub is offline.
+                let watched = this.watched_slugs();
+                let reconciled = this.store.retain_watched(&watched);
+                if reconciled.snoozes_changed {
+                    this.snoozes_changed(cx);
+                } else if reconciled.pending_changed {
+                    this.save();
+                    this.sync_tray();
+                }
+                // GitHub fetches all requests, so an in-flight fetch can use the
+                // newly discovered repo list when it completes. Do not cancel
+                // a synchronous gh subprocess and start a duplicate one.
+                this.fetch_reviews(cx);
+                cx.notify();
             })
             .ok();
         }));
@@ -260,7 +293,10 @@ impl Octowatcher {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        // Filtering needs the repo list, and the scan refreshes once it's done.
+        self.rescan(cx);
+    }
+
+    fn fetch_reviews(&mut self, cx: &mut Context<Self>) {
         if self.repos.is_none() || self.fetch_task.is_some() {
             return;
         }
@@ -271,6 +307,12 @@ impl Octowatcher {
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
+                // A scan in progress may invalidate the filtering list. Its
+                // completion starts a fresh fetch; do not announce stale repos.
+                if this.scan_task.is_some() {
+                    cx.notify();
+                    return;
+                }
                 this.last_checked = Some(Local::now());
                 match result {
                     Ok(fetched) => {
@@ -768,21 +810,24 @@ impl Octowatcher {
                             .items_center()
                             .gap_3()
                             .child(div().text_xs().text_color(rgb(theme::MUTED)).child(status))
-                            .child(button("refresh", "Refresh").on_click(cx.listener(
-                                |this, _: &ClickEvent, _, cx| this.refresh(cx),
-                            ))),
+                            .child(button("refresh", "Refresh").on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx)),
+                            )),
                     ),
             )
             .children(
                 self.displayed_error()
                     .map(str::to_owned)
-                    .map(|err| {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::RED))
-                            .child(err)
-                    }),
+                    .map(|err| div().text_xs().text_color(rgb(theme::RED)).child(err)),
             )
+            .when(!self.scan_issues.is_empty(), |s| {
+                s.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::PEACH))
+                        .child("Some folders could not be scanned. See Repositories for details."),
+                )
+            })
             .children(self.render_update(cx))
             .child(
                 div()
@@ -985,13 +1030,23 @@ impl Octowatcher {
                 div()
                     .flex()
                     .gap_2()
-                    .child(button("add-root", "Add folder…").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.add_root(cx),
-                    )))
-                    .child(button("rescan", "Rescan").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.rescan(cx),
-                    ))),
+                    .child(
+                        button("add-root", "Add folder…")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_root(cx))),
+                    )
+                    .child(
+                        button("rescan", "Rescan")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rescan(cx))),
+                    ),
             );
+
+        let roots = roots.children(self.scan_issues.iter().map(|issue| {
+            div().text_xs().text_color(rgb(theme::PEACH)).child(format!(
+                "{}: {}. Previously found repositories are retained; retrying on the next check.",
+                display_path(&issue.path),
+                issue.message
+            ))
+        }));
 
         let repos = self.repos.as_deref().unwrap_or_default();
         let list = div()
@@ -1047,9 +1102,9 @@ impl Octowatcher {
                     } else {
                         pill("off", theme::MUTED)
                     })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_repo(&slug, cx)
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&slug, cx)),
+                    )
             }));
 
         div().flex().flex_col().gap_6().child(roots).child(list)

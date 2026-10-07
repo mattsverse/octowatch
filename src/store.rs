@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -7,12 +7,16 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::discovery::LocalRepo;
+
 /// Everything that survives a restart, saved as JSON in the platform config dir.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Store {
     /// Folders scanned for local git clones.
     pub roots: Vec<PathBuf>,
+    /// Last discovered checkouts, retained when their folders are unavailable.
+    pub discovered: Vec<LocalRepo>,
     /// `owner/name` slugs (lowercase) the user switched off.
     pub disabled: BTreeSet<String>,
     /// Pull requests currently waiting on the user's review.
@@ -29,6 +33,7 @@ impl Default for Store {
     fn default() -> Self {
         Self {
             roots: Vec::new(),
+            discovered: Vec::new(),
             disabled: BTreeSet::new(),
             pending: Vec::new(),
             poll_minutes: 2,
@@ -172,6 +177,18 @@ impl Store {
             pending_changed,
             snoozes_changed,
         }
+    }
+
+    /// Drop reviews and snoozes for repos no longer watched, even when GitHub
+    /// cannot be reached. Local discovery alone never produces fresh requests.
+    pub fn retain_watched(&mut self, watched: &HashSet<String>) -> Reconciled {
+        let retained = self
+            .pending
+            .iter()
+            .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
+            .cloned()
+            .collect();
+        self.reconcile(retained)
     }
 
     /// Ends every snooze that ran out by `now`, and returns the pending
@@ -358,6 +375,48 @@ mod tests {
         assert_eq!(order, vec![3, 1, 2]);
         let fresh: Vec<u64> = reconciled.fresh.iter().map(|pr| pr.number).collect();
         assert_eq!(fresh, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn discovery_cache_is_compatible_with_old_state_and_preserves_toggles() {
+        use crate::discovery::{LocalRepo, discover};
+        let old = r#"{"roots":["/missing/watched"],"disabled":["owner/repo"],"poll_minutes":10,"snooze_minutes":15}"#;
+        let mut store: Store = serde_json::from_str(old).unwrap();
+        assert!(store.discovered.is_empty());
+        assert_eq!(store.poll_minutes, 10);
+        assert_eq!(store.snooze_minutes, 15);
+        store.discovered.push(LocalRepo {
+            slug: "Owner/Repo".into(),
+            paths: vec!["/missing/watched/clone".into()],
+        });
+        let saved = serde_json::to_string(&store).unwrap();
+        let restored: Store = serde_json::from_str(&saved).unwrap();
+        let mut scan = discover(&restored.roots);
+        scan.retain_unavailable(&restored.discovered);
+        assert_eq!(scan.repos, store.discovered);
+        assert!(!restored.is_enabled(&scan.repos[0].slug));
+        assert_eq!(restored.disabled, store.disabled);
+    }
+
+    #[test]
+    fn local_scan_removes_reviews_and_snoozes_without_new_notifications() {
+        let mut store = Store {
+            pending: vec![pr("Owner/Kept", 1, Some(T1)), pr("o/removed", 2, Some(T2))],
+            snoozed: vec![
+                snooze("owner/kept", 1, Some(T1)),
+                snooze("o/removed", 2, Some(T2)),
+            ],
+            ..Store::default()
+        };
+        let changed = store.retain_watched(&["owner/kept".into()].into());
+        assert!(changed.fresh.is_empty());
+        assert!(changed.pending_changed);
+        assert!(changed.snoozes_changed);
+        assert_eq!(store.pending, vec![pr("Owner/Kept", 1, Some(T1))]);
+        assert_eq!(store.snoozed, vec![snooze("owner/kept", 1, Some(T1))]);
+        let unchanged = store.retain_watched(&["owner/kept".into()].into());
+        assert!(!unchanged.pending_changed);
+        assert!(!unchanged.snoozes_changed);
     }
 
     #[test]

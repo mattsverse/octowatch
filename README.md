@@ -70,13 +70,15 @@ This tab lists the pull requests waiting on you, most recent request first. Clic
 
 ### Repositories
 
-**Watched folders** are the folders Octowatcher scans for clones. The first time you launch it, it watches `~/Dev` if that folder exists, and your home folder otherwise. Use **Add folder…** and **Remove** to change the list, and **Rescan** after you clone something new.
+**Watched folders** are the folders Octowatcher scans for clones. The first time you launch it, it watches `~/Dev` if that folder exists, and your home folder otherwise. Use **Add folder…** and **Remove** to change the list. Octowatcher rescans in the background before every GitHub check (every 2 minutes by default). **Refresh** and **Rescan** both scan immediately and then check GitHub. New, moved or removed checkouts and changes to their remotes appear on the next scan.
 
-The scan goes up to five levels deep. It skips hidden folders and `node_modules`, `target`, `vendor`, `build`, `dist` and `Library`.
+The scan goes up to five levels deep. It skips hidden folders and `node_modules`, `target`, `vendor`, `build`, `dist` and `Library`. It stops at each checkout rather than scanning inside it, and does not follow directory symlinks. A folder added explicitly is scanned even if its name is normally skipped.
 
 **GitHub repositories found** lists every repository that has at least one clone in those folders, with the paths of its clones. Click a repository to switch between **watching** and **off**. Reviews from repositories that are off don't show up and don't notify you.
 
-Octowatcher reads the remotes from each clone's `.git/config` and understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them.
+Octowatcher reads each checkout's Git config, resolving `.git` files and the shared metadata of linked worktrees even when the main clone is outside watched folders. A submodule is included when its folder is watched explicitly; scans do not descend into its parent checkout to find it. It understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them.
+
+If a watched folder is missing or unreadable, or a checkout’s Git metadata cannot be read, the window shows a warning with details in **Repositories**. Octowatcher retains previously discovered repositories in the affected folders, including across restarts, and retries on the next scan. A successful scan updates the list; removing a watched folder removes its checkouts from the list.
 
 ### Settings
 
@@ -90,7 +92,7 @@ Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To
 
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories, check interval and snooze length), your snoozes, and the current review list for the repositories you watch to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories, check interval and snooze length), the last discovered checkout paths, your snoozes, and the current review list for the repositories you watch to one JSON file:
 
 | Platform | Path |
 | --- | --- |
@@ -104,7 +106,7 @@ Delete this file to reset Octowatcher. Everything it sends to GitHub goes throug
 - **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then restart the app.
 - **"could not run `gh`; is the GitHub CLI installed?"**: install the GitHub CLI, or put it in one of the folders listed under [Requirements](#requirements).
 - **"gh api failed: …"**: run `gh auth status` in a terminal, and `gh auth login` if you're logged out.
-- **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. Then click **Rescan**.
+- **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. Wait for the next check, or click **Rescan** to scan immediately. Check **Repositories** for folder or Git metadata warnings. For a nested submodule, add its folder explicitly.
 - **No tray icon on Linux**: GNOME needs an AppIndicator extension, such as *AppIndicator and KStatusNotifierItem Support*, before it shows tray icons.
 
 ## Building from source
