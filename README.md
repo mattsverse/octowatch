@@ -75,7 +75,7 @@ If GitHub can't completely check a repository, Octowatcher shows the error and k
 
 If a team request and your review have exactly the same timestamp, the request stays visible: Octowatcher can't prove which happened first.
 
-Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front; its **Open Reviews** button does the same. After the first successful GitHub check at each launch, Octowatcher summarizes the eligible reviews already waiting.
+Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front; its **Open Reviews** button does the same. At each launch, Octowatcher summarizes eligible reviews as GitHub confirms them. An incomplete check can announce confirmed requests, while unchecked saved reviews and their undelivered alerts wait for confirmation. Reviews confirmed later can notify then; they do not need a new request.
 
 **Snooze…** opens a duration picker for that pull request: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default from Settings is marked; choose a duration to snooze, or **Cancel** to leave the review waiting. Each choice applies only to that snooze and doesn't change the default. Only one picker is open at a time.
 

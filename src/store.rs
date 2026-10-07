@@ -211,11 +211,6 @@ impl Store {
         }
     }
 
-    /// Seed the first successful poll after launch, including suppressed drafts.
-    pub fn queue_startup_notifications(&mut self) {
-        self.queue_notifications(&self.awake());
-    }
-
     pub fn discard_notification(&mut self, key: &(String, u64)) {
         self.notification_queue
             .retain(|notice| (&notice.repo, notice.number) != (&key.0, key.1));
@@ -263,8 +258,7 @@ impl Store {
             .map(|pr| (pr.key(), pr.requested_at.clone()))
             .collect();
         // A missing timestamp on a still-pending PR is not evidence of a new
-        // request;
-        // keep its known identity, undelivered notice, and snooze deadline.
+        // request; keep its known identity, undelivered notice, and snooze deadline.
         for pr in &mut fetched {
             if pr.requested_at.is_none() {
                 pr.requested_at = known.get(&pr.key()).cloned().flatten();

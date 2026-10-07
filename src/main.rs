@@ -70,7 +70,7 @@ struct Octowatcher {
     tray_error: Option<String>,
     save_error: Option<String>,
     notification_error: Option<String>,
-    /// Whether the first successful poll has validated the cached review list.
+    /// Whether a check has confirmed requests or completed a repository.
     announced_launch: bool,
     /// Retained until the launch batch is accepted, including after failures.
     launch_summary: bool,
@@ -136,6 +136,7 @@ impl Octowatcher {
             }
         });
         let store = Store::load();
+        let review_delivery = Delivery::for_launch(&store);
         let (tray, tray_error) = match Tray::new(&store.awake(), store.notifications_muted) {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
@@ -152,7 +153,7 @@ impl Octowatcher {
             notification_error: None,
             announced_launch: false,
             launch_summary: true,
-            review_delivery: Delivery::default(),
+            review_delivery,
             notification_tasks: HashMap::new(),
             tray,
             update: None,
@@ -351,16 +352,16 @@ impl Octowatcher {
         let can_announce_launch = !fetched.pending.is_empty()
             || !fetched.completed_repos.is_empty()
             || watched.is_empty();
+        let confirmed = fetched.pending.clone();
         let reconciled =
             self.store
                 .reconcile_repositories(fetched.pending, &fetched.completed_repos, &watched);
         self.dismiss_stale_snooze_picker();
         let notification_sequence = self.store.notification_sequence;
+        self.review_delivery.confirm(&mut self.store, &confirmed);
         let first_check = !self.announced_launch && can_announce_launch;
         if first_check {
             self.announced_launch = true;
-            // Preserve launch summaries, but keep suppressed drafts queued.
-            self.store.queue_startup_notifications();
             if self.store.notification_queue.is_empty() {
                 self.launch_summary = false;
             }
@@ -380,7 +381,8 @@ impl Octowatcher {
     /// Sends eligible, undelivered review events in one batch. A failed send
     /// stays persisted and is attempted at the next successful GitHub poll.
     fn deliver_reviews(&mut self, cx: &mut Context<Self>) {
-        // Validate cached requests against GitHub before any launch delivery.
+        // Require a confirmed check before delivery. Delivery also holds each
+        // unchecked saved review until GitHub confirms that request.
         if !self.announced_launch {
             return;
         }
@@ -1838,6 +1840,7 @@ mod snooze_tests {
             let mut app = app_for_picker_test();
             app.announced_launch = false;
             app.store.pending = vec![review(1)];
+            app.review_delivery = Delivery::for_launch(&app.store);
             // No notification or persistence side effects: this request is
             // already saved, snoozed, and unchanged by the partial response.
             app.store
