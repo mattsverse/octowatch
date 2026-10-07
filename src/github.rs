@@ -257,6 +257,7 @@ fn fetch_account_reviews(
     let token = session.token.as_str();
     let watched = repos.iter().filter(|repo| preferences.monitors(me, repo));
     let mut accessible = BTreeSet::new();
+    let mut cached_access = BTreeSet::new();
     let mut unavailable_repos = BTreeSet::new();
     for repo in watched {
         let key = (session.viewer.id, repo.to_lowercase());
@@ -266,31 +267,13 @@ fn fetch_account_reviews(
             .is_some_and(|expires| *expires > now)
         {
             accessible.insert(repo.to_lowercase());
+            cached_access.insert(repo.to_lowercase());
             continue;
         }
-        match runner.run(
-            &["api", &format!("repos/{repo}"), "--jq", ".full_name"],
-            Some(token),
-        ) {
-            Ok(_) => {
-                cache.allowed.insert(key, now + ACCESS_CACHE_TTL);
-                accessible.insert(repo.to_lowercase());
-            }
-            Err(err) => {
-                cache.allowed.remove(&key);
-                let message = format!("{err:#}");
-                // A repository error is never proof that its review requests
-                // disappeared. Preserve that partition and hide it until a
-                // successful access check. Other accessible repos can proceed.
-                let repository_error = message.contains("HTTP 404")
-                    || (message.contains("HTTP 403")
-                        && !message.to_lowercase().contains("rate limit"));
-                if !repository_error {
-                    return Err(err);
-                }
-                unavailable_repos.insert(repo.to_lowercase());
-                access_errors.push((repo.clone(), format!("@{me} cannot check {repo}: {message}. Cached reviews and snoozes are retained. Check repository permissions and organization SSO authorization.")));
-            }
+        if check_repo_access(runner, session, repo, cache, now, access_errors)? {
+            accessible.insert(repo.to_lowercase());
+        } else {
+            unavailable_repos.insert(repo.to_lowercase());
         }
     }
     if accessible.is_empty() {
@@ -314,14 +297,66 @@ fn fetch_account_reviews(
         ],
         Some(token),
     )?;
+    let pending = parse_reviews(&output, &session.viewer)?;
+    // Search can silently omit requests after permissions change. Before
+    // deleting a known request based on cached access, verify its repo again.
+    let missing_repos: BTreeSet<_> = preferences
+        .pending
+        .iter()
+        .filter(|old| {
+            old.account_id == session.viewer.id
+                && cached_access.contains(&old.repo.to_lowercase())
+                && !pending.iter().any(|pr| pr.key() == old.key())
+        })
+        .map(|pr| pr.repo.to_lowercase())
+        .collect();
+    for repo in missing_repos {
+        if !check_repo_access(runner, session, &repo, cache, now, access_errors)? {
+            accessible.remove(&repo);
+            unavailable_repos.insert(repo);
+        }
+    }
     Ok(AccountReviews {
         account_id: session.viewer.id,
-        pending: parse_reviews(&output, &session.viewer)?
+        pending: pending
             .into_iter()
             .filter(|pr| accessible.contains(&pr.repo.to_lowercase()))
             .collect(),
         unavailable_repos,
     })
+}
+
+fn check_repo_access(
+    runner: &impl GhRunner,
+    session: &Session,
+    repo: &str,
+    cache: &mut AccessCache,
+    now: Instant,
+    access_errors: &mut Vec<(String, String)>,
+) -> Result<bool> {
+    let key = (session.viewer.id, repo.to_lowercase());
+    match runner.run(
+        &["api", &format!("repos/{repo}"), "--jq", ".full_name"],
+        Some(&session.token),
+    ) {
+        Ok(_) => {
+            cache.allowed.insert(key, now + ACCESS_CACHE_TTL);
+            Ok(true)
+        }
+        Err(err) => {
+            cache.allowed.remove(&key);
+            let message = format!("{err:#}");
+            if !message.contains("HTTP 404")
+                && (!message.contains("HTTP 403") || message.to_lowercase().contains("rate limit"))
+            {
+                return Err(err);
+            }
+            // Repository failures never prove its review requests disappeared.
+            let me = &session.viewer.login;
+            access_errors.push((repo.into(), format!("@{me} cannot check {repo}: {message}. Cached reviews and snoozes are retained. Check repository permissions and organization SSO authorization.")));
+            Ok(false)
+        }
+    }
 }
 
 fn parse_reviews(output: &str, me: &Viewer) -> Result<Vec<PendingReview>> {
@@ -1169,6 +1204,55 @@ mod tests {
         .unwrap();
         assert!(recovered.checks.iter().all(|check| check.reviews.is_ok()));
         script.finished();
+    }
+
+    #[test]
+    fn missing_requests_recheck_cached_access_before_deleting_state() {
+        for accessible in [false, true] {
+            let script = Script::default();
+            let now = Instant::now();
+            let mut store = Store::from_json(include_str!(
+                "../tests/fixtures/multiple-account-state.json"
+            ))
+            .unwrap();
+            script.status(ACCOUNTS);
+            script.successful("alice", 1);
+            script.successful("bob", 2);
+            let first = poll_with(
+                &script,
+                &[REPO.into()],
+                store.clone(),
+                AccessCache::default(),
+                now,
+            )
+            .unwrap();
+            script.status(ACCOUNTS);
+            script.identity("alice", 1);
+            script.search("alice", r#"{"data":{"search":{"nodes":[]}}}"#);
+            script.access(
+                "alice",
+                REPO,
+                if accessible {
+                    Ok(REPO.into())
+                } else {
+                    Err(anyhow::anyhow!("Forbidden (HTTP 403)"))
+                },
+            );
+            script.identity("bob", 2);
+            script.search("bob", REVIEWS);
+            let next = poll_with(
+                &script,
+                &[REPO.into()],
+                store.clone(),
+                first.access_cache,
+                now + Duration::from_secs(120),
+            )
+            .unwrap();
+            apply(&mut store, next);
+            assert_eq!(store.pending.len(), if accessible { 1 } else { 2 });
+            assert_eq!(store.snoozed.len(), usize::from(!accessible));
+            script.finished();
+        }
     }
 
     #[test]

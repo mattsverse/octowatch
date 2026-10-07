@@ -1,13 +1,14 @@
 mod discovery;
 mod github;
 mod notifications;
+mod review_notifications;
 mod store;
 mod theme;
 mod tray;
 mod updater;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     path::PathBuf,
     time::Duration,
 };
@@ -21,6 +22,7 @@ use gpui::{
 
 use discovery::LocalRepo;
 use notifications::Response;
+use review_notifications::{Batch, Delivery, ReviewAction, Target};
 use store::{PendingReview, ReviewKey, Store};
 use theme::{Appearance, Palette};
 use tray::{Tray, UpdateItem};
@@ -68,10 +70,16 @@ struct Octowatcher {
     save_error: Option<String>,
     notification_error: Option<String>,
     /// Whether the reviews waiting at launch were announced yet.
-    announced_accounts: BTreeSet<String>,
+    announced_accounts: BTreeSet<u64>,
     account_errors: BTreeMap<String, String>,
     repo_errors: BTreeMap<(String, String), String>,
     access_cache: github::AccessCache,
+    /// Whether the first successful poll has validated the cached review list.
+    announced_launch: bool,
+    /// Retained until the launch batch is accepted, including after failures.
+    launch_summary: bool,
+    review_delivery: Delivery,
+    notification_tasks: HashMap<usize, Task<()>>,
     tray: Option<Tray>,
     update: Option<Update>,
     scan_task: Option<Task<()>>,
@@ -130,7 +138,7 @@ impl Octowatcher {
             }
         });
         let store = Store::load();
-        let (tray, tray_error) = match Tray::new(&store.awake()) {
+        let (tray, tray_error) = match Tray::new(&store.awake(), store.notifications_muted) {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
         };
@@ -148,6 +156,10 @@ impl Octowatcher {
             account_errors: BTreeMap::new(),
             repo_errors: BTreeMap::new(),
             access_cache: github::AccessCache::default(),
+            announced_launch: false,
+            launch_summary: true,
+            review_delivery: Delivery::default(),
+            notification_tasks: HashMap::new(),
             tray,
             update: None,
             scan_task: None,
@@ -190,6 +202,23 @@ impl Octowatcher {
         }
         self.store.snooze_minutes = minutes;
         self.save();
+        cx.notify();
+    }
+
+    fn toggle_notifications_muted(&mut self, cx: &mut Context<Self>) {
+        self.store.notifications_muted = !self.store.notifications_muted;
+        self.save();
+        self.sync_tray();
+        if !self.store.notifications_muted {
+            self.deliver_reviews(cx);
+        }
+        cx.notify();
+    }
+
+    fn toggle_notify_drafts(&mut self, cx: &mut Context<Self>) {
+        self.store.notify_drafts = !self.store.notify_drafts;
+        self.save();
+        self.deliver_reviews(cx);
         cx.notify();
     }
 
@@ -246,9 +275,9 @@ impl Octowatcher {
 
     /// Brings back every review whose snooze ran out, and notifies again.
     fn wake(&mut self, cx: &mut Context<Self>) {
-        let woken = self.store.take_expired(Local::now().timestamp());
+        self.store.take_expired(Local::now().timestamp());
         self.snoozes_changed(cx);
-        self.notify(woken, cx);
+        self.deliver_reviews(cx);
     }
 
     /// Rediscovers local clones, then checks GitHub again.
@@ -386,52 +415,78 @@ impl Octowatcher {
                 }
             }
         }
-        let reconciled = self.store.reconcile(fetched, &checked_accounts);
+        self.store.reconcile(fetched, &checked_accounts);
         self.dismiss_stale_snooze_picker();
-        // Account discovery and preferences are persisted too.
-        self.save();
-        self.sync_tray();
-        self.schedule_wake(cx);
-        let first_accounts: BTreeSet<_> = self
-            .store
-            .available_accounts
-            .difference(&self.announced_accounts)
-            .cloned()
+        let first_accounts: BTreeSet<_> = checked_accounts
+            .values()
+            .copied()
+            .filter(|id| !self.announced_accounts.contains(id))
             .collect();
         self.announced_accounts
-            .extend(first_accounts.iter().cloned());
-        let fresh = reconciled
-            .fresh
-            .into_iter()
-            .filter(|pr| {
-                !first_accounts.contains(&pr.account.to_lowercase()) && self.store.visible(pr)
-            })
-            .collect();
-        self.notify(fresh, cx);
-        self.announce_waiting(&first_accounts, cx);
-        // Expired snoozes on unavailable accounts wake only after a successful
-        // check, against that account's newly reconciled review requests.
+            .extend(first_accounts.iter().copied());
+        if !checked_accounts.is_empty() {
+            self.announced_launch = true;
+        }
+        self.store.queue_startup_notifications(&first_accounts);
+        if self.store.notification_queue.is_empty() {
+            self.launch_summary = false;
+        }
+        // Discovery and availability changes matter even when the cached list is unchanged.
         self.wake(cx);
     }
 
-    /// Notifies about every review waiting and not snoozed, as a count.
-    fn announce_waiting(&mut self, accounts: &BTreeSet<String>, cx: &mut Context<Self>) {
-        let awake: Vec<_> = self
-            .store
-            .awake()
-            .into_iter()
-            .filter(|pr| accounts.contains(&pr.account.to_lowercase()))
-            .collect();
-        let summary = match awake.len() {
-            0 => return,
-            1 => "You have 1 pending review".to_string(),
-            n => format!("You have {n} pending reviews"),
+    /// Sends eligible, undelivered review events in one batch. A failed send
+    /// stays persisted and is attempted at the next successful GitHub poll.
+    fn deliver_reviews(&mut self, cx: &mut Context<Self>) {
+        // Validate cached requests against GitHub before any launch delivery.
+        if !self.announced_launch {
+            return;
+        }
+        let Some(batch) = self.review_delivery.begin(&self.store) else {
+            return;
         };
-        let body = match awake.as_slice() {
-            [pr] => format!("@{} · {}#{}: {}", pr.account, pr.repo, pr.number, pr.title),
-            many => pr_list(many),
+        self.send_review_batch(batch, cx);
+    }
+
+    fn send_review_batch(&mut self, batch: Batch, cx: &mut Context<Self>) {
+        let target = Target::for_reviews(&batch.reviews);
+        let (summary, body) = if self.launch_summary {
+            waiting_text(&batch.reviews)
+        } else {
+            notification_text(&batch.reviews)
         };
-        self.show_notification(summary, body, None, cx, |_, _, _| {});
+        let action = target.action();
+        let started = self.start_notification(
+            summary,
+            body,
+            Some(action),
+            cx,
+            move |this, delivered, cx| {
+                let next = this
+                    .review_delivery
+                    .complete(&mut this.store, &batch, delivered);
+                if delivered {
+                    this.launch_summary = false;
+                    this.save();
+                }
+                if let Some(next) = next {
+                    this.send_review_batch(next, cx);
+                }
+                cx.notify();
+            },
+            move |this, response, cx| match target.respond(response, &this.store) {
+                Some(ReviewAction::OpenPr(url)) => cx.open_url(&url),
+                Some(ReviewAction::OpenReviews) => {
+                    this.tab = Tab::Reviews;
+                    show_window(cx);
+                }
+                Some(ReviewAction::Snooze(pr)) => this.snooze(pr.key(), cx),
+                None => {}
+            },
+        );
+        if !started {
+            self.review_delivery.deferred();
+        }
     }
 
     fn send_test_notification(&mut self, cx: &mut Context<Self>) {
@@ -444,8 +499,7 @@ impl Octowatcher {
         );
     }
 
-    /// Shows a notification, then hands what the user did with it to
-    /// `respond`. A failure to show it stays on screen until one succeeds.
+    /// Generic notifications (test/update) use the same bounded sender.
     fn show_notification(
         &mut self,
         summary: String,
@@ -454,48 +508,78 @@ impl Octowatcher {
         cx: &mut Context<Self>,
         respond: impl FnOnce(&mut Self, Response, &mut Context<Self>) + 'static,
     ) {
-        cx.spawn(async move |this, cx| {
-            let shown = notifications::show(&summary, &body, action).await;
+        if !self.start_notification(summary, body, action, cx, |_, _, _| {}, respond) {
+            self.notification_error =
+                Some("Too many active notifications. Try again after dismissing one.".into());
+            cx.notify();
+        }
+    }
+
+    /// Reports OS acceptance before waiting for any action. Fixed slots and
+    /// a finite observer lifetime bound tasks and platform response registries.
+    fn start_notification(
+        &mut self,
+        summary: String,
+        body: String,
+        action: Option<notifications::Action>,
+        cx: &mut Context<Self>,
+        delivered: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
+        respond: impl FnOnce(&mut Self, Response, &mut Context<Self>) + 'static,
+    ) -> bool {
+        let Some(slot) =
+            notifications::free_slot(|slot| self.notification_tasks.contains_key(&slot))
+        else {
+            return false;
+        };
+        let task = cx.spawn(async move |this, cx| {
+            let shown = futures_lite::future::or(
+                notifications::send(slot, &summary, &body, action),
+                async {
+                    cx.background_executor()
+                        .timer(Duration::from_secs(15))
+                        .await;
+                    Err("notification service did not answer within 15 seconds".into())
+                },
+            )
+            .await;
+            let accepted = shown.is_ok();
+            if this
+                .update(cx, |this, cx| {
+                    this.notification_error = shown
+                        .as_ref()
+                        .err()
+                        .map(|err| format!("could not send notification: {err}"));
+                    delivered(this, accepted, cx);
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
+            let response = match shown {
+                Ok(handle) => {
+                    handle
+                        .response(|duration| cx.background_executor().timer(duration))
+                        .await
+                }
+                Err(_) => Response::Dismissed,
+            };
             this.update(cx, |this, cx| {
-                match shown {
-                    Ok(response) => {
-                        this.notification_error = None;
-                        respond(this, response, cx);
-                    }
-                    Err(err) => {
-                        this.notification_error =
-                            Some(format!("could not send notification: {err}"));
-                    }
+                if accepted {
+                    respond(this, response, cx);
+                }
+                this.notification_tasks.remove(&slot);
+                // Successful observers also free bounded sender capacity.
+                // A failed send waits for a later poll or explicit resume.
+                if accepted {
+                    this.deliver_reviews(cx);
                 }
                 cx.notify();
             })
             .ok();
-        })
-        .detach();
-    }
-
-    /// Notifies about reviews to do. A single one gets a button to snooze it.
-    fn notify(&mut self, prs: Vec<PendingReview>, cx: &mut Context<Self>) {
-        let prs: Vec<_> = prs
-            .into_iter()
-            .filter(|pr| self.store.visible(pr))
-            .collect();
-        if prs.is_empty() {
-            return;
-        }
-        let key = match prs.as_slice() {
-            [pr] => Some(pr.key()),
-            _ => None,
-        };
-        let (summary, body) = notification_text(&prs);
-        let action = key.is_some().then_some(("snooze", "Snooze"));
-        self.show_notification(summary, body, action, cx, move |this, response, cx| {
-            if response == Response::Action("snooze".into())
-                && let Some(key) = key
-            {
-                this.snooze(key, cx);
-            }
         });
+        self.notification_tasks.insert(slot, task);
+        true
     }
 
     fn watched_slugs(&self) -> HashSet<String> {
@@ -799,7 +883,7 @@ impl Octowatcher {
             Some(Update::Manual(_)) | None => UpdateItem::Check,
         };
         self.tray_error = tray
-            .update(&self.store.awake(), item)
+            .update(&self.store.awake(), item, self.store.notifications_muted)
             .err()
             .map(|err| format!("could not update tray menu: {err:#}"));
     }
@@ -823,6 +907,18 @@ impl Octowatcher {
         .into_iter()
         .find_map(Option::as_deref)
     }
+}
+
+fn waiting_text(prs: &[PendingReview]) -> (String, String) {
+    let summary = match prs.len() {
+        1 => "You have 1 pending review".to_string(),
+        n => format!("You have {n} pending reviews"),
+    };
+    let body = match prs {
+        [pr] => format!("@{} · {}#{}: {}", pr.account, pr.repo, pr.number, pr.title),
+        many => pr_list(many),
+    };
+    (summary, body)
 }
 
 fn notification_text(prs: &[PendingReview]) -> (String, String) {
@@ -1428,13 +1524,67 @@ impl Octowatcher {
                     .flex_col()
                     .gap_2()
                     .child(section_title("Notifications", theme))
-                    .child(div().flex().child(
-                        button("test-notification", "Send test notification", theme).on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.send_test_notification(cx)
-                            }),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .child(
+                                button(
+                                    "mute-notifications",
+                                    if self.store.notifications_muted {
+                                        "Resume review notifications"
+                                    } else {
+                                        "Mute review notifications"
+                                    },
+                                    theme,
+                                )
+                                .debug_selector(|| "mute-notifications".to_string())
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.toggle_notifications_muted(cx)
+                                })),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.secondary_text))
+                                    .child(if self.store.notifications_muted {
+                                        "Muted · polling continues"
+                                    } else {
+                                        "On"
+                                    }),
+                            ),
+                    )
+                    .child(
+                        button(
+                            "notify-drafts",
+                            if self.store.notify_drafts {
+                                "Notify about drafts: On"
+                            } else {
+                                "Notify about drafts: Off"
+                            },
+                            theme,
+                        )
+                        .debug_selector(|| "notify-drafts".to_string())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.toggle_notify_drafts(cx)
+                        })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.muted_text))
+                            .child("Drafts stay in the queue. Resume sends one catch-up alert for undelivered reviews."),
+                    )
+                    .child(
+                        div().flex().child(
+                            button("test-notification", "Send test notification", theme)
+                                .debug_selector(|| "test-notification".to_string())
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.send_test_notification(cx)
+                                })),
                         ),
-                    )),
+                    ),
             )
     }
 
@@ -1643,6 +1793,12 @@ pub fn refresh(cx: &mut App) {
     view.update(cx, |this, cx| this.force_refresh(cx));
 }
 
+/// Mutes or resumes review notifications, from the tray.
+pub fn toggle_notifications_muted(cx: &mut App) {
+    let view = cx.global::<MainView>().0.clone();
+    view.update(cx, |this, cx| this.toggle_notifications_muted(cx));
+}
+
 /// Checks for a new release now, from the tray.
 pub fn check_for_updates(cx: &mut App) {
     let view = cx.global::<MainView>().0.clone();
@@ -1787,10 +1943,14 @@ mod snooze_tests {
             tray_error: None,
             save_error: None,
             notification_error: None,
-            announced_accounts: BTreeSet::from(["alice".into()]),
+            announced_accounts: BTreeSet::from([1]),
             account_errors: BTreeMap::new(),
             repo_errors: BTreeMap::new(),
             access_cache: github::AccessCache::default(),
+            announced_launch: true,
+            launch_summary: false,
+            review_delivery: Delivery::default(),
+            notification_tasks: HashMap::new(),
             tray: None,
             update: None,
             scan_task: None,
@@ -1800,6 +1960,31 @@ mod snooze_tests {
             update_check: None,
             _startup_and_updates: Task::ready(()),
             appearance_subscription: None,
+        }
+    }
+
+    #[gpui::test]
+    fn notification_controls_render_in_both_palettes_and_preference_states(
+        cx: &mut TestAppContext,
+    ) {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            for muted in [false, true] {
+                let (_, window) = cx.add_window_view(|_, _| {
+                    let mut app = app_for_picker_test();
+                    app.tab = Tab::Settings;
+                    app.store.appearance = appearance;
+                    app.store.notifications_muted = muted;
+                    app.store.notify_drafts = !muted;
+                    app
+                });
+                for selector in ["mute-notifications", "notify-drafts", "test-notification"] {
+                    let bounds = window
+                        .debug_bounds(selector)
+                        .expect("notification control rendered");
+                    assert!(bounds.size.width > px(0.));
+                    assert!(bounds.size.height > px(0.));
+                }
+            }
         }
     }
 
