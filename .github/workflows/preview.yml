@@ -1,0 +1,57 @@
+name: Preview
+
+# Builds unsigned bundles for a pull request carrying the `preview` label.
+# Opt-in, since the macOS runner is the expensive part of CI.
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    # On `labeled`, only the preview label itself starts a build.
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'preview') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'preview')
+    runs-on: blacksmith-6vcpu-macos-15
+    steps:
+      - uses: actions/checkout@v7
+      # Apple Silicon only and no notarization: a preview needs neither.
+      - id: build
+        uses: ./.github/actions/build-macos
+      # Ad-hoc signed, so Gatekeeper still quarantines the download.
+      - env:
+          BUNDLE_DIR: ${{ steps.build.outputs.bundle-dir }}
+        run: |
+          codesign --force --sign - "$BUNDLE_DIR/osx/Octowatcher.app"
+          COPYFILE_DISABLE=1 tar -C "$BUNDLE_DIR/osx" -czf octowatcher-macos-preview.tar.gz Octowatcher.app
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-preview
+          path: octowatcher-macos-preview.tar.gz
+          retention-days: 7
+
+  linux:
+    if: >-
+      contains(github.event.pull_request.labels.*.name, 'preview') &&
+      (github.event.action != 'labeled' || github.event.label.name == 'preview')
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/build-linux
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-preview
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          retention-days: 7
