@@ -96,8 +96,10 @@ xcrun stapler validate "$work_dir/extracted/Octowatcher.app"
 mkdir -p "$(dirname "$dmg")" "$work_dir/dmg"
 ditto "$app" "$work_dir/dmg/Octowatcher.app"
 ln -s /Applications "$work_dir/dmg/Applications"
-hdiutil create -ov -volname Octowatcher -fs HFS+ -format UDZO \
+# HFS+ UDZO images come out corrupt on the macOS 15 runners.
+hdiutil create -ov -volname Octowatcher -fs APFS -format UDZO \
     -srcfolder "$work_dir/dmg" "$dmg"
+hdiutil verify "$dmg"
 codesign --force --sign "$identity" --keychain "$keychain" --timestamp "$dmg"
 notarize "$dmg"
 xcrun stapler staple "$dmg"
