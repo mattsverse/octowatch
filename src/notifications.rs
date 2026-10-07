@@ -200,6 +200,7 @@ mod tests {
         };
         futures_lite::future::block_on(async {
             let review = PendingReview {
+                host: crate::repository::default_host(),
                 account: "alice".into(),
                 account_id: 1,
                 repo: "test/repo".into(),

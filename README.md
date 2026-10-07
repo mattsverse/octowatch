@@ -15,14 +15,15 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Opens reviews from notifications.** Click a single-review notification to open its PR, or a summary to open the Reviews tab.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
 - **Monitors multiple accounts together.** Enable your work and personal accounts independently. Each review shows its receiving account, and requests for the same PR under different accounts have separate snoozes.
-- **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), using its saved github.com accounts without switching your active CLI account.
+- **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), using saved github.com accounts and existing Enterprise host credentials without switching your active CLI account.
+- **Supports Enterprise hosts.** Watch github.com, Enterprise Server and Enterprise Cloud with data residency together; matching repositories on different hosts stay separate.
 - **Follows your desktop appearance.** Use System, Light or Dark in Settings. System is the default, and your choice survives restarts.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
 ## Requirements
 
 - macOS, or Linux with a desktop that shows tray icons (AppIndicator).
-- A recent [GitHub CLI](https://cli.github.com/) (`gh`) supporting `gh auth status --json hosts` and `gh auth token --user`, with at least one saved github.com login:
+- The [GitHub CLI](https://cli.github.com/) (`gh`) **2.81 or newer**, logged in:
 
   ```sh
   gh auth login --hostname github.com
@@ -87,9 +88,34 @@ The scan goes up to five levels deep. It skips hidden folders and `node_modules`
 
 **GitHub repositories found** lists every repository that has at least one clone in those folders, with the paths of its clones. Click a repository to switch between **watching** and **off**. Reviews from repositories that are off don't show up and don't notify you.
 
-Each repository defaults to **All enabled accounts**. Under **Monitor with**, click account names to restrict it to selected accounts, or choose **All enabled accounts** to restore the default, including accounts added later. Selecting no accounts pauses that repository. Account selections still respect the account's global enable/disable setting. Repository-access errors name the account and repository; check permissions and organization SSO authorization if a private repository is inaccessible. Other accessible repositories continue normally. A failed access check hides that repository’s requests for the affected account and retains its cached reviews and snoozes until access recovers. Successful access checks are cached in memory for 30 minutes to reduce API requests; **Refresh** rechecks immediately, and repository-permission changes may otherwise take up to 30 minutes to be reported. Review requests and account identity are still checked at every polling interval.
+Each github.com repository defaults to **All enabled accounts**. Under **Monitor with**, click account names to restrict it to selected accounts, or choose **All enabled accounts** to restore the default, including accounts added later. Selecting no accounts pauses that repository. Account selections still respect the account's global enable/disable setting. Repository-access errors name the account and repository; check permissions and organization SSO authorization if a private repository is inaccessible. Other accessible repositories continue normally. A failed access check hides that repository’s requests for the affected account and retains its cached reviews and snoozes until access recovers. Successful access checks are cached in memory for 30 minutes to reduce API requests; **Refresh** rechecks immediately, and repository-permission changes may otherwise take up to 30 minutes to be reported. Review requests and account identity are still checked at every polling interval.
 
-Octowatcher reads the remotes from each clone's `.git/config` and understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. SSH aliases identify repositories; they do not assign a GitHub API account. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them. GitHub Enterprise hosts are not supported by this account feature.
+Octowatcher reads the remotes from each clone's `.git/config` and understands scp-like SSH (`git@HOST:owner/repo.git`), `ssh://`, and HTTPS remotes. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them. Repository labels include the host, for example `github.com/owner/repo` and `github.example.com/owner/repo`.
+
+It also reads straightforward literal `Host` / `HostName` aliases from `~/.ssh/config`. For example, `git@github-work:owner/repo.git` maps to the host named by `HostName` in the `Host github-work` block. Aliases work for SSH remotes only, and each alias stays scoped to its destination host. Octowatcher does not evaluate `Include`, `Match`, wildcard or negated SSH host rules; use a direct host remote or a literal alias for those configurations.
+
+SSH aliases identify destinations and do not assign a github.com API account.
+
+### Enterprise hosts
+
+Log in to each host through GitHub CLI, then choose **Rescan** in Repositories (or restart Octowatcher):
+
+```sh
+gh auth login --hostname github.example.com
+gh auth login --hostname acme.ghe.com
+```
+
+Octowatcher recognizes the hosts configured in `gh`, plus github.com. You can watch several hosts at once; only hosts with enabled local repositories are polled for reviews. An expired login remains discoverable, so re-authenticating can recover its reviews. There is no separate host or token list in Octowatcher. On Enterprise hosts it uses gh's active account, including gh's normal environment-token precedence. SSH keys and aliases select a remote destination; they do not select the account used by the API. Enterprise accounts on one host are not independently monitored; the simultaneous-account controls apply to github.com.
+
+API requests explicitly target the repository's web host. GitHub CLI chooses the endpoint: `api.github.com` for github.com, `HOST/api/v3` and `HOST/api/graphql` for Enterprise Server, and `api.TENANT.ghe.com` for Enterprise Cloud with data residency. Hosts must provide standard HTTPS APIs. Custom API ports, HTTP-only APIs, reverse-proxy path prefixes, and IPv6 host literals are not supported. SSH remote URLs may use a custom SSH port; HTTPS remotes may use the standard port 443.
+
+Each host must support the GraphQL fields used for review requests, review history, and re-review detection. Octowatcher reports incompatible schemas as a host-specific error; it does not provide fallback APIs for older Enterprise Server versions. Authentication, permission, network, and API failures on one host leave its last known reviews and snoozes in place while healthy hosts keep refreshing. Discovery and review CLI calls time out after 60 seconds, including command completion and output collection, so a stalled request can report an error and allow other hosts to refresh. If discovery itself fails, Octowatcher keeps the previous scan in memory; retry **Rescan** after resolving the error. Cached reviews may be out of date until that host recovers. Repositories switched off or removed from the watched folders still leave the list.
+
+Undelivered notifications are also scoped to their host. After a restart, cached alerts wait for that host’s first successful check; healthy hosts can deliver while another host’s alerts remain queued. Snoozing a review or switching a repository off clears only its own host’s alerts.
+
+Self-updates always use `github.com/mattsverse/octowatch`, independently of monitored hosts and `GH_HOST`. Keep your github.com login available to check and download app updates.
+
+Host routing and failure handling are covered by local fixtures and command-routing tests. Enterprise Server and data-residency service behavior has not been exercised against a live Enterprise instance.
 
 ### Settings
 
@@ -128,9 +154,9 @@ Octowatcher saves your settings (folders, switched-off repositories and accounts
 
 Delete this file to reset Octowatcher. Everything it sends to GitHub goes through `gh`.
 
-Review and snooze identity uses GitHub's stable user ID, repository, and PR number. Monitoring preferences also use verified user IDs; older login-based preferences migrate when the corresponding identity is known or verified. Credentials are retrieved by account from `gh`, used temporarily in memory and the child process environment, and never saved to the state file or passed in command arguments. Octowatcher uses saved CLI credentials and ignores inherited `GH_TOKEN`/`GITHUB_TOKEN` overrides for both monitoring and updates. Update checks and downloads can use a healthy saved github.com account even if it is disabled for monitoring.
+Review and snooze identity includes the GitHub host, repository, and PR number, plus the stable user ID on github.com. Enterprise keeps its existing per-host active-account state. Monitoring preferences also use verified user IDs; older login-based preferences migrate when the corresponding identity is known or verified. Credentials are retrieved by account from `gh`, used temporarily in memory and the child process environment, and never saved to the state file or passed in command arguments. For github.com monitoring and updates, Octowatcher uses saved CLI credentials and ignores inherited `GH_TOKEN`/`GITHUB_TOKEN` overrides. Enterprise host calls retain gh’s normal environment-token precedence. Update checks and downloads can use a healthy saved github.com account even if it is disabled for monitoring.
 
-When upgrading from a state file without account identity, folders, disabled repositories, check interval, and snooze duration are preserved. Old cached reviews, snoozes and undelivered alerts are discarded because their receiving account is unknown; current requests are fetched again and may notify again.
+When upgrading github.com state without account identity, folders, disabled repositories, check interval, and snooze duration are preserved. Old cached reviews, snoozes and undelivered alerts are discarded because their receiving account is unknown; current requests are fetched again and may notify again. Host-qualified Enterprise caches, snoozes and queued alerts are retained, and old repository switches remain compatible.
 
 ## Troubleshooting
 

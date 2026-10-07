@@ -107,6 +107,7 @@ mod tests {
 
     fn pr(number: u64, draft: bool) -> PendingReview {
         PendingReview {
+            host: crate::repository::default_host(),
             account: "alice".into(),
             account_id: 1,
             repo: "Owner/Repo".into(),
@@ -122,6 +123,7 @@ mod tests {
 
     fn snooze(pr: &PendingReview, until: i64) -> Snooze {
         Snooze {
+            host: pr.host.clone(),
             account: pr.account.clone(),
             account_id: pr.account_id,
             repo: pr.key().1,
@@ -143,6 +145,7 @@ mod tests {
         let mut restored = Store::from_json(&serde_json::to_string(store).unwrap()).unwrap();
         restored.available_accounts = store.available_accounts.clone();
         restored.local_repos = store.local_repos.clone();
+        restored.available_hosts = store.available_hosts.clone();
         restored
     }
 
@@ -746,6 +749,87 @@ mod tests {
         store.local_repos.insert("owner/repo".into());
         store.queue_notifications(&store.pending.clone());
         store
+    }
+
+    #[test]
+    fn identical_reviews_on_different_hosts_keep_notices_and_actions_separate() {
+        let public = pr(1, false);
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let mut store = verified_store();
+        store.pending = vec![public.clone(), server.clone()];
+        store
+            .local_repos
+            .insert("github.example.com/owner/repo".into());
+        store.available_hosts.insert(server.host.clone());
+        store.queue_notifications(&store.pending.clone());
+        let due = store.notifications_due();
+        assert_eq!(due.len(), 2);
+        store.mark_delivered(std::slice::from_ref(&due[0].0));
+        assert_eq!(store.notifications_due()[0].1, server);
+        assert!(store.snooze(&public.key(), 5, 0));
+        assert!(store.snooze_for(&server).is_none());
+        store.pending.retain(|pr| pr.host != server.host);
+        assert_eq!(
+            Target::Single(server).respond(Response::Action("snooze".into()), &store),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_hosts_keep_queued_notices_until_their_own_launch_validation() {
+        let public = pr(1, false);
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            account_id: 0,
+            ..public.clone()
+        };
+        let mut store = verified_store();
+        store.pending = vec![public, server.clone()];
+        store
+            .local_repos
+            .insert("github.example.com/owner/repo".into());
+        store.queue_notifications(&store.pending.clone());
+        let mut delivery = Delivery::default();
+        let batch = delivery.begin(&store).unwrap();
+        assert_eq!(batch.reviews.len(), 1);
+        assert_eq!(batch.reviews[0].host, "github.com");
+        assert!(delivery.complete(&mut store, &batch, true).is_none());
+        assert_eq!(store.notification_queue.len(), 1);
+        let watched = store.local_repos.clone();
+        store.reconcile_scopes(vec![], &Default::default(), &Default::default(), &watched);
+        assert!(delivery.begin(&store).is_none());
+        store.available_hosts.insert(server.host.clone());
+        store.reconcile_scopes(
+            vec![server.clone()],
+            &Default::default(),
+            &[server.host.clone()].into(),
+            &watched,
+        );
+        assert_eq!(delivery.begin(&store).unwrap().reviews, vec![server]);
+    }
+
+    #[test]
+    fn startup_seeding_does_not_announce_unvalidated_cached_hosts() {
+        let public = pr(1, false);
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let mut store = verified_store();
+        store.pending = vec![public.clone(), server.clone()];
+        store
+            .local_repos
+            .insert("github.example.com/owner/repo".into());
+        store.queue_startup_notifications(&[1].into());
+        assert_eq!(store.notification_queue.len(), 1);
+        assert_eq!(store.notifications_due()[0].1, public);
+        store.mark_delivered(&store.notification_queue.clone());
+        store.available_hosts.insert(server.host.clone());
+        store.queue_startup_host_notifications(&[server.host.clone()].into());
+        assert_eq!(store.notifications_due()[0].1, server);
     }
 
     #[test]

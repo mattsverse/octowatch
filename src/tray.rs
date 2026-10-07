@@ -116,9 +116,8 @@ fn build_menu(pending: &[PendingReview], update: UpdateItem, muted: bool) -> Res
     }
     for pr in pending {
         let mut label = format!(
-            "@{} · {}#{}: {}",
-            pr.account,
-            pr.repo,
+            "{}#{}: {}",
+            pr.request_label(),
             pr.number,
             truncate(&pr.title)
         );

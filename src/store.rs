@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::theme::Appearance;
+use crate::{
+    repository::{PUBLIC_HOST, RepositoryId, default_host},
+    theme::Appearance,
+};
 
 /// Everything that survives a restart, saved as JSON in the platform config dir.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +47,9 @@ pub struct Store {
     /// Failed repository checks keep their cache hidden in this session.
     #[serde(skip)]
     pub unavailable_repos: BTreeSet<(u64, String)>,
+    /// Enterprise hosts validated in this session, gating cached alerts.
+    #[serde(skip)]
+    pub available_hosts: BTreeSet<String>,
     /// Review alerts are muted; polling and the queue stay active.
     pub notifications_muted: bool,
     /// Drafts stay in the queue regardless of this delivery preference.
@@ -74,6 +80,7 @@ impl Default for Store {
             available_accounts: BTreeSet::new(),
             local_repos: BTreeSet::new(),
             unavailable_repos: BTreeSet::new(),
+            available_hosts: BTreeSet::new(),
             notifications_muted: false,
             notify_drafts: true,
             notification_queue: Vec::new(),
@@ -85,6 +92,8 @@ impl Default for Store {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
+    #[serde(default = "default_host")]
+    pub host: String,
     /// Receiving github.com login. Empty only when reading legacy state.
     #[serde(default)]
     pub account: String,
@@ -106,7 +115,21 @@ pub struct PendingReview {
 
 impl PendingReview {
     pub fn key(&self) -> ReviewKey {
-        (self.account_id, self.repo.to_lowercase(), self.number)
+        (self.account_id, self.repository().store_key(), self.number)
+    }
+
+    pub fn repository(&self) -> RepositoryId {
+        RepositoryId::new(&self.host, &self.repo)
+    }
+    pub fn repo_label(&self) -> String {
+        format!("{}/{}", self.host, self.repo)
+    }
+    pub fn request_label(&self) -> String {
+        if self.account.is_empty() {
+            self.repo_label()
+        } else {
+            format!("@{} · {}", self.account, self.repo_label())
+        }
     }
 }
 
@@ -115,6 +138,8 @@ pub type ReviewKey = (u64, String, u64);
 /// A delivery event, independently persisted from the current review list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewNotice {
+    #[serde(default = "default_host")]
+    pub host: String,
     #[serde(default)]
     pub account_id: u64,
     pub repo: String,
@@ -126,7 +151,7 @@ pub struct ReviewNotice {
 impl ReviewNotice {
     pub fn matches(&self, pr: &PendingReview) -> bool {
         self.account_id == pr.account_id
-            && self.repo == pr.repo.to_lowercase()
+            && RepositoryId::new(&self.host, &self.repo) == pr.repository()
             && self.number == pr.number
             && self.requested_at == pr.requested_at
     }
@@ -135,6 +160,8 @@ impl ReviewNotice {
 /// A pending review hidden from the list and the tray until `until`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snooze {
+    #[serde(default = "default_host")]
+    pub host: String,
     #[serde(default)]
     pub account: String,
     /// Stable github.com user ID; a reused login must not inherit a snooze.
@@ -151,7 +178,11 @@ pub struct Snooze {
 
 impl Snooze {
     pub fn key(&self) -> ReviewKey {
-        (self.account_id, self.repo.to_lowercase(), self.number)
+        (
+            self.account_id,
+            RepositoryId::new(&self.host, &self.repo).store_key(),
+            self.number,
+        )
     }
 }
 
@@ -187,21 +218,70 @@ impl Store {
     /// but never guess an account for an old cached request or snooze.
     pub fn from_json(json: &str) -> Result<Self> {
         let mut store: Self = serde_json::from_str(json)?;
+        for review in &mut store.pending {
+            review.host.make_ascii_lowercase();
+        }
+        for snooze in &mut store.snoozed {
+            snooze.host.make_ascii_lowercase();
+        }
+        for notice in &mut store.notification_queue {
+            notice.host.make_ascii_lowercase();
+        }
         store
             .pending
-            .retain(|pr| !pr.account.is_empty() && pr.account_id != 0);
+            .retain(|pr| pr.host != PUBLIC_HOST || (!pr.account.is_empty() && pr.account_id != 0));
         store
             .snoozed
-            .retain(|s| !s.account.is_empty() && s.account_id != 0);
+            .retain(|s| s.host != PUBLIC_HOST || (!s.account.is_empty() && s.account_id != 0));
         // Existing account-aware state already carries verified user IDs.
         for (login, id) in store
             .pending
             .iter()
+            .filter(|pr| pr.host == PUBLIC_HOST)
             .map(|pr| (&pr.account, pr.account_id))
-            .chain(store.snoozed.iter().map(|s| (&s.account, s.account_id)))
+            .chain(
+                store
+                    .snoozed
+                    .iter()
+                    .filter(|s| s.host == PUBLIC_HOST)
+                    .map(|s| (&s.account, s.account_id)),
+            )
         {
             store.account_ids.entry(login.to_lowercase()).or_insert(id);
         }
+        store.disabled = store
+            .disabled
+            .into_iter()
+            .map(|key| {
+                key.strip_prefix("github.com/")
+                    .unwrap_or(&key)
+                    .to_lowercase()
+            })
+            .collect();
+        store.repo_accounts = store
+            .repo_accounts
+            .into_iter()
+            .map(|(key, names)| {
+                (
+                    key.strip_prefix("github.com/")
+                        .unwrap_or(&key)
+                        .to_lowercase(),
+                    names,
+                )
+            })
+            .collect();
+        store.repo_account_ids = store
+            .repo_account_ids
+            .into_iter()
+            .map(|(key, ids)| {
+                (
+                    key.strip_prefix("github.com/")
+                        .unwrap_or(&key)
+                        .to_lowercase(),
+                    ids,
+                )
+            })
+            .collect();
         store.migrate_account_preferences();
         store.prune_notifications();
         Ok(store)
@@ -239,10 +319,18 @@ impl Store {
         self.known_accounts
             .retain(|name| name == &login || self.account_ids.get(name) != Some(&id));
         self.known_accounts.insert(login.clone());
-        for pr in self.pending.iter_mut().filter(|pr| pr.account_id == id) {
+        for pr in self
+            .pending
+            .iter_mut()
+            .filter(|pr| pr.host == PUBLIC_HOST && pr.account_id == id)
+        {
             pr.account = login.clone();
         }
-        for snooze in self.snoozed.iter_mut().filter(|s| s.account_id == id) {
+        for snooze in self
+            .snoozed
+            .iter_mut()
+            .filter(|s| s.host == PUBLIC_HOST && s.account_id == id)
+        {
             snooze.account = login.clone();
         }
     }
@@ -331,12 +419,13 @@ impl Store {
     }
 
     pub fn visible(&self, pr: &PendingReview) -> bool {
-        !self
-            .unavailable_repos
-            .contains(&(pr.account_id, pr.repo.to_lowercase()))
-            && self.available_accounts.contains(&pr.account.to_lowercase())
-            && self.local_repos.contains(&pr.repo.to_lowercase())
-            && self.monitors(&pr.account, &pr.repo)
+        let key = pr.repository().store_key();
+        self.local_repos.contains(&key)
+            && self.is_enabled(&key)
+            && (pr.host != PUBLIC_HOST
+                || (!self.unavailable_repos.contains(&(pr.account_id, key))
+                    && self.available_accounts.contains(&pr.account.to_lowercase())
+                    && self.monitors(&pr.account, &pr.repo)))
     }
 
     pub fn visible_pending(&self) -> Vec<PendingReview> {
@@ -378,9 +467,10 @@ impl Store {
             return false;
         };
         let snooze = Snooze {
+            host: pr.host.clone(),
             account: pr.account.clone(),
             account_id: key.0,
-            repo: key.1.clone(),
+            repo: pr.repo.to_lowercase(),
             number: key.2,
             until: now + minutes as i64 * 60,
             requested_at: pr.requested_at.clone(),
@@ -425,6 +515,7 @@ impl Store {
             self.discard_notification(&pr.key());
             self.notification_sequence = self.notification_sequence.wrapping_add(1);
             self.notification_queue.push(ReviewNotice {
+                host: pr.host.clone(),
                 account_id: pr.account_id,
                 repo: pr.repo.to_lowercase(),
                 number: pr.number,
@@ -439,14 +530,27 @@ impl Store {
         let reviews = self
             .awake()
             .into_iter()
-            .filter(|pr| accounts.contains(&pr.account_id))
+            .filter(|pr| pr.host == PUBLIC_HOST && accounts.contains(&pr.account_id))
+            .collect::<Vec<_>>();
+        self.queue_notifications(&reviews);
+    }
+
+    pub fn queue_startup_host_notifications(&mut self, hosts: &BTreeSet<String>) {
+        let reviews = self
+            .awake()
+            .into_iter()
+            .filter(|pr| hosts.contains(&pr.host))
             .collect::<Vec<_>>();
         self.queue_notifications(&reviews);
     }
 
     pub fn discard_notification(&mut self, key: &ReviewKey) {
         self.notification_queue.retain(|notice| {
-            (notice.account_id, &notice.repo, notice.number) != (key.0, &key.1, key.2)
+            (
+                notice.account_id,
+                RepositoryId::new(&notice.host, &notice.repo).store_key(),
+                notice.number,
+            ) != *key
         });
     }
 
@@ -465,6 +569,7 @@ impl Store {
             .iter()
             .filter_map(|pr| {
                 if !self.visible(pr)
+                    || (pr.host != PUBLIC_HOST && !self.available_hosts.contains(&pr.host))
                     || self.snooze_for(pr).is_some()
                     || (pr.is_draft && !self.notify_drafts)
                 {
@@ -488,16 +593,38 @@ impl Store {
     /// Replaces the pending list with what GitHub reports now, newest first.
     /// A PR that drops out (reviewed, request removed, closed) is gone, and
     /// so is its snooze.
+    #[cfg(test)]
     pub fn reconcile(
+        &mut self,
+        fetched: Vec<PendingReview>,
+        checked_accounts: &BTreeMap<String, u64>,
+    ) -> Reconciled {
+        self.reconcile_scopes(
+            fetched,
+            checked_accounts,
+            &BTreeSet::new(),
+            &self.local_repos.clone(),
+        )
+    }
+
+    pub fn reconcile_scopes(
         &mut self,
         mut fetched: Vec<PendingReview>,
         checked_accounts: &BTreeMap<String, u64>,
+        successful_hosts: &BTreeSet<String>,
+        watched: &BTreeSet<String>,
     ) -> Reconciled {
+        fetched
+            .retain(|pr| pr.host == PUBLIC_HOST || watched.contains(&pr.repository().store_key()));
         // Failed, disabled, or signed-out accounts retain their own cache.
         fetched.extend(
             self.pending
                 .iter()
                 .filter(|pr| {
+                    if pr.host != PUBLIC_HOST {
+                        return watched.contains(&pr.repository().store_key())
+                            && !successful_hosts.contains(&pr.host);
+                    }
                     self.unavailable_repos
                         .contains(&(pr.account_id, pr.repo.to_lowercase()))
                         || (!checked_accounts.contains_key(&pr.account.to_lowercase())
@@ -529,10 +656,19 @@ impl Store {
         let fresh: Vec<PendingReview> = fetched
             .iter()
             .filter(|pr| match known.get(&pr.key()) {
-                None => checked_accounts.contains_key(&pr.account.to_lowercase()),
+                None => {
+                    if pr.host == PUBLIC_HOST {
+                        checked_accounts.contains_key(&pr.account.to_lowercase())
+                    } else {
+                        successful_hosts.contains(&pr.host)
+                    }
+                }
                 Some(previous) => {
-                    checked_accounts.contains_key(&pr.account.to_lowercase())
-                        && pr.requested_at > *previous
+                    (if pr.host == PUBLIC_HOST {
+                        checked_accounts.contains_key(&pr.account.to_lowercase())
+                    } else {
+                        successful_hosts.contains(&pr.host)
+                    }) && pr.requested_at > *previous
                 }
             })
             .cloned()
@@ -575,7 +711,8 @@ impl Store {
             .into_iter()
             .partition(|s| {
                 s.until <= now
-                    && self.available_accounts.contains(&s.account.to_lowercase())
+                    && (s.host != PUBLIC_HOST
+                        || self.available_accounts.contains(&s.account.to_lowercase()))
                     && !self
                         .unavailable_repos
                         .contains(&(s.account_id, s.repo.to_lowercase()))
@@ -603,6 +740,7 @@ fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PendingReview, Snooze, Store};
+    use crate::repository::default_host;
     use crate::theme::Appearance;
 
     #[test]
@@ -686,6 +824,7 @@ mod tests {
 
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
         PendingReview {
+            host: default_host(),
             account: "alice".into(),
             account_id: 1,
             repo: repo.to_string(),
@@ -701,6 +840,7 @@ mod tests {
 
     fn snooze(repo: &str, number: u64, requested_at: Option<&str>) -> Snooze {
         Snooze {
+            host: default_host(),
             account: "alice".into(),
             account_id: 1,
             repo: repo.to_string(),
@@ -712,6 +852,128 @@ mod tests {
 
     const T1: &str = "2026-01-01T00:00:00Z";
     const T2: &str = "2026-01-02T00:00:00Z";
+
+    #[test]
+    fn enterprise_state_migration_keeps_host_state_and_discards_unowned_public_state() {
+        let mut json = serde_json::to_value(fixture_store()).unwrap();
+        json["disabled"] =
+            serde_json::json!(["github.com/owner/off", "github.example.com/owner/off"]);
+        let mut legacy = json["pending"][0].clone();
+        legacy.as_object_mut().unwrap().remove("account");
+        legacy.as_object_mut().unwrap().remove("account_id");
+        legacy["host"] = serde_json::json!("github.example.com");
+        json["pending"].as_array_mut().unwrap().push(legacy.clone());
+        legacy["host"] = serde_json::json!("github.com");
+        json["pending"].as_array_mut().unwrap().push(legacy);
+        let mut snooze = json["snoozed"][0].clone();
+        snooze.as_object_mut().unwrap().remove("account");
+        snooze.as_object_mut().unwrap().remove("account_id");
+        snooze["host"] = serde_json::json!("github.example.com");
+        json["snoozed"].as_array_mut().unwrap().push(snooze);
+        json["notification_queue"] = serde_json::json!([
+            {"host":"github.example.com","repo":"owner/repo","number":7,"requested_at":"2026-10-07T10:00:00Z","sequence":42},
+            {"repo":"owner/repo","number":7,"requested_at":"2026-10-07T10:00:00Z","sequence":43}
+        ]);
+        let store = Store::from_json(&json.to_string()).unwrap();
+        assert_eq!(store.appearance, Appearance::System);
+        assert_eq!(store.pending.len(), 3);
+        assert_eq!(store.snoozed.len(), 2);
+        assert_eq!(store.notification_queue.len(), 1);
+        assert_eq!(store.notification_queue[0].host, "github.example.com");
+        assert!(!store.is_enabled("owner/off"));
+        assert!(!store.is_enabled("github.example.com/owner/off"));
+        assert!(store.is_enabled("acme.ghe.com/owner/off"));
+        assert_eq!(store.account_ids.len(), 2);
+        let restarted = Store::from_json(&serde_json::to_string(&store).unwrap()).unwrap();
+        assert_eq!(restarted.pending, store.pending);
+        assert_eq!(restarted.snoozed, store.snoozed);
+    }
+
+    #[test]
+    fn chosen_durations_and_unsnooze_are_independent_across_hosts() {
+        let public = pr("owner/repo", 7, Some(T1));
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let cloud = PendingReview {
+            host: "acme.ghe.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store {
+            pending: vec![public.clone(), server.clone(), cloud.clone()],
+            local_repos: [
+                "owner/repo".into(),
+                "github.example.com/owner/repo".into(),
+                "acme.ghe.com/owner/repo".into(),
+            ]
+            .into(),
+            available_accounts: ["alice".into()].into(),
+            ..Store::default()
+        };
+        assert_ne!(public.key(), server.key());
+        assert_ne!(server.key(), cloud.key());
+        assert!(store.snooze(&public.key(), 5, 1000));
+        assert!(store.snooze(&server.key(), 30, 1000));
+        assert!(store.snooze(&cloud.key(), 120, 1000));
+        assert_eq!(store.snooze_for(&public).unwrap().until, 1300);
+        assert_eq!(store.snooze_for(&server).unwrap().until, 2800);
+        store.unsnooze(&public.key());
+        assert_eq!(store.snoozed.len(), 2);
+        assert_eq!(store.take_expired(2800), vec![server]);
+        assert_eq!(store.snooze_for(&cloud).unwrap().until, 8200);
+    }
+
+    #[test]
+    fn failed_hosts_keep_cache_and_snoozes_while_healthy_accounts_reconcile() {
+        let public = pr("owner/repo", 7, Some(T1));
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let cloud = PendingReview {
+            host: "acme.ghe.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store {
+            pending: vec![public.clone(), server.clone(), cloud.clone()],
+            snoozed: vec![Snooze {
+                host: server.host.clone(),
+                ..snooze("owner/repo", 7, Some(T1))
+            }],
+            ..Store::default()
+        };
+        let watched = [
+            "owner/repo".into(),
+            "github.example.com/owner/repo".into(),
+            "acme.ghe.com/owner/repo".into(),
+        ]
+        .into();
+        let new_cloud = PendingReview {
+            requested_at: Some(T2.into()),
+            ..cloud
+        };
+        let changes = store.reconcile_scopes(
+            vec![new_cloud.clone()],
+            &[("alice".into(), 1)].into(),
+            &["acme.ghe.com".into()].into(),
+            &watched,
+        );
+        assert_eq!(changes.fresh, vec![new_cloud]);
+        assert!(store.pending.contains(&server));
+        assert!(!store.pending.contains(&public));
+        assert_eq!(store.snoozed.len(), 1);
+        store.reconcile_scopes(vec![], &Default::default(), &[server.host].into(), &watched);
+        assert!(store.snoozed.is_empty());
+        // Removing a cached Enterprise repo clears it even if that host is down.
+        store.reconcile_scopes(
+            vec![],
+            &Default::default(),
+            &Default::default(),
+            &Default::default(),
+        );
+        assert!(store.pending.is_empty());
+    }
 
     #[test]
     fn independent_durations_survive_restart_and_expire_in_deadline_order() {
