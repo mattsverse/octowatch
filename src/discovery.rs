@@ -222,7 +222,7 @@ impl Scanner<'_> {
         }
         self.visited.insert(identity.to_path_buf(), depth);
         let git = dir.join(".git");
-        match fs::metadata(&git) {
+        match fs::symlink_metadata(&git) {
             Ok(_) => {
                 match checkout_config(&git).and_then(|config| {
                     self.configs
@@ -283,15 +283,18 @@ impl Scanner<'_> {
     }
 }
 
-/// Read only bounded, regular metadata files: a bad gitfile cannot cause a
-/// blocking FIFO read, unbounded allocation, or recursive pointer traversal.
-fn read_metadata(path: &Path, limit: u64) -> std::io::Result<String> {
-    use std::io::Read;
+fn open_metadata(path: &Path) -> std::io::Result<fs::File> {
     if !fs::metadata(path)?.is_file() {
         return Err(std::io::Error::other("metadata is not a regular file"));
     }
+    fs::File::open(path)
+}
+
+/// Bound small path-pointer files; do not follow recursive pointer chains.
+fn read_metadata(path: &Path, limit: u64) -> std::io::Result<String> {
+    use std::io::Read;
     let mut contents = String::new();
-    fs::File::open(path)?
+    open_metadata(path)?
         .take(limit + 1)
         .read_to_string(&mut contents)?;
     if contents.len() as u64 > limit {
@@ -324,8 +327,12 @@ fn checkout_config(git: &Path) -> Result<PathBuf, String> {
         metadata_path(git.parent().ok_or("missing checkout directory")?, target)?
     };
     let common_file = git_dir.join("commondir");
-    let common = match read_metadata(&common_file, 64 * 1024) {
-        Ok(contents) => metadata_path(&git_dir, &contents)?,
+    let common = match fs::symlink_metadata(&common_file) {
+        Ok(_) => {
+            let contents = read_metadata(&common_file, 64 * 1024)
+                .map_err(|err| format!("{}: {err}", common_file.display()))?;
+            metadata_path(&git_dir, &contents)?
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => git_dir,
         Err(err) => return Err(format!("{}: {err}", common_file.display())),
     };
@@ -371,14 +378,21 @@ fn ssh_aliases_for_github(config: &str) -> Vec<String> {
 }
 
 fn github_slugs(config: &Path, hosts: &[String]) -> std::io::Result<Vec<String>> {
-    let contents = read_metadata(config, 1024 * 1024)?;
-    let mut slugs: Vec<String> = contents
-        .lines()
-        .filter_map(|line| {
-            let (key, value) = line.trim().split_once('=')?;
-            (key.trim() == "url").then(|| parse_github_url(value.trim(), hosts))?
-        })
-        .collect();
+    use std::io::{BufRead, BufReader};
+    // Large valid configs remain supported without allocating the entire file.
+    let reader = BufReader::new(open_metadata(config)?);
+    let mut slugs = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        if key.trim() == "url"
+            && let Some(slug) = parse_github_url(value.trim(), hosts)
+        {
+            slugs.push(slug);
+        }
+    }
     slugs.sort_by_key(|slug| slug.to_lowercase());
     slugs.dedup_by_key(|slug| slug.to_lowercase());
     Ok(slugs)
@@ -734,6 +748,103 @@ mod tests {
         assert!(!failed.issues.is_empty());
         fs::rename(f.path("unmounted"), &root).unwrap();
         assert!(discover(&[alias]).issues.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_regression_unavailable_git_symlink_preserves_saved_snooze() {
+        use crate::store::{PendingReview, Snooze, Store};
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        let clone = f.checkout("watched/clone", &["git@github.com:o/r.git"]);
+        let root = f.path("watched");
+        let metadata = f.path("external-metadata");
+        fs::rename(clone.join(".git"), &metadata).unwrap();
+        symlink(&metadata, clone.join(".git")).unwrap();
+        let previous = discover(std::slice::from_ref(&root)).repos;
+        assert_eq!(previous.len(), 1);
+        let mut store = Store {
+            pending: vec![PendingReview {
+                repo: "o/r".into(),
+                number: 1,
+                title: "review".into(),
+                url: "https://github.com/o/r/pull/1".into(),
+                author: "reviewer".into(),
+                is_draft: false,
+                rereview: false,
+                requested_at: None,
+            }],
+            snoozed: vec![Snooze {
+                repo: "o/r".into(),
+                number: 1,
+                until: 100,
+                requested_at: None,
+            }],
+            ..Store::default()
+        };
+        fs::rename(&metadata, f.path("offline")).unwrap();
+        let mut scan = discover(std::slice::from_ref(&root));
+        scan.retain_unavailable(&previous);
+        let watched = scan
+            .repos
+            .iter()
+            .map(|repo| repo.slug.to_lowercase())
+            .collect();
+        store.retain_watched(&watched);
+        assert_eq!(
+            store.snoozed.len(),
+            1,
+            "unavailable metadata must not discard a saved snooze"
+        );
+        assert_eq!(store.pending.len(), 1);
+        assert_eq!(scan.repos, previous);
+        assert_eq!(scan.issues[0].path, clone);
+        fs::rename(f.path("offline"), &metadata).unwrap();
+        let recovered = discover(&[root]);
+        assert!(recovered.issues.is_empty());
+        assert_eq!(recovered.repos, previous);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unavailable_common_dir_symlink_does_not_fall_back_to_private_config() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        let clone = f.checkout("watched/clone", &["git@github.com:o/private.git"]);
+        let common = f.path("common");
+        fs::create_dir(&common).unwrap();
+        write_remotes(&common.join("config"), &["git@github.com:o/shared.git"]);
+        let pointer = f.path("common-pointer");
+        fs::write(&pointer, common.to_str().unwrap()).unwrap();
+        symlink(&pointer, clone.join(".git/commondir")).unwrap();
+        let root = f.path("watched");
+        let previous = discover(std::slice::from_ref(&root)).repos;
+        assert_eq!(previous[0].slug, "o/shared");
+        fs::rename(&pointer, f.path("offline-pointer")).unwrap();
+        let mut scan = discover(std::slice::from_ref(&root));
+        scan.retain_unavailable(&previous);
+        assert_eq!(scan.repos, previous);
+        assert_eq!(scan.issues[0].path, clone);
+        fs::rename(f.path("offline-pointer"), &pointer).unwrap();
+        assert!(discover(&[root]).issues.is_empty());
+    }
+
+    #[test]
+    fn review_regression_valid_config_larger_than_one_mib_is_discovered() {
+        let f = Fixture::new();
+        let clone = f.checkout("clone", &[]);
+        let mut contents = "# valid padding comment\n".repeat(50_000);
+        contents.push_str("[remote \"origin\"]\nurl = https://github.com/o/large.git\n");
+        assert!(contents.len() > 1024 * 1024);
+        fs::write(clone.join(".git/config"), contents).unwrap();
+        let scan = discover(&[f.0.clone()]);
+        assert_eq!(
+            scan.repos.len(),
+            1,
+            "valid configs must not be excluded by their total size"
+        );
+        assert_eq!(scan.repos[0].slug, "o/large");
+        assert!(scan.issues.is_empty());
     }
 
     #[test]

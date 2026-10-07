@@ -70,7 +70,7 @@ This tab lists the pull requests waiting on you, most recent request first. Clic
 
 ### Repositories
 
-**Watched folders** are the folders Octowatcher scans for clones. The first time you launch it, it watches `~/Dev` if that folder exists, and your home folder otherwise. Use **Add folder…** and **Remove** to change the list. Octowatcher rescans in the background before every GitHub check (every 2 minutes by default). **Refresh** and **Rescan** both scan immediately and then check GitHub. New, moved or removed checkouts and changes to their remotes appear on the next scan.
+**Watched folders** are the folders Octowatcher scans for clones. The first time you launch it, it watches `~/Dev` if that folder exists, and your home folder otherwise. Use **Add folder…** and **Remove** to change the list. Octowatcher rescans in the background before every GitHub check (every 2 minutes by default). **Refresh** and **Rescan** both scan immediately and then check GitHub. New, moved or removed checkouts and changes to their remotes appear on the next scan. Requests received during an active scan or GitHub check trigger one follow-up, so a manual refresh is not lost behind work already running.
 
 The scan goes up to five levels deep. It skips hidden folders and `node_modules`, `target`, `vendor`, `build`, `dist` and `Library`. It stops at each checkout rather than scanning inside it, and does not follow directory symlinks. A folder added explicitly is scanned even if its name is normally skipped.
 

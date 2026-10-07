@@ -1,6 +1,7 @@
 mod discovery;
 mod github;
 mod notifications;
+mod refresh_queue;
 mod store;
 mod tray;
 mod updater;
@@ -78,6 +79,7 @@ struct Octowatcher {
     tray: Option<Tray>,
     update: Option<Update>,
     scan_task: Option<Task<()>>,
+    refresh_queue: refresh_queue::RefreshQueue,
     fetch_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     /// Fires when the earliest snooze runs out.
@@ -149,6 +151,7 @@ impl Octowatcher {
             tray,
             update: None,
             scan_task: None,
+            refresh_queue: refresh_queue::RefreshQueue::default(),
             fetch_task: None,
             poll_task: None,
             wake_task: None,
@@ -242,9 +245,9 @@ impl Octowatcher {
     }
 
     /// Rediscovers local checkouts off the UI thread, then checks GitHub.
-    /// Repeated requests coalesce; changed roots are rescanned before applying.
+    /// Requests received during a scan coalesce into one follow-up snapshot.
     fn rescan(&mut self, cx: &mut Context<Self>) {
-        if self.scan_task.is_some() {
+        if !self.refresh_queue.request_scan(self.scan_task.is_some()) {
             return;
         }
         let roots = self.store.roots.clone();
@@ -262,7 +265,7 @@ impl Octowatcher {
                 .await;
             this.update(cx, |this, cx| {
                 this.scan_task = None;
-                if roots != this.store.roots {
+                if this.refresh_queue.scan_finished(roots != this.store.roots) {
                     this.rescan(cx);
                     return;
                 }
@@ -297,7 +300,7 @@ impl Octowatcher {
     }
 
     fn fetch_reviews(&mut self, cx: &mut Context<Self>) {
-        if self.repos.is_none() || self.fetch_task.is_some() {
+        if self.repos.is_none() || !self.refresh_queue.request_fetch(self.fetch_task.is_some()) {
             return;
         }
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
@@ -307,6 +310,13 @@ impl Octowatcher {
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
+                let fetch_again = this.refresh_queue.fetch_finished(this.scan_task.is_some());
+                if fetch_again {
+                    // Discard the older result, including errors. This requested
+                    // check must run after it, without overlapping subprocesses.
+                    this.fetch_reviews(cx);
+                    return;
+                }
                 // A scan in progress may invalidate the filtering list. Its
                 // completion starts a fresh fetch; do not announce stale repos.
                 if this.scan_task.is_some() {
