@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.2](https://github.com/mattsverse/octowatch/compare/v0.4.1...v0.4.2) (2026-10-07)
+
+
+### Bug Fixes
+
+* deliver macOS notifications through the async UserNotifications API ([ec2e5f4](https://github.com/mattsverse/octowatch/commit/ec2e5f4d61d0cc27a079bdbd44cc91d5b2b3164a))
+* keep tray and save errors visible after a successful check ([38d7abd](https://github.com/mattsverse/octowatch/commit/38d7abd3a6ab69fbb747fffc51f9a5b380876a45))
+* keep tray and save errors visible after a successful check ([1bdd3f3](https://github.com/mattsverse/octowatch/commit/1bdd3f346b1bf3d5a3072efa30550bf3cdb17305))
+
 ## [0.4.1](https://github.com/mattsverse/octowatch/compare/v0.4.0...v0.4.1) (2026-10-06)
 
 
