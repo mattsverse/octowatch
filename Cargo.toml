@@ -13,12 +13,17 @@ async-channel = "2.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 gpui = "0.2.2"
-notify-rust = { version = "4.18", features = ["preview-macos-un"] }
 png = "0.18"
 semver = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 tray-icon = "0.26"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-usernotifications = "0.3.1"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify-rust = "4.18"
 
 [package.metadata.bundle]
 name = "Octowatcher"

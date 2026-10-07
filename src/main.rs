@@ -1,5 +1,6 @@
 mod discovery;
 mod github;
+mod notifications;
 mod store;
 mod tray;
 mod updater;
@@ -14,6 +15,7 @@ use gpui::{
 };
 
 use discovery::LocalRepo;
+use notifications::Response;
 use store::{PendingReview, Snooze, Store};
 use tray::{Tray, UpdateItem};
 use updater::Release;
@@ -65,8 +67,11 @@ struct Octowatcher {
     tab: Tab,
     last_checked: Option<DateTime<Local>>,
     error: Option<String>,
-    /// Kept separately so a successful GitHub check doesn't hide permission errors.
+    /// Kept separately so a successful GitHub check doesn't hide permission
+    /// or delivery errors.
     notification_error: Option<String>,
+    /// Whether the reviews waiting at launch were announced yet.
+    announced_launch: bool,
     tray: Option<Tray>,
     update: Option<Update>,
     scan_task: Option<Task<()>>,
@@ -85,13 +90,13 @@ impl Octowatcher {
             // Ask without blocking the UI, before any background notification
             // can be sent. macOS only prompts when permission is undecided.
             #[cfg(target_os = "macos")]
-            let notification_error = match notify_rust::request_auth().await {
+            let notification_error = match notifications::request_auth().await {
                 Ok(true) => None,
                 Ok(false) => Some(
                     "Notifications are disabled. Enable Allow Notifications for Octowatcher in System Settings → Notifications."
                         .into(),
                 ),
-                Err(err) => Some(format!("could not request notification permission: {err:#}")),
+                Err(err) => Some(format!("could not request notification permission: {err}")),
             };
             if this
                 .update(cx, |this, cx| {
@@ -134,6 +139,7 @@ impl Octowatcher {
             last_checked: None,
             error,
             notification_error: None,
+            announced_launch: false,
             tray,
             update: None,
             scan_task: None,
@@ -291,6 +297,7 @@ impl Octowatcher {
     /// Replaces the pending list with what GitHub reports now, keeping only
     /// enabled local repos. A PR that drops out (reviewed, request removed,
     /// closed) is gone; one seen for the first time raises a notification.
+    /// The first check after launch announces everything waiting instead.
     fn reconcile(&mut self, fetched: Vec<PendingReview>, cx: &mut Context<Self>) {
         let watched = self.watched_slugs();
         let mut fetched: Vec<PendingReview> = fetched
@@ -333,7 +340,67 @@ impl Octowatcher {
         if snoozes_changed {
             self.snoozes_changed(cx);
         }
-        self.notify(fresh, cx);
+        if self.announced_launch {
+            self.notify(fresh, cx);
+        } else {
+            self.announced_launch = true;
+            self.announce_waiting(cx);
+        }
+    }
+
+    /// Notifies about every review waiting and not snoozed, as a count.
+    fn announce_waiting(&mut self, cx: &mut Context<Self>) {
+        let awake = self.store.awake();
+        let summary = match awake.len() {
+            0 => return,
+            1 => "You have 1 pending review".to_string(),
+            n => format!("You have {n} pending reviews"),
+        };
+        let body = match awake.as_slice() {
+            [pr] => format!("{}#{}: {}", pr.repo, pr.number, pr.title),
+            many => pr_list(many),
+        };
+        self.show_notification(summary, body, None, cx, |_, _, _| {});
+    }
+
+    fn send_test_notification(&mut self, cx: &mut Context<Self>) {
+        self.show_notification(
+            "Notifications work".into(),
+            "Octowatcher will tell you here when a review is requested.".into(),
+            None,
+            cx,
+            |_, _, _| {},
+        );
+    }
+
+    /// Shows a notification, then hands what the user did with it to
+    /// `respond`. A failure to show it stays on screen until one succeeds.
+    fn show_notification(
+        &mut self,
+        summary: String,
+        body: String,
+        action: Option<notifications::Action>,
+        cx: &mut Context<Self>,
+        respond: impl FnOnce(&mut Self, Response, &mut Context<Self>) + 'static,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let shown = notifications::show(&summary, &body, action).await;
+            this.update(cx, |this, cx| {
+                match shown {
+                    Ok(response) => {
+                        this.notification_error = None;
+                        respond(this, response, cx);
+                    }
+                    Err(err) => {
+                        this.notification_error =
+                            Some(format!("could not send notification: {err}"));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Notifies about reviews to do. A single one gets a button to snooze it.
@@ -346,43 +413,14 @@ impl Octowatcher {
             _ => None,
         };
         let (summary, body) = notification_text(&prs);
-        let snoozable = key.is_some();
-        let (tx, rx) = async_channel::bounded(1);
-        // Waiting on the click blocks until the user acts, which may be never,
-        // so it gets a thread of its own rather than one of the executor's.
-        std::thread::spawn(move || {
-            let mut notification = notify_rust::Notification::new();
-            notification.summary(&summary).body(&body);
-            if snoozable {
-                notification.action("snooze", "Snooze");
-            }
-            match notification.show() {
-                Ok(handle) if snoozable => handle.wait_for_action(|clicked| {
-                    tx.send_blocking(Ok(clicked.to_string())).ok();
-                }),
-                Ok(_) => {}
-                Err(err) => {
-                    tx.send_blocking(Err(format!("{err:#}"))).ok();
-                }
+        let action = key.is_some().then_some(("snooze", "Snooze"));
+        self.show_notification(summary, body, action, cx, move |this, response, cx| {
+            if response == Response::Action("snooze".into())
+                && let Some(key) = key
+            {
+                this.snooze(key, cx);
             }
         });
-        cx.spawn(async move |this, cx| {
-            let Ok(clicked) = rx.recv().await else { return };
-            this.update(cx, |this, cx| match clicked {
-                Ok(action) if action == "snooze" => {
-                    if let Some(key) = key {
-                        this.snooze(key, cx);
-                    }
-                }
-                Ok(_) => {}
-                Err(err) => {
-                    this.error = Some(format!("could not send notification: {err}"));
-                    cx.notify();
-                }
-            })
-            .ok();
-        })
-        .detach();
     }
 
     fn watched_slugs(&self) -> HashSet<String> {
@@ -576,33 +614,14 @@ impl Octowatcher {
         };
         let summary = format!("Octowatcher {} is available", release.version);
         let url = release.url.clone();
-        let (tx, rx) = async_channel::bounded(1);
-        // Waiting on the click blocks until the user acts, which may be never,
-        // so it gets a thread of its own rather than one of the executor's.
-        std::thread::spawn(move || {
-            let shown = notify_rust::Notification::new()
-                .summary(&summary)
-                .body(body)
-                .action(action.0, action.1)
-                .show();
-            match shown {
-                Ok(handle) => handle.wait_for_action(|clicked| {
-                    tx.send_blocking(clicked.to_string()).ok();
-                }),
-                Err(err) => eprintln!("could not send notification: {err:#}"),
+        self.show_notification(summary, body.into(), Some(action), cx, move |this, response, cx| {
+            match response {
+                Response::Action(id) if id == "update" => this.install_update(cx),
+                Response::Action(id) if id == "download" => cx.open_url(&url),
+                Response::Clicked => show_window(cx),
+                _ => {}
             }
         });
-        cx.spawn(async move |this, cx| {
-            let Ok(clicked) = rx.recv().await else { return };
-            match clicked.as_str() {
-                "update" => this.update(cx, |this, cx| this.install_update(cx)).ok(),
-                "download" => cx.update(|cx| cx.open_url(&url)).ok(),
-                // A click on the notification itself.
-                "default" => cx.update(show_window).ok(),
-                _ => None,
-            };
-        })
-        .detach();
     }
 
     /// Swaps in the available update, then offers to restart into it.
@@ -693,12 +712,16 @@ fn notification_text(prs: &[PendingReview]) -> (String, String) {
         ),
         many => (
             format!("{} pull requests need your review", many.len()),
-            many.iter()
-                .map(|pr| format!("{}#{}", pr.repo, pr.number))
-                .collect::<Vec<_>>()
-                .join(", "),
+            pr_list(many),
         ),
     }
+}
+
+fn pr_list(prs: &[PendingReview]) -> String {
+    prs.iter()
+        .map(|pr| format!("{}#{}", pr.repo, pr.number))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl Render for Octowatcher {
@@ -1075,6 +1098,22 @@ impl Octowatcher {
                 Self::set_snooze_minutes,
                 cx,
             ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("Notifications"))
+                    .child(
+                        div().flex().child(
+                            button("test-notification", "Send test notification").on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.send_test_notification(cx)
+                                }),
+                            ),
+                        ),
+                    ),
+            )
     }
 
     /// A row of minute lengths to pick one from.
