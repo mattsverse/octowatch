@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -174,6 +174,33 @@ impl Store {
         }
     }
 
+    /// Replace only complete repository snapshots, retaining failed repos and
+    /// their snoozes. Repositories no longer watched still leave the queue.
+    pub fn reconcile_repositories(
+        &mut self,
+        fetched: Vec<PendingReview>,
+        completed: &HashSet<String>,
+        watched: &HashSet<String>,
+    ) -> Reconciled {
+        let mut pending: Vec<_> = fetched
+            .into_iter()
+            .filter(|pr| {
+                let repo = pr.repo.to_lowercase();
+                watched.contains(&repo) && completed.contains(&repo)
+            })
+            .collect();
+        pending.extend(
+            self.pending
+                .iter()
+                .filter(|pr| {
+                    let repo = pr.repo.to_lowercase();
+                    watched.contains(&repo) && !completed.contains(&repo)
+                })
+                .cloned(),
+        );
+        self.reconcile(pending)
+    }
+
     /// Ends every snooze that ran out by `now`, and returns the pending
     /// reviews they hid.
     pub fn take_expired(&mut self, now: i64) -> Vec<PendingReview> {
@@ -199,6 +226,8 @@ fn default_roots() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::{PendingReview, Snooze, Store};
 
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
@@ -366,6 +395,87 @@ mod tests {
             pr("Owner/Repo", 7, None).key(),
             ("owner/repo".to_string(), 7)
         );
+    }
+
+    #[test]
+    fn failed_repos_keep_requests_and_snoozes_while_complete_repos_update() {
+        let mut store = Store {
+            pending: vec![pr("o/failed", 1, Some(T1)), pr("o/good", 2, Some(T1))],
+            snoozed: vec![
+                snooze("o/failed", 1, Some(T1)),
+                snooze("o/good", 2, Some(T1)),
+            ],
+            ..Store::default()
+        };
+        let watched = HashSet::from(["o/failed".into(), "o/good".into()]);
+        // A partial fetch from the failed repository cannot overwrite it.
+        let result = store.reconcile_repositories(
+            vec![pr("o/failed", 1, Some(T2)), pr("o/good", 3, Some(T2))],
+            &HashSet::from(["o/good".into()]),
+            &watched,
+        );
+        assert_eq!(
+            store.pending,
+            vec![pr("o/good", 3, Some(T2)), pr("o/failed", 1, Some(T1))]
+        );
+        assert_eq!(result.fresh, vec![pr("o/good", 3, Some(T2))]);
+        assert_eq!(store.snoozed, vec![snooze("o/failed", 1, Some(T1))]);
+
+        // Once the failed repo succeeds, a later request ends its snooze.
+        let result = store.reconcile_repositories(
+            vec![pr("o/failed", 1, Some(T2)), pr("o/good", 3, Some(T2))],
+            &watched,
+            &watched,
+        );
+        assert_eq!(result.fresh, vec![pr("o/failed", 1, Some(T2))]);
+        assert!(store.snoozed.is_empty());
+        // A complete empty response clears requests after review, withdrawal
+        // or closure, and won't preserve old state as though it were an error.
+        store.reconcile_repositories(vec![], &watched, &watched);
+        assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn failed_check_keeps_watched_state_but_removed_repos_leave_queue() {
+        let mut store = Store {
+            pending: vec![pr("o/failed", 1, Some(T1)), pr("o/off", 2, Some(T1))],
+            snoozed: vec![
+                snooze("o/failed", 1, Some(T1)),
+                snooze("o/off", 2, Some(T1)),
+            ],
+            ..Store::default()
+        };
+        let result = store.reconcile_repositories(
+            vec![],
+            &HashSet::new(),
+            &HashSet::from(["o/failed".into()]),
+        );
+        assert!(result.fresh.is_empty());
+        assert_eq!(store.pending, vec![pr("o/failed", 1, Some(T1))]);
+        assert_eq!(store.snoozed, vec![snooze("o/failed", 1, Some(T1))]);
+        let result = store.reconcile_repositories(
+            vec![],
+            &HashSet::new(),
+            &HashSet::from(["o/failed".into()]),
+        );
+        assert!(!result.pending_changed);
+        assert!(!result.snoozes_changed);
+        assert!(result.fresh.is_empty());
+    }
+
+    #[test]
+    fn existing_state_format_remains_compatible() {
+        let old = serde_json::json!({
+            "pending": [pr("o/r", 1, Some(T1))],
+            "snoozed": [snooze("o/r", 1, Some(T1))]
+        });
+        let mut store: Store = serde_json::from_value(old).unwrap();
+        assert_eq!(store.poll_minutes, 2);
+        let result =
+            store.reconcile_repositories(vec![], &HashSet::new(), &HashSet::from(["o/r".into()]));
+        assert!(!result.pending_changed);
+        assert!(!result.snoozes_changed);
+        assert_eq!(store.pending[0].requested_at.as_deref(), Some(T1));
     }
 
     #[test]

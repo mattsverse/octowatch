@@ -260,21 +260,23 @@ impl Octowatcher {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        // Filtering needs the repo list, and the scan refreshes once it's done.
+        // Scope the API request to enabled local repos after discovery finishes.
         if self.repos.is_none() || self.fetch_task.is_some() {
             return;
         }
+        let watched = self.watched_slugs();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { github::fetch_awaiting_reviews() })
+                .spawn(async move { github::fetch_awaiting_reviews(&watched) })
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
                 this.last_checked = Some(Local::now());
                 match result {
                     Ok(fetched) => {
-                        this.fetch_error = None;
+                        this.fetch_error =
+                            (!fetched.errors.is_empty()).then(|| fetched.errors.join("\n"));
                         this.reconcile(fetched, cx);
                     }
                     Err(err) => this.fetch_error = Some(format!("{err:#}")),
@@ -287,16 +289,15 @@ impl Octowatcher {
     }
 
     /// Replaces the pending list with what GitHub reports now, keeping only
-    /// enabled local repos. A PR that drops out (reviewed, request removed,
-    /// closed) is gone; one seen for the first time raises a notification.
+    /// enabled local repos. Complete snapshots remove reviewed, withdrawn or
+    /// closed requests; failed repos keep their saved queue and snoozes.
+    /// A request seen for the first time raises a notification.
     /// The first check after launch announces everything waiting instead.
-    fn reconcile(&mut self, fetched: Vec<PendingReview>, cx: &mut Context<Self>) {
+    fn reconcile(&mut self, fetched: github::FetchedReviews, cx: &mut Context<Self>) {
         let watched = self.watched_slugs();
-        let fetched: Vec<PendingReview> = fetched
-            .into_iter()
-            .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
-            .collect();
-        let reconciled = self.store.reconcile(fetched);
+        let reconciled =
+            self.store
+                .reconcile_repositories(fetched.pending, &fetched.completed_repos, &watched);
         // Saving the snoozes also saves the pending list.
         if reconciled.snoozes_changed {
             self.snoozes_changed(cx);
@@ -306,7 +307,7 @@ impl Octowatcher {
         }
         if self.announced_launch {
             self.notify(reconciled.fresh, cx);
-        } else {
+        } else if !fetched.completed_repos.is_empty() || watched.is_empty() {
             self.announced_launch = true;
             self.announce_waiting(cx);
         }

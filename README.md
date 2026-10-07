@@ -8,7 +8,8 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 
 - **Uses the repositories you already have.** Octowatcher scans folders such as `~/Dev` for git clones with a GitHub remote, so you only hear about the repositories you work on. You can switch any of them off.
 - **Notifies you about new requests only.** You get one notification when a review is requested, and another if you are asked to re-review after you've already left a review. A pull request leaves the list once you review it, the request is withdrawn, or the PR is closed.
-- **Includes team requests.** It counts requests made to a team you belong to. The request clears once you review, even if the rest of the team hasn't.
+- **Includes team requests.** It checks membership for each requested team, including child-team membership. The request clears once you submit a review, even if the rest of the team hasn't. A later request to you or a team you belong to brings it back; requests to unrelated teams don't.
+- **Checks the whole queue.** It checks enabled local repositories directly and follows every page of open pull requests, requested reviewers and review history. Reviews from other repositories can't crowd yours out of a global search, and requests older than the latest 20 history events still count.
 - **Snoozes a review for later.** Snooze a pull request from its notification or from the window. It leaves the tray until the snooze runs out, then notifies you again. A new review request on it ends the snooze early.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
@@ -66,6 +67,10 @@ The window has three tabs.
 
 This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
 
+If GitHub can't completely check a repository, Octowatcher shows the error and keeps that repository's saved reviews and snoozes until a complete check succeeds. Other repositories continue updating. The saved list may be out of date while an error is shown. Large repositories or long review histories take more API requests to check; GitHub rate-limit errors also preserve the saved list.
+
+If a team request and your review have exactly the same timestamp, the request stays visible: Octowatcher can't prove which happened first.
+
 **Snooze** hides a pull request from the tray for the snooze length set in Settings. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new notification about a single pull request also has a **Snooze** button. One that covers several pull requests doesn't. Snoozes survive a restart.
 
 ### Repositories
@@ -104,6 +109,7 @@ Delete this file to reset Octowatcher. Everything it sends to GitHub goes throug
 - **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then restart the app.
 - **"could not run `gh`; is the GitHub CLI installed?"**: install the GitHub CLI, or put it in one of the folders listed under [Requirements](#requirements).
 - **"gh api failed: …"**: run `gh auth status` in a terminal, and `gh auth login` if you're logged out.
+- **A team membership check fails**: make sure your GitHub CLI login can read the organization's teams. For a normal OAuth CLI login, `gh auth refresh -h github.com -s read:org` can grant the required scope; organizations using SAML SSO may also require authorizing the login for that organization.
 - **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. Then click **Rescan**.
 - **No tray icon on Linux**: GNOME needs an AppIndicator extension, such as *AppIndicator and KStatusNotifierItem Support*, before it shows tray icons.
 
