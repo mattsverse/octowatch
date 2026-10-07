@@ -5,7 +5,10 @@ use std::{
     rc::Rc,
 };
 
-use crate::store::{PendingReview, Store};
+use crate::{
+    repository::RepositoryId,
+    store::{PendingReview, Store},
+};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DraftFilter {
@@ -35,7 +38,7 @@ pub enum SnoozeFilter {
 pub struct ReviewFilters {
     pub query: String,
     /// An exact owner/repository selection, independent of watched repositories.
-    pub repository: Option<String>,
+    pub repository: Option<RepositoryId>,
     pub draft: DraftFilter,
     pub review: ReviewFilter,
     pub snooze: SnoozeFilter,
@@ -64,7 +67,7 @@ impl SearchTerm {
 /// a query scans these values without allocating lowercase strings per PR.
 struct SearchableReview {
     fields: [String; 4],
-    key: (String, u64),
+    key: (RepositoryId, u64),
     draft: bool,
     rereview: bool,
 }
@@ -74,7 +77,7 @@ impl From<&PendingReview> for SearchableReview {
         Self {
             fields: [
                 pr.title.to_lowercase(),
-                pr.repo.to_lowercase(),
+                pr.repo_label().to_lowercase(),
                 pr.author.to_lowercase(),
                 pr.number.to_string(),
             ],
@@ -89,8 +92,8 @@ impl From<&PendingReview> for SearchableReview {
 /// inputs; filter comparisons are cheap and automatic. No monitoring uses it.
 pub struct ReviewFilterCache {
     reviews: Vec<SearchableReview>,
-    repositories: BTreeMap<String, String>,
-    snoozed: HashSet<(String, u64)>,
+    repositories: BTreeMap<RepositoryId, String>,
+    snoozed: HashSet<(RepositoryId, u64)>,
     filters: Option<ReviewFilters>,
     visible: Rc<Vec<usize>>,
     reviews_dirty: bool,
@@ -130,8 +133,8 @@ impl ReviewFilterCache {
             self.repositories.clear();
             for pr in &store.pending {
                 self.repositories
-                    .entry(pr.repo.to_lowercase())
-                    .or_insert_with(|| pr.repo.clone());
+                    .entry(pr.repository())
+                    .or_insert_with(|| pr.repo_label());
             }
         }
         if self.snoozes_dirty {
@@ -151,7 +154,7 @@ impl ReviewFilterCache {
                     let matches = filters
                         .repository
                         .as_ref()
-                        .is_none_or(|repo| repo.eq_ignore_ascii_case(&pr.fields[1]))
+                        .is_none_or(|repo| repo == &pr.key.0)
                         && match filters.draft {
                             DraftFilter::All => true,
                             DraftFilter::Ready => !pr.draft,
@@ -189,14 +192,14 @@ impl ReviewFilterCache {
 
     /// Choices use the whole queue, retaining a selected repo after its last
     /// review leaves. This does not configure watched repositories.
-    pub fn repositories(&self, filters: &ReviewFilters) -> Vec<String> {
+    pub fn repositories(&self, filters: &ReviewFilters) -> Vec<(RepositoryId, String)> {
         let mut repos = self.repositories.clone();
         if let Some(repo) = &filters.repository {
             repos
-                .entry(repo.to_lowercase())
-                .or_insert_with(|| repo.clone());
+                .entry(repo.clone())
+                .or_insert_with(|| repo.to_string());
         }
-        repos.into_values().collect()
+        repos.into_iter().collect()
     }
 }
 
@@ -211,7 +214,11 @@ impl ReviewFilters {
     fn repositories(&self, store: &Store) -> Vec<String> {
         let mut cache = ReviewFilterCache::default();
         cache.refresh(store, self);
-        cache.repositories(self)
+        cache
+            .repositories(self)
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect()
     }
 }
 
@@ -229,6 +236,7 @@ mod tests {
         rereview: bool,
     ) -> PendingReview {
         PendingReview {
+            host: "github.com".into(),
             repo: repo.into(),
             number,
             title: title.into(),
@@ -249,6 +257,7 @@ mod tests {
                 pr("Other/Web", 8, "Login polish", "Chloé", true, false),
             ],
             snoozed: vec![Snooze {
+                host: "github.com".into(),
                 repo: "acme/api".into(),
                 number: 1234,
                 until: 200,
@@ -256,6 +265,42 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn search_repository_and_snooze_filters_keep_host_collisions_separate() {
+        let public = pr("Acme/API", 1, "Fix login", "Alice", false, false);
+        let enterprise = PendingReview {
+            host: "ghe.example.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store {
+            pending: vec![public.clone(), enterprise.clone()],
+            ..Default::default()
+        };
+        assert!(store.snooze(&public.key(), 5, 0));
+        let mut filters = ReviewFilters {
+            query: "ACME ALICE #1".into(),
+            ..Default::default()
+        };
+        assert_eq!(filters.visible_indices(&store), vec![0, 1]);
+        filters.query = "GHE.EXAMPLE.COM acme #1".into();
+        assert_eq!(filters.visible_indices(&store), vec![1]);
+        filters.query = "#1".into();
+        filters.repository = Some(RepositoryId::new("GHE.EXAMPLE.COM", "ACME/API"));
+        filters.snooze = SnoozeFilter::Awake;
+        assert_eq!(filters.visible_indices(&store), vec![1]);
+        filters.snooze = SnoozeFilter::Snoozed;
+        assert!(filters.visible_indices(&store).is_empty());
+        filters.repository = Some(public.repository());
+        assert_eq!(filters.visible_indices(&store), vec![0]);
+        filters.snooze = SnoozeFilter::Awake;
+        assert!(filters.visible_indices(&store).is_empty());
+        assert_eq!(store.awake(), vec![enterprise]);
+        assert_eq!(
+            filters.repositories(&store),
+            vec!["ghe.example.com/Acme/API", "github.com/Acme/API"]
+        );
     }
 
     #[test]
@@ -297,14 +342,29 @@ mod tests {
         assert!(cache.refresh(&store, &filters));
         assert_eq!(*cache.visible_indices(), vec![1, 2]);
         assert_eq!(
-            cache.repositories(&filters),
-            vec!["Acme/API", "New/Repo", "Other/Web"]
+            cache
+                .repositories(&filters)
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>(),
+            vec![
+                "github.com/Acme/API",
+                "github.com/New/Repo",
+                "github.com/Other/Web"
+            ]
         );
         store.pending.retain(|pr| !pr.repo.starts_with("New/"));
         cache.invalidate_reviews();
         cache.refresh(&store, &filters);
         assert_eq!(*cache.visible_indices(), vec![1]);
-        assert_eq!(cache.repositories(&filters), vec!["Acme/API", "Other/Web"]);
+        assert_eq!(
+            cache
+                .repositories(&filters)
+                .into_iter()
+                .map(|(_, label)| label)
+                .collect::<Vec<_>>(),
+            vec!["github.com/Acme/API", "github.com/Other/Web"]
+        );
     }
 
     #[test]
@@ -435,7 +495,7 @@ mod tests {
     fn search_and_independent_filters_are_intersections() {
         let mut filters = ReviewFilters {
             query: "LOGIN bob".into(),
-            repository: Some("ACME/api".into()),
+            repository: Some(RepositoryId::new("github.com", "ACME/api")),
             draft: DraftFilter::Draft,
             review: ReviewFilter::Rereview,
             snooze: SnoozeFilter::Snoozed,
@@ -444,7 +504,7 @@ mod tests {
         filters.snooze = SnoozeFilter::Awake;
         assert!(filters.visible_indices(&queue()).is_empty());
         filters.snooze = SnoozeFilter::All;
-        filters.repository = Some("other/web".into());
+        filters.repository = Some(RepositoryId::new("github.com", "other/web"));
         assert!(filters.visible_indices(&queue()).is_empty());
         filters = ReviewFilters::default();
         assert_eq!(filters.visible_indices(&queue()), vec![0, 1, 2, 3]);
@@ -499,10 +559,13 @@ mod tests {
         let mut store = queue();
         let filters = ReviewFilters {
             query: "login".into(),
-            repository: Some("Acme/API".into()),
+            repository: Some(RepositoryId::new("github.com", "Acme/API")),
             ..Default::default()
         };
-        assert_eq!(filters.repositories(&store), vec!["Acme/API", "Other/Web"]);
+        assert_eq!(
+            filters.repositories(&store),
+            vec!["github.com/Acme/API", "github.com/Other/Web"]
+        );
         store.reconcile(vec![pr(
             "Other/Web",
             99,
@@ -512,11 +575,17 @@ mod tests {
             false,
         )]);
         assert!(filters.visible_indices(&store).is_empty());
-        assert_eq!(filters.repositories(&store), vec!["Acme/API", "Other/Web"]);
+        assert_eq!(
+            filters.repositories(&store),
+            vec!["github.com/acme/api", "github.com/Other/Web"]
+        );
         store.reconcile(vec![pr("acme/api", 100, "LOGIN fix", "Bob", false, false)]);
         assert_eq!(filters.visible_indices(&store), vec![0]);
         assert_eq!(filters.query, "login");
-        assert_eq!(filters.repository.as_deref(), Some("Acme/API"));
+        assert_eq!(
+            filters.repository.as_ref(),
+            Some(&RepositoryId::new("github.com", "Acme/API"))
+        );
     }
 
     #[test]

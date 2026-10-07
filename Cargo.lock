@@ -4149,6 +4149,7 @@ dependencies = [
  "dirs 7.0.0",
  "futures-lite 2.6.1",
  "gpui",
+ "libc",
  "mac-usernotifications",
  "notify-rust",
  "png 0.18.1",
