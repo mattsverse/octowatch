@@ -11,10 +11,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Linux only: the macOS runner is the expensive part of CI, and the tests
-  # don't touch platform code.
+  # Linux only: behavioral tests plus an isolated native D-Bus contract test.
+  # Live desktop rendering still requires a macOS/Linux desktop check.
   test:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
         # cargo test runs dependency build scripts; keep the token out of reach.
@@ -22,3 +22,7 @@ jobs:
           persist-credentials: false
       - uses: ./.github/actions/setup-linux
       - run: cargo test --locked
+      - name: Test the Linux notification service contract
+        run: |
+          sudo apt-get install -y python3-dbus python3-gi dbus-daemon
+          tests/test-linux-notifications.sh

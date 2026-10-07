@@ -9,9 +9,10 @@ use anyhow::{Context as _, Result};
 use semver::Version;
 use serde::Deserialize;
 
-use crate::github::gh;
+use crate::{github::gh, repository::PUBLIC_HOST};
 
-const REPO: &str = "mattsverse/octowatch";
+const REPO: &str = "github.com/mattsverse/octowatch";
+const RELEASE_ENDPOINT: &str = "repos/mattsverse/octowatch/releases/latest";
 
 #[derive(Debug, Clone)]
 pub struct Release {
@@ -30,7 +31,11 @@ pub fn current_version() -> Version {
 /// The latest published release, when it's newer than the running build.
 /// Drafts and prereleases never count.
 pub fn check() -> Result<Option<Release>> {
-    let output = gh(&["api", &format!("repos/{REPO}/releases/latest")])?;
+    check_with(gh)
+}
+
+fn check_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Result<Option<Release>> {
+    let output = run(&["api", "--hostname", PUBLIC_HOST, RELEASE_ENDPOINT])?;
     let latest: Latest = serde_json::from_str(&output).context("unexpected GitHub response")?;
     let version = Version::parse(latest.tag_name.trim_start_matches('v'))
         .with_context(|| format!("release tag {} is not a version", latest.tag_name))?;
@@ -41,7 +46,11 @@ pub fn check() -> Result<Option<Release>> {
         version,
         tag: latest.tag_name,
         url: latest.html_url,
-        asset: latest.assets.into_iter().map(|a| a.name).find(|n| is_update_asset(n)),
+        asset: latest
+            .assets
+            .into_iter()
+            .map(|a| a.name)
+            .find(|n| is_update_asset(n)),
     }))
 }
 
@@ -72,9 +81,26 @@ pub fn install(release: &Release) -> Result<PathBuf> {
 }
 
 fn download(release: &Release, asset: &str, staging: &Path) -> Result<()> {
+    download_with(release, asset, staging, gh)
+}
+
+fn download_with(
+    release: &Release,
+    asset: &str,
+    staging: &Path,
+    mut run: impl FnMut(&[&str]) -> Result<String>,
+) -> Result<()> {
     let dir = staging.to_str().context("staging path is not UTF-8")?;
-    gh(&[
-        "release", "download", &release.tag, "--repo", REPO, "--pattern", asset, "--dir", dir,
+    run(&[
+        "release",
+        "download",
+        &release.tag,
+        "--repo",
+        REPO,
+        "--pattern",
+        asset,
+        "--dir",
+        dir,
     ])
     .map(drop)
 }
@@ -181,7 +207,7 @@ fn restart_command(path: &Path, pid: u32) -> std::process::Command {
 }
 
 #[cfg(test)]
-mod tests {
+mod restart_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -217,4 +243,37 @@ struct Latest {
 #[derive(Deserialize)]
 struct Asset {
     name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_and_download_always_target_the_projects_public_host() {
+        let release = check_with(|args| {
+            assert_eq!(args, ["api", "--hostname", "github.com", "repos/mattsverse/octowatch/releases/latest"]);
+            Ok(r#"{"tag_name":"v999.0.0","html_url":"https://github.com/mattsverse/octowatch/releases/tag/v999.0.0","assets":[]}"#.into())
+        }).unwrap().unwrap();
+        let asset = "fixture.tar.gz";
+        let staging = Path::new("/tmp/octowatcher-updater-routing");
+        download_with(&release, asset, staging, |args| {
+            assert_eq!(
+                args,
+                [
+                    "release",
+                    "download",
+                    "v999.0.0",
+                    "--repo",
+                    "github.com/mattsverse/octowatch",
+                    "--pattern",
+                    asset,
+                    "--dir",
+                    staging.to_str().unwrap()
+                ]
+            );
+            Ok(String::new())
+        })
+        .unwrap();
+    }
 }

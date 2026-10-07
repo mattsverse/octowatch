@@ -43,10 +43,18 @@ openbox >"$workspace/wm.log" 2>&1 &
 wm_pid=$!
 wm_ready() { xprop -root _NET_SUPPORTING_WM_CHECK 2>/dev/null | grep -q 'window id'; }
 await wm_ready
-"$binary" >"$workspace/app.log" 2>&1 &
+"$binary" --background >"$workspace/app.log" 2>&1 &
 app_pid=$!
 window_for_app() { xdotool search --onlyvisible --pid "$app_pid" 2>/dev/null | head -n 1; }
 window_exists() { [[ -n $(window_for_app) ]]; }
+await test -s "$HOME/.octowatcher-instance/instance.lock"
+# Allow the cold launch to finish initialization on the virtual display.
+sleep 1
+kill -0 "$app_pid"
+[[ -z $(window_for_app) ]]
+"$binary" --background
+[[ -z $(window_for_app) ]]
+"$binary"
 await window_exists
 old=$(window_for_app)
 # The actual WM Close action invokes our minimize-on-close handler.
@@ -75,4 +83,4 @@ await is_minimized
 await restored
 kill -0 "$app_pid"
 [[ $(xdotool search --onlyvisible --pid "$app_pid" | wc -l) -eq 1 ]]
-echo 'PASS: Close and native minimize reopen visibly without replacing the running process'
+echo 'PASS: quiet cold launch, Close and native minimize reopen in the same process'
