@@ -201,7 +201,7 @@ Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To
 
 On Linux, **Close** minimizes the window and leaves its taskbar entry available. GPUI's Linux backend otherwise exits when the last window is destroyed. Opening Octowatcher again creates a visible window with the same app state and window bounds. The desktop controls whether it receives keyboard focus. On macOS, Close removes the window as before.
 
-There is one running instance per user, even if you launch another copy or start it from a terminal. An ordinary launch brings back that instance's window; a login launch leaves it quietly in the background. This prevents duplicate checks, notifications, and simultaneous state writes. The instance lock uses a protected home directory, or the platform’s private per-user directory when your home is group-writable (Linux: `$XDG_RUNTIME_DIR`, falling back to `/run/user/<uid>`; macOS: the Darwin user cache). **Quit Octowatcher** stops it until you open it again or next sign in, without disabling launch at login. Restarting after an update opens the new version's window.
+There is one running instance per user, even if you launch another copy or start it from a terminal. An ordinary launch brings back that instance's window; a login launch leaves it quietly in the background. This prevents duplicate checks, notifications, and simultaneous state writes. The instance lock uses the OS’s private directory for your user ID: `/run/user/<uid>` on Linux and the Darwin user cache on macOS. Changing `HOME`, `XDG_RUNTIME_DIR`, or home permissions does not create another instance. Linux requires that user runtime directory to exist with mode `0700`, as provisioned by typical desktop login managers; a custom `XDG_RUNTIME_DIR` alone is insufficient. **Quit Octowatcher** stops it until you open it again or next sign in, without disabling launch at login. Restarting after an update opens the new version's window.
 
 For a quiet manual launch, pass `--background` to the binary or AppImage (on macOS, use `open /Applications/Octowatcher.app --args --background`). If the app cannot create its tray icon, it opens the window so you can still access it. On Linux, the desktop must still provide a visible AppIndicator tray; a successfully created icon cannot tell Octowatcher whether the desktop displays it.
 
@@ -264,7 +264,7 @@ cargo build --locked
 tests/linux-window-reopen.sh target/debug/octowatcher
 ```
 
-It starts its own virtual display and uses temporary settings. Wayland compositor behavior still needs a desktop check.
+Run this check under a dedicated OS test user or inside a container with a private `/run/user/<uid>` directory. It starts its own virtual display and uses temporary settings, but instance ownership is per OS user. Wayland compositor behavior still needs a desktop check.
 
 ## Testing notifications
 

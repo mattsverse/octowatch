@@ -23,9 +23,14 @@ unset WAYLAND_DISPLAY GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRIS
 export GH_CONFIG_DIR="$workspace/gh-config"
 mkdir -m 700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR"
 chmod "${OCTOWATCHER_TEST_HOME_MODE:-700}" "$HOME"
-instance_parent="$HOME"
-if [[ ${OCTOWATCHER_TEST_HOME_MODE:-700} == 775 ]]; then
-    instance_parent="$XDG_RUNTIME_DIR"
+instance_parent="/run/user/$(id -u)"
+# Per-UID ownership deliberately ignores temporary HOME/XDG overrides.
+# Run this smoke check under a dedicated test account or in a container.
+if [[ -s "$instance_parent/.octowatcher-instance/instance.lock" ]]; then
+    flock -n "$instance_parent/.octowatcher-instance/instance.lock" true || {
+        echo 'Octowatcher is already running for this OS user; use a dedicated test account.' >&2
+        exit 1
+    }
 fi
 mkdir -p "$XDG_CONFIG_HOME/octowatcher" "$workspace/empty" "$workspace/bin"
 # No repository discovery, notifications or GitHub authentication in this test.
@@ -70,9 +75,12 @@ await test -s "$instance_parent/.octowatcher-instance/instance.lock"
 sleep 1
 kill -0 "$app_pid"
 [[ -z $(window_for_app) ]]
-"$binary" --background
+mkdir -m 700 "$workspace/alternate-runtime"
+# Duplicates launched from a different valid runtime, or without the variable,
+# must still hand off to the original process.
+XDG_RUNTIME_DIR="$workspace/alternate-runtime" "$binary" --background
 [[ -z $(window_for_app) ]]
-"$binary"
+env -u XDG_RUNTIME_DIR "$binary"
 await window_exists
 old=$(await window_for_app)
 # The actual WM Close action invokes our minimize-on-close handler.

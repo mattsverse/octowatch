@@ -37,12 +37,10 @@ impl Instance {
     /// `None` means another process accepted this launch. Quiet login launches
     /// don't raise its window; ordinary launches queue a reopen request.
     pub fn acquire(background: bool) -> Result<Option<Self>> {
-        // Prefer the stable home location; use the OS's private per-user
-        // directory when HOME permits other users to create/replace entries.
-        // Neither location depends on XDG_CONFIG_HOME or the executable.
-        let home = dirs::home_dir().context("no home directory for instance lock")?;
+        // One OS-provided directory per UID, independent of HOME, XDG
+        // overrides, executable paths, and home-directory permission changes.
         let runtime = runtime_directory();
-        let directory = instance_directory(&home, runtime.as_deref())?;
+        let directory = instance_directory(runtime.as_deref())?;
         Self::acquire_in(&directory, background)
     }
 
@@ -80,8 +78,8 @@ impl Instance {
     }
 
     fn own(lock: File) -> Result<Self> {
-        // The lock lives in HOME; the random private socket directory keeps
-        // Unix socket paths short even with a very long home directory.
+        // A short random socket path also works when the OS per-user
+        // directory would exceed Unix socket pathname limits.
         if let Ok(stale) = read_socket(&lock) {
             cleanup_socket(&stale);
         }
@@ -145,9 +143,14 @@ fn current_uid() -> libc::uid_t {
 
 #[cfg(target_os = "linux")]
 fn runtime_directory() -> Option<PathBuf> {
-    // Login and terminal launches normally share XDG_RUNTIME_DIR. The
-    // conventional OS path also works when a shell omits that variable.
-    dirs::runtime_dir().or_else(|| Some(PathBuf::from(format!("/run/user/{}", current_uid()))))
+    linux_runtime_directory(Path::new("/run/user"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_runtime_directory(root: &Path) -> Option<PathBuf> {
+    // Never select an ownership namespace from caller-controlled environment
+    // variables. Desktop login managers provision this private UID directory.
+    Some(root.join(current_uid().to_string()))
 }
 
 #[cfg(target_os = "macos")]
@@ -176,22 +179,17 @@ fn runtime_directory() -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
 }
 
-fn protected_parent(path: &Path, private: bool) -> bool {
+fn protected_parent(path: &Path) -> bool {
     path.is_absolute()
         && fs::metadata(path).is_ok_and(|metadata| {
-            metadata.is_dir()
-                && metadata.uid() == current_uid()
-                && metadata.mode() & if private { 0o077 } else { 0o022 } == 0
+            metadata.is_dir() && metadata.uid() == current_uid() && metadata.mode() & 0o077 == 0
         })
 }
 
-fn instance_directory(home: &Path, runtime: Option<&Path>) -> Result<PathBuf> {
-    if protected_parent(home, false) {
-        return private_directory(home);
-    }
+fn instance_directory(runtime: Option<&Path>) -> Result<PathBuf> {
     let runtime = runtime
-        .filter(|path| protected_parent(path, true))
-        .context("instance lock needs a protected home or a private per-user runtime directory")?;
+        .filter(|path| protected_parent(path))
+        .context("instance lock needs the OS per-user directory owned by you with mode 0700")?;
     private_directory(runtime)
 }
 
@@ -199,7 +197,7 @@ fn private_directory(home: &Path) -> Result<PathBuf> {
     // Validate the parent too: a private leaf in a shared writable directory
     // could already have been reserved by another local user.
     let uid = current_uid();
-    if !protected_parent(home, false) {
+    if !protected_parent(home) {
         bail!("the instance lock directory must be owned by you and not writable by other users");
     }
     let directory = home.join(".octowatcher-instance");
@@ -396,6 +394,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let home = root.path().join("long-home".repeat(20));
         fs::create_dir(&home).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
         let directory = private_directory(&home).unwrap();
         assert!(directory.starts_with(&home));
         assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o700);
@@ -422,12 +421,12 @@ mod tests {
     }
 
     #[test]
-    fn group_writable_home_uses_private_runtime_and_hands_off_launches() {
+    fn private_user_directory_hands_off_launches_independent_of_home_permissions() {
         let home = tempfile::tempdir().unwrap();
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o775)).unwrap();
         let runtime = tempfile::tempdir().unwrap();
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
-        let directory = instance_directory(home.path(), Some(runtime.path())).unwrap();
+        let directory = instance_directory(Some(runtime.path())).unwrap();
         assert!(directory.starts_with(runtime.path()));
         assert!(!home.path().join(".octowatcher-instance").exists());
         let owner = Instance::acquire_in(&directory, true).unwrap().unwrap();
@@ -437,28 +436,117 @@ mod tests {
         assert_eq!(owner.reopen.try_recv(), Ok(()));
         drop(owner);
         assert!(Instance::acquire_in(&directory, false).unwrap().is_some());
-        // A protected HOME keeps the same lock regardless of runtime env.
+        // Changing HOME permissions never changes the lock identity.
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
-            instance_directory(home.path(), Some(runtime.path()))
+            instance_directory(Some(runtime.path()))
                 .unwrap()
-                .starts_with(home.path())
+                .starts_with(runtime.path())
         );
     }
 
     #[test]
-    fn unprotected_home_requires_a_private_runtime_parent() {
+    fn refuses_missing_shared_or_symlinked_user_directory() {
         let home = tempfile::tempdir().unwrap();
         fs::set_permissions(home.path(), fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(instance_directory(home.path(), None).is_err());
+        assert!(instance_directory(None).is_err());
         let runtime = tempfile::tempdir().unwrap();
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(instance_directory(home.path(), Some(runtime.path())).is_err());
+        assert!(instance_directory(Some(runtime.path())).is_err());
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let target = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(target.path(), runtime.path().join(".octowatcher-instance"))
             .unwrap();
-        assert!(instance_directory(home.path(), Some(runtime.path())).is_err());
+        assert!(instance_directory(Some(runtime.path())).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn child_environment_instance() {
+        let Some(root) = std::env::var_os("OCTOWATCHER_TEST_SYSTEM_RUNTIME_ROOT") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let runtime = linux_runtime_directory(&root);
+        let directory = instance_directory(runtime.as_deref()).unwrap();
+        let background = std::env::var("OCTOWATCHER_TEST_LAUNCH").unwrap() == "quiet";
+        let instance = Instance::acquire_in(&directory, background).unwrap();
+        if std::env::var_os("OCTOWATCHER_TEST_OWNER").is_none() {
+            assert!(
+                instance.is_none(),
+                "different launch environments created a second owner"
+            );
+            return;
+        }
+        let owner = instance.unwrap();
+        fs::write(root.join("ready"), "ready").unwrap();
+        owner.reopen.recv_blocking().unwrap();
+        fs::write(root.join("opened"), "opened").unwrap();
+        loop {
+            thread::park();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn different_launch_environments_handoff_to_one_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let system = root.path().join("system-runtime");
+        let os_user = system.join(current_uid().to_string());
+        fs::create_dir_all(&os_user).unwrap();
+        fs::set_permissions(&os_user, fs::Permissions::from_mode(0o700)).unwrap();
+        let environments: Vec<_> = (0..2)
+            .map(|index| {
+                let home = root.path().join(format!("home-{index}"));
+                let runtime = root.path().join(format!("runtime-{index}"));
+                fs::create_dir(&home).unwrap();
+                fs::create_dir(&runtime).unwrap();
+                fs::set_permissions(&home, fs::Permissions::from_mode(0o775)).unwrap();
+                fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+                (home, runtime)
+            })
+            .collect();
+        let command = |index: usize, launch: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "instance::tests::child_environment_instance"])
+                .env("OCTOWATCHER_TEST_SYSTEM_RUNTIME_ROOT", &system)
+                .env("OCTOWATCHER_TEST_LAUNCH", launch)
+                .env("HOME", &environments[index].0)
+                .env("XDG_RUNTIME_DIR", &environments[index].1)
+                .env("XDG_CONFIG_HOME", environments[index].0.join("config"));
+            command
+        };
+        let mut child = command(0, "quiet")
+            .env("OCTOWATCHER_TEST_OWNER", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let result = std::panic::catch_unwind(|| {
+            wait_for(&system.join("ready"));
+            let quiet = command(1, "quiet").output().unwrap();
+            assert!(
+                quiet.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&quiet.stdout),
+                String::from_utf8_lossy(&quiet.stderr)
+            );
+            assert!(!system.join("opened").exists());
+            let ordinary = command(1, "ordinary").output().unwrap();
+            assert!(
+                ordinary.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&ordinary.stdout),
+                String::from_utf8_lossy(&ordinary.stderr)
+            );
+            wait_for(&system.join("opened"));
+        });
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The killed owner's socket must be reclaimed on the next launch.
+        let directory = instance_directory(Some(&os_user)).unwrap();
+        drop(Instance::acquire_in(&directory, false).unwrap().unwrap());
+        result.unwrap();
     }
 
     fn wait_for(path: &Path) {
