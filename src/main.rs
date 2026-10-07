@@ -3,6 +3,7 @@ mod github;
 mod notifications;
 mod repository;
 mod store;
+mod theme;
 mod tray;
 mod updater;
 
@@ -15,14 +16,15 @@ use std::{
 use chrono::{DateTime, Local};
 use gpui::{
     App, Application, AsyncApp, Bounds, ClickEvent, Context, Entity, FontWeight, Global,
-    KeyBinding, PathPromptOptions, PromptButton, PromptLevel, SharedString, Task, Window,
-    WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    KeyBinding, PathPromptOptions, PromptButton, PromptLevel, SharedString, Subscription, Task,
+    Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
 
 use discovery::LocalRepo;
 use notifications::Response;
 use repository::RepositoryId;
 use store::{PendingReview, Store};
+use theme::{Appearance, Palette};
 use tray::{Tray, UpdateItem};
 use updater::Release;
 
@@ -33,19 +35,6 @@ const SNOOZE_CHOICES: [u64; 6] = [5, 10, 15, 30, 60, 120];
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 actions!(octowatcher, [Quit, Refresh]);
-
-mod theme {
-    pub const BASE: u32 = 0x1e1e2e;
-    pub const SURFACE: u32 = 0x313244;
-    pub const SURFACE_HOVER: u32 = 0x45475a;
-    pub const TEXT: u32 = 0xcdd6f4;
-    pub const SUBTEXT: u32 = 0xa6adc8;
-    pub const MUTED: u32 = 0x6c7086;
-    pub const ACCENT: u32 = 0x89b4fa;
-    pub const GREEN: u32 = 0xa6e3a1;
-    pub const PEACH: u32 = 0xfab387;
-    pub const RED: u32 = 0xf38ba8;
-}
 
 #[derive(Clone)]
 enum Update {
@@ -93,6 +82,8 @@ struct Octowatcher {
     update_check: Option<Task<()>>,
     /// Requests notification permission, starts polling, then schedules updates.
     _startup_and_updates: Task<()>,
+    /// Reattached when a closed window is opened again.
+    appearance_subscription: Option<Subscription>,
 }
 
 impl Octowatcher {
@@ -163,6 +154,7 @@ impl Octowatcher {
             wake_task: None,
             update_check: None,
             _startup_and_updates: startup_and_updates,
+            appearance_subscription: None,
         }
     }
 
@@ -195,6 +187,15 @@ impl Octowatcher {
             return;
         }
         self.store.snooze_minutes = minutes;
+        self.save();
+        cx.notify();
+    }
+
+    fn set_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
+        if self.store.appearance == appearance {
+            return;
+        }
+        self.store.appearance = appearance;
         self.save();
         cx.notify();
     }
@@ -753,20 +754,21 @@ fn pr_list(prs: &[PendingReview]) -> String {
 }
 
 impl Render for Octowatcher {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.store.appearance.palette(window.appearance());
         let content = match self.tab {
-            Tab::Reviews => self.render_reviews(cx).into_any_element(),
-            Tab::Repositories => self.render_repositories(cx).into_any_element(),
-            Tab::Settings => self.render_settings(cx).into_any_element(),
+            Tab::Reviews => self.render_reviews(theme, cx).into_any_element(),
+            Tab::Repositories => self.render_repositories(theme, cx).into_any_element(),
+            Tab::Settings => self.render_settings(theme, cx).into_any_element(),
         };
         div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(theme::BASE))
-            .text_color(rgb(theme::TEXT))
+            .bg(rgb(theme.background))
+            .text_color(rgb(theme.text))
             .text_sm()
-            .child(self.render_header(cx))
+            .child(self.render_header(theme, cx))
             .child(
                 div()
                     .id("content")
@@ -779,7 +781,7 @@ impl Render for Octowatcher {
 }
 
 impl Octowatcher {
-    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_header(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = if self.scan_task.is_some() {
             "Scanning folders…".into()
         } else if self.fetch_task.is_some() {
@@ -799,7 +801,7 @@ impl Octowatcher {
             .pt_4()
             .pb_3()
             .border_b_1()
-            .border_color(rgb(theme::SURFACE))
+            .border_color(rgb(theme.border))
             .child(
                 div()
                     .flex()
@@ -816,8 +818,13 @@ impl Octowatcher {
                             .flex()
                             .items_center()
                             .gap_3()
-                            .child(div().text_xs().text_color(rgb(theme::MUTED)).child(status))
-                            .child(button("refresh", "Refresh").on_click(
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(theme.muted_text))
+                                    .child(status),
+                            )
+                            .child(button("refresh", "Refresh", theme).on_click(
                                 cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx)),
                             )),
                     ),
@@ -825,9 +832,9 @@ impl Octowatcher {
             .children(
                 self.displayed_error()
                     .map(str::to_owned)
-                    .map(|err| div().text_xs().text_color(rgb(theme::RED)).child(err)),
+                    .map(|err| div().text_xs().text_color(rgb(theme.error)).child(err)),
             )
-            .children(self.render_update(cx))
+            .children(self.render_update(theme, cx))
             .child(
                 div()
                     .flex()
@@ -835,23 +842,25 @@ impl Octowatcher {
                     .child(self.render_tab(
                         Tab::Reviews,
                         format!("Reviews ({})", self.store.pending.len()),
+                        theme,
                         cx,
                     ))
                     .child(self.render_tab(
                         Tab::Repositories,
                         format!("Repositories ({repo_count})"),
+                        theme,
                         cx,
                     ))
-                    .child(self.render_tab(Tab::Settings, "Settings".into(), cx)),
+                    .child(self.render_tab(Tab::Settings, "Settings".into(), theme, cx)),
             )
     }
 
-    fn render_update(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn render_update(&self, theme: Palette, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (message, action) =
             match self.update.as_ref()? {
                 Update::Available(release) => (
                     format!("Octowatcher {} is available.", release.version),
-                    Some(button("install-update", "Update").on_click(
+                    Some(button("install-update", "Update", theme).on_click(
                         cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx)),
                     )),
                 ),
@@ -859,7 +868,7 @@ impl Octowatcher {
                 Update::Ready(version) => (
                     format!("Octowatcher {version} is installed."),
                     Some(
-                        button("restart", "Restart")
+                        button("restart", "Restart", theme)
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
                     ),
                 ),
@@ -867,7 +876,7 @@ impl Octowatcher {
                     let url = release.url.clone();
                     (
                         format!("Octowatcher {} is available.", release.version),
-                        Some(button("download-update", "Download").on_click(
+                        Some(button("download-update", "Download", theme).on_click(
                             cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)),
                         )),
                     )
@@ -881,14 +890,20 @@ impl Octowatcher {
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(rgb(theme::SURFACE))
+                .bg(rgb(theme.surface))
                 .text_xs()
                 .child(message)
                 .children(action),
         )
     }
 
-    fn render_tab(&self, tab: Tab, label: String, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_tab(
+        &self,
+        tab: Tab,
+        label: String,
+        theme: Palette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let active = self.tab == tab;
         let id = match tab {
             Tab::Reviews => "tab-reviews",
@@ -902,11 +917,11 @@ impl Octowatcher {
             .rounded_md()
             .cursor_pointer()
             .when(active, |s| {
-                s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+                s.bg(rgb(theme.surface)).text_color(rgb(theme.text))
             })
             .when(!active, |s| {
-                s.text_color(rgb(theme::SUBTEXT))
-                    .hover(|s| s.bg(rgb(theme::SURFACE)))
+                s.text_color(rgb(theme.secondary_text))
+                    .hover(|s| s.bg(rgb(theme.surface)))
             })
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -916,13 +931,13 @@ impl Octowatcher {
             }))
     }
 
-    fn render_reviews(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_reviews(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         if self.store.pending.is_empty() {
             return div()
                 .flex()
                 .justify_center()
                 .pt_16()
-                .text_color(rgb(theme::MUTED))
+                .text_color(rgb(theme.muted_text))
                 .child("Nothing waiting on your review.");
         }
         div()
@@ -939,7 +954,7 @@ impl Octowatcher {
                         .unwrap_or_default()
                 });
                 let action = if snoozed_until.is_some() {
-                    button(("unsnooze", ix), "Unsnooze").on_click(cx.listener(
+                    button(("unsnooze", ix), "Unsnooze", theme).on_click(cx.listener(
                         move |this, _: &ClickEvent, _, cx| {
                             // The card behind the button opens the PR.
                             cx.stop_propagation();
@@ -947,7 +962,7 @@ impl Octowatcher {
                         },
                     ))
                 } else {
-                    button(("snooze", ix), "Snooze…")
+                    button(("snooze", ix), "Snooze…", theme)
                         .debug_selector(move || format!("snooze-{ix}"))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
@@ -956,7 +971,7 @@ impl Octowatcher {
                         }))
                 };
                 let badge = if pr.rereview {
-                    Some(("re-review", theme::PEACH))
+                    Some(("re-review", theme.warning))
                 } else {
                     None
                 };
@@ -968,10 +983,12 @@ impl Octowatcher {
                     .gap_1()
                     .p_3()
                     .rounded_lg()
-                    .bg(rgb(theme::SURFACE))
-                    .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
+                    .bg(rgb(theme.surface))
+                    .hover(|s| s.bg(rgb(theme.surface_hover)))
                     .cursor_pointer()
-                    .when(snoozed_until.is_some(), |s| s.opacity(0.6))
+                    .when(snoozed_until.is_some(), |s| {
+                        s.text_color(rgb(theme.snoozed_text))
+                    })
                     .child(
                         div()
                             .flex()
@@ -984,10 +1001,12 @@ impl Octowatcher {
                                     .items_center()
                                     .gap_2()
                                     .text_xs()
-                                    .text_color(rgb(theme::SUBTEXT))
+                                    .text_color(rgb(theme.secondary_text))
                                     .child(format!("{}#{}", pr.repo_label(), pr.number))
                                     .children(badge.map(|(label, color)| pill(label, color)))
-                                    .when(pr.is_draft, |s| s.child(pill("draft", theme::MUTED))),
+                                    .when(pr.is_draft, |s| {
+                                        s.child(pill("draft", theme.muted_text))
+                                    }),
                             )
                             .child(action),
                     )
@@ -997,7 +1016,7 @@ impl Octowatcher {
                             .truncate()
                             .child(pr.title.clone()),
                     )
-                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(
+                    .child(div().text_xs().text_color(rgb(theme.muted_text)).child(
                         match &snoozed_until {
                             Some(at) => format!("by {} · snoozed until {at}", pr.author),
                             None => format!("by {}", pr.author),
@@ -1008,6 +1027,7 @@ impl Octowatcher {
                         card.child(snooze_picker(
                             ix,
                             self.store.snooze_minutes,
+                            theme,
                             cx,
                             move |this, minutes, cx| {
                                 if let Some(minutes) = minutes {
@@ -1023,12 +1043,12 @@ impl Octowatcher {
             }))
     }
 
-    fn render_repositories(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_repositories(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         let roots = div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title("Watched folders"))
+            .child(section_title("Watched folders", theme))
             .children(self.store.roots.iter().enumerate().map(|(ix, root)| {
                 let root_for_click = root.clone();
                 div()
@@ -1038,22 +1058,26 @@ impl Octowatcher {
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .bg(rgb(theme::SURFACE))
+                    .bg(rgb(theme.surface))
                     .child(display_path(root))
-                    .child(button(("remove-root", ix), "Remove").on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| this.remove_root(&root_for_click, cx),
-                    )))
+                    .child(
+                        button(("remove-root", ix), "Remove", theme).on_click(cx.listener(
+                            move |this, _: &ClickEvent, _, cx| {
+                                this.remove_root(&root_for_click, cx)
+                            },
+                        )),
+                    )
             }))
             .child(
                 div()
                     .flex()
                     .gap_2()
                     .child(
-                        button("add-root", "Add folder…")
+                        button("add-root", "Add folder…", theme)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_root(cx))),
                     )
                     .child(
-                        button("rescan", "Rescan")
+                        button("rescan", "Rescan", theme)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rescan(cx))),
                     ),
             );
@@ -1063,11 +1087,11 @@ impl Octowatcher {
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title("GitHub repositories found"))
+            .child(section_title("GitHub repositories found", theme))
             .when(repos.is_empty() && self.scan_task.is_none(), |s| {
                 s.child(
                     div()
-                        .text_color(rgb(theme::MUTED))
+                        .text_color(rgb(theme.muted_text))
                         .child("No GitHub clones in these folders."),
                 )
             })
@@ -1089,28 +1113,28 @@ impl Octowatcher {
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .bg(rgb(theme::SURFACE))
-                    .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
+                    .bg(rgb(theme.surface))
+                    .hover(|s| s.bg(rgb(theme.surface_hover)))
                     .cursor_pointer()
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .min_w_0()
-                            .when(!enabled, |s| s.text_color(rgb(theme::MUTED)))
+                            .when(!enabled, |s| s.text_color(rgb(theme.muted_text)))
                             .child(repo.id.to_string())
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(rgb(theme::MUTED))
+                                    .text_color(rgb(theme.muted_text))
                                     .truncate()
                                     .child(paths),
                             ),
                     )
                     .child(if enabled {
-                        pill("watching", theme::GREEN)
+                        pill("watching", theme.success)
                     } else {
-                        pill("off", theme::MUTED)
+                        pill("off", theme.muted_text)
                     })
                     .on_click(
                         cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&id, cx)),
@@ -1120,12 +1144,42 @@ impl Octowatcher {
         div().flex().flex_col().gap_6().child(roots).child(list)
     }
 
-    fn render_settings(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_settings(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .flex()
             .flex_col()
             .gap_6()
-            .child(self.render_choices(
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(section_title("Appearance", theme))
+                    .child(
+                        div().flex().gap_2().children(
+                            Appearance::CHOICES
+                                .into_iter()
+                                .enumerate()
+                                .map(|(ix, appearance)| {
+                                    let active = self.store.appearance == appearance;
+                                    choice(("appearance", ix), appearance.label(), active, theme)
+                                        .on_click(cx.listener(
+                                            move |this, _: &ClickEvent, _, cx| {
+                                                this.set_appearance(appearance, cx);
+                                            },
+                                        ))
+                                }),
+                        ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(theme.muted_text))
+                            .child("System follows your desktop’s light or dark appearance."),
+                    ),
+            )
+            .child(Self::render_choices(
+                theme,
                 "Check GitHub for review requests every",
                 "poll",
                 &POLL_CHOICES,
@@ -1133,7 +1187,8 @@ impl Octowatcher {
                 Self::set_poll_minutes,
                 cx,
             ))
-            .child(self.render_choices(
+            .child(Self::render_choices(
+                theme,
                 "Default snooze length",
                 "snooze-minutes",
                 &SNOOZE_CHOICES,
@@ -1146,9 +1201,9 @@ impl Octowatcher {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(section_title("Notifications"))
+                    .child(section_title("Notifications", theme))
                     .child(div().flex().child(
-                        button("test-notification", "Send test notification").on_click(
+                        button("test-notification", "Send test notification", theme).on_click(
                             cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.send_test_notification(cx)
                             }),
@@ -1159,7 +1214,7 @@ impl Octowatcher {
 
     /// A row of minute lengths to pick one from.
     fn render_choices(
-        &self,
+        theme: Palette,
         title: &'static str,
         id: &'static str,
         choices: &[u64],
@@ -1171,7 +1226,7 @@ impl Octowatcher {
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title(title))
+            .child(section_title(title, theme))
             .child(
                 div()
                     .flex()
@@ -1180,25 +1235,9 @@ impl Octowatcher {
                     .children(choices.iter().map(|&minutes| {
                         let active = minutes == current;
                         let label = minutes_label(minutes);
-                        div()
-                            .id((id, minutes as usize))
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .text_xs()
-                            .cursor_pointer()
-                            .when(active, |s| {
-                                s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE))
-                            })
-                            .when(!active, |s| {
-                                s.bg(rgb(theme::SURFACE))
-                                    .text_color(rgb(theme::SUBTEXT))
-                                    .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
-                            })
-                            .child(label)
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                pick(this, minutes, cx)
-                            }))
+                        choice((id, minutes as usize), label, active, theme).on_click(
+                            cx.listener(move |this, _: &ClickEvent, _, cx| pick(this, minutes, cx)),
+                        )
                     })),
             )
     }
@@ -1208,6 +1247,7 @@ impl Octowatcher {
 fn snooze_picker<T: 'static>(
     ix: usize,
     default_minutes: u64,
+    theme: Palette,
     cx: &mut Context<T>,
     pick: impl Fn(&mut T, Option<u64>, &mut Context<T>) + Clone + 'static,
 ) -> gpui::Stateful<gpui::Div> {
@@ -1223,7 +1263,7 @@ fn snooze_picker<T: 'static>(
         .gap_2()
         .pt_2()
         .cursor_default()
-        .child(section_title("Snooze for"))
+        .child(section_title("Snooze for", theme))
         .child(
             div()
                 .flex()
@@ -1237,18 +1277,16 @@ fn snooze_picker<T: 'static>(
                     } else {
                         minutes_label(minutes)
                     };
-                    button(("snooze-duration", minutes as usize), label)
+                    button(("snooze-duration", minutes as usize), label, theme)
                         .debug_selector(move || format!("snooze-duration-{ix}-{minutes}"))
-                        .when(is_default, |s| {
-                            s.border_1().border_color(rgb(theme::ACCENT))
-                        })
+                        .when(is_default, |s| s.border_1().border_color(rgb(theme.accent)))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
                             pick(this, Some(minutes), cx);
                         }))
                 }))
                 .child(
-                    button("cancel-snooze", "Cancel")
+                    button("cancel-snooze", "Cancel", theme)
                         .debug_selector(move || format!("cancel-snooze-{ix}"))
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
@@ -1267,9 +1305,11 @@ fn minutes_label(minutes: u64) -> String {
     }
 }
 
-fn button(
+fn choice(
     id: impl Into<gpui::ElementId>,
     label: impl Into<SharedString>,
+    active: bool,
+    theme: Palette,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -1277,10 +1317,38 @@ fn button(
         .py_1()
         .rounded_md()
         .text_xs()
-        .bg(rgb(theme::SURFACE))
-        .text_color(rgb(theme::ACCENT))
-        .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
         .cursor_pointer()
+        .when(active, |s| {
+            s.bg(rgb(theme.accent)).text_color(rgb(theme.on_accent))
+        })
+        .when(!active, |s| {
+            s.bg(rgb(theme.surface))
+                .text_color(rgb(theme.secondary_text))
+                .hover(|s| s.bg(rgb(theme.surface_hover)))
+        })
+        .focus(|s| {
+            s.border_1()
+                .border_color(rgb(if active { theme.on_accent } else { theme.focus }))
+        })
+        .child(label.into())
+}
+
+fn button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+    theme: Palette,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .text_xs()
+        .bg(rgb(theme.surface))
+        .text_color(rgb(theme.accent))
+        .hover(|s| s.bg(rgb(theme.surface_hover)))
+        .cursor_pointer()
+        .focus(|s| s.border_1().border_color(rgb(theme.focus)))
         .child(label.into())
 }
 
@@ -1295,11 +1363,11 @@ fn pill(label: &'static str, color: u32) -> gpui::Div {
         .child(label)
 }
 
-fn section_title(label: &'static str) -> gpui::Div {
+fn section_title(label: &'static str, theme: Palette) -> gpui::Div {
     div()
         .text_xs()
         .font_weight(FontWeight::BOLD)
-        .text_color(rgb(theme::SUBTEXT))
+        .text_color(rgb(theme.secondary_text))
         .child(label)
 }
 
@@ -1420,7 +1488,13 @@ pub fn show_window(cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..Default::default()
         },
-        |_, _| view,
+        |window, cx| {
+            view.update(cx, |this, cx| {
+                this.appearance_subscription =
+                    Some(cx.observe_window_appearance(window, |_, _, cx| cx.notify()));
+            });
+            view
+        },
     )
     .unwrap();
 }
@@ -1475,6 +1549,7 @@ mod snooze_tests {
             wake_task: None,
             update_check: None,
             _startup_and_updates: Task::ready(()),
+            appearance_subscription: None,
         }
     }
 
@@ -1568,7 +1643,7 @@ mod snooze_tests {
     }
 
     impl Render for PickerHarness {
-        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div()
                 .id("card")
                 .w(px(360.))
@@ -1577,6 +1652,7 @@ mod snooze_tests {
                 .child(snooze_picker(
                     0,
                     self.store.snooze_minutes,
+                    self.store.appearance.palette(window.appearance()),
                     cx,
                     |this, minutes, _| {
                         this.picked.push(minutes);
@@ -1599,38 +1675,46 @@ mod snooze_tests {
             },
             picked: Vec::new(),
         });
-        for (minutes, selector) in [
-            (5, "snooze-duration-0-5"),
-            (10, "snooze-duration-0-10"),
-            (15, "snooze-duration-0-15"),
-            (30, "snooze-duration-0-30"),
-            (60, "snooze-duration-0-60"),
-            (120, "snooze-duration-0-120"),
-        ] {
-            click(cx, selector);
-            view.read_with(cx, |v, _| {
-                assert_eq!(v.picked.last(), Some(&Some(minutes)));
-                assert_eq!(
-                    v.store.next_snooze_until(),
-                    Some(1_000 + minutes as i64 * 60)
-                );
-                assert_eq!(v.store.snooze_minutes, 15);
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            view.update(cx, |view, cx| {
+                view.store.appearance = appearance;
+                view.picked.clear();
+                cx.notify();
             });
+            cx.run_until_parked();
+            for (minutes, selector) in [
+                (5, "snooze-duration-0-5"),
+                (10, "snooze-duration-0-10"),
+                (15, "snooze-duration-0-15"),
+                (30, "snooze-duration-0-30"),
+                (60, "snooze-duration-0-60"),
+                (120, "snooze-duration-0-120"),
+            ] {
+                click(cx, selector);
+                view.read_with(cx, |v, _| {
+                    assert_eq!(v.picked.last(), Some(&Some(minutes)));
+                    assert_eq!(
+                        v.store.next_snooze_until(),
+                        Some(1_000 + minutes as i64 * 60)
+                    );
+                    assert_eq!(v.store.snooze_minutes, 15);
+                });
+                assert_eq!(cx.opened_url(), None);
+            }
+            // The panel heading/padding must also consume the card's click.
+            let panel = cx.debug_bounds("snooze-picker-0").unwrap();
+            cx.simulate_click(
+                panel.origin + gpui::point(px(2.), px(2.)),
+                Modifiers::none(),
+            );
+            assert_eq!(cx.opened_url(), None);
+            assert_eq!(view.read_with(cx, |v, _| v.picked.len()), 6);
+            click(cx, "cancel-snooze-0");
+            assert_eq!(
+                view.read_with(cx, |v, _| v.picked.last().copied()),
+                Some(None)
+            );
             assert_eq!(cx.opened_url(), None);
         }
-        // The panel heading/padding must also consume the card's click.
-        let panel = cx.debug_bounds("snooze-picker-0").unwrap();
-        cx.simulate_click(
-            panel.origin + gpui::point(px(2.), px(2.)),
-            Modifiers::none(),
-        );
-        assert_eq!(cx.opened_url(), None);
-        assert_eq!(view.read_with(cx, |v, _| v.picked.len()), 6);
-        click(cx, "cancel-snooze-0");
-        assert_eq!(
-            view.read_with(cx, |v, _| v.picked.last().copied()),
-            Some(None)
-        );
-        assert_eq!(cx.opened_url(), None);
     }
 }
