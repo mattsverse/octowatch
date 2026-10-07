@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 use crate::github::Check;
-use crate::github::{FetchResults, Readiness};
+use crate::github::{FetchedReviews, Readiness};
 #[cfg(test)]
 use crate::store::PendingReview;
 use crate::store::Store;
@@ -60,7 +60,7 @@ impl SyncHealth {
     /// success advances only when every enabled host completed this sync.
     pub fn apply_hosts(
         &mut self,
-        fetched: &FetchResults,
+        fetched: &FetchedReviews,
         store: &mut Store,
         now: i64,
     ) -> BTreeSet<String> {
@@ -106,14 +106,14 @@ impl SyncHealth {
         store: &mut Store,
         now: i64,
     ) -> (Option<Vec<PendingReview>>, bool) {
-        let mut results = FetchResults::default();
+        let mut results = FetchedReviews::default();
         results
             .readiness
             .insert("github.com".into(), check.readiness);
         let fetched = match check.reviews {
             Ok(reviews) => {
                 results.successful_hosts.insert("github.com".into());
-                results.reviews = reviews.clone();
+                results.pending = reviews.clone();
                 Some(reviews)
             }
             Err(error) => {
@@ -204,26 +204,27 @@ mod tests {
         store.pending.push(enterprise.clone());
         store.last_successful_sync = Some(100);
         let mut health = SyncHealth::default();
-        let partial = FetchResults {
+        let partial = FetchedReviews {
             readiness: [
                 ("github.com".into(), Readiness::Ready("alice".into())),
                 (enterprise.host.clone(), Readiness::Offline),
             ]
             .into(),
             successful_hosts: ["github.com".into()].into(),
-            reviews: Vec::new(),
+            pending: Vec::new(),
             errors: vec!["github.example.com: dial tcp: network is unreachable".into()],
+            ..FetchedReviews::default()
         };
         assert!(health.apply_hosts(&partial, &mut store, 200).is_empty());
-        store.reconcile_hosts(
-            partial.reviews,
-            &partial.successful_hosts,
+        store.reconcile_repositories(
+            partial.pending,
+            &[public.repository()].into(),
             &[public.repository(), enterprise.repository()].into(),
         );
         assert_eq!(store.pending, vec![enterprise.clone()]);
         assert_eq!(store.last_successful_sync, Some(100));
         assert!(!health.verified);
-        let recovered = FetchResults {
+        let recovered = FetchedReviews {
             readiness: [
                 ("github.com".into(), Readiness::Ready("alice".into())),
                 (
@@ -233,7 +234,7 @@ mod tests {
             ]
             .into(),
             successful_hosts: ["github.com".into(), enterprise.host].into(),
-            ..FetchResults::default()
+            ..FetchedReviews::default()
         };
         assert!(health.apply_hosts(&recovered, &mut store, 300).is_empty());
         assert_eq!(store.last_successful_sync, Some(300));
@@ -252,14 +253,14 @@ mod tests {
         store.activate_host_account(&enterprise.host, "old-viewer");
         store.pending.push(enterprise.clone());
         store.queue_notifications(&[public.clone(), enterprise.clone()]);
-        let fetched = FetchResults {
+        let fetched = FetchedReviews {
             readiness: [(
                 enterprise.host.clone(),
                 Readiness::Ready("new-viewer".into()),
             )]
             .into(),
             errors: vec!["github.example.com: review query failed".into()],
-            ..FetchResults::default()
+            ..FetchedReviews::default()
         };
         let changed = SyncHealth::default().apply_hosts(&fetched, &mut store, 200);
         assert_eq!(changed, [enterprise.host.clone()].into());
