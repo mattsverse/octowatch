@@ -70,9 +70,9 @@ The window has three tabs.
 
 ### Reviews
 
-This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
+This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu lists the awake reviews.
 
-While setup or a check needs attention, this tab shows **Setup & health** with guidance and recovery actions. The header keeps the sync status and **last successful sync** visible. An empty list says **Nothing waiting on your review** only after a successful check with enabled repositories and a complete folder scan. Before then it distinguishes loading, folder setup, and unverified results.
+When the cache is empty and setup or a check needs attention, this tab shows **Setup & health** with guidance and recovery actions. A populated list keeps a compact warning and the header shortcut to full details, including when filters match no reviews. The header keeps the sync status and **last successful sync** visible. An empty list says **Nothing waiting on your review** only after a successful check with enabled repositories and a complete folder scan. Before then it distinguishes loading, folder setup, and unverified results.
 
 If a check fails, the last known reviews stay visible with a stale warning, including the tray links and count after a restart or during a rescan. An empty cache cannot confirm that no reviews are waiting. The success time does not advance on failure and survives a restart; saved results remain unverified until this launch completes a sync. Results also become stale after two check intervals plus one minute without a successful sync. The tray menu shows setup or stale status too.
 
@@ -82,13 +82,21 @@ Choose **Refresh** to retry immediately. Automatic checks continue at the interv
 
 Octowatcher rechecks the effective account on each enabled host every sync. After you change it with `gh auth switch --hostname HOST`, choose **Refresh**. A detected account change clears that host's previous cached reviews, snoozes, and queued notifications; other hosts, folder choices, and settings stay intact. Setup & health lists readiness and the active account for every enabled host. The last-success time advances only when all enabled hosts complete a sync; successful hosts still update their reviews when another host fails. Cached reviews from an older state file without an account are reloaded from GitHub before being assigned to an account. This uses one active account per host, and GitHub CLI environment-token overrides still take precedence.
 
-Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front; its **Open Reviews** button does the same. After the first successful GitHub check at each launch, Octowatcher summarizes the eligible reviews already waiting.
+**Search and filters** help you find reviews in a busy queue. Search matches title, owner/repository, author, and PR number without regard to case. Every space-separated term must match, and terms can match different fields: `acme alice login` finds login PRs by Alice in an Acme repository. A plain number is a substring search; `#123` matches exactly PR number 123.
+
+Repository choices include the host, so matching owner/repository names on different hosts remain separate. You can also search by host as part of the repository label. Choose a repository, **Ready** (non-draft) or **Draft**, **First review** or **Re-review**, and **Awake** or **Snoozed**. These filters combine with search and each other. All four default to **All**, including snoozed reviews. Repository choices come from the full review list; a selected repository stays selected even if its last PR disappears during a refresh.
+
+The list shows **X of Y reviews**. The Reviews tab keeps the total count, including snoozed PRs. Search and filters only change this window's list: they do not change watched repositories, the tray's awake count/list, or notifications. Your view choices survive refreshes, tab changes, and closing/reopening the window, and reset when you restart the app.
+
+Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. In short windows, the filter area scrolls while leaving space for reviews; keyboard focus scrolls each control into view. When no PRs match, the window shows a no-results message and a reset button.
+
+Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front, reopening the window if you closed it; its **Open Reviews** button does the same. Your current search and filters stay active. After the first successful GitHub check at each launch, Octowatcher summarizes the eligible reviews already waiting.
 
 **Snooze…** opens a duration picker for that pull request: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default from Settings is marked; choose a duration to snooze, or **Cancel** to leave the review waiting. Each choice applies only to that snooze and doesn't change the default. Only one picker is open at a time.
 
 The picker and snooze apply to the pull request on its displayed host. Matching repository names and pull request numbers on another host keep their own snooze durations and deadlines.
 
-A snoozed pull request leaves the tray. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new review request ends its snooze early. A new notification about a single pull request also has a **Snooze** button, which uses the Settings default. One that covers several pull requests doesn't. Each snooze's deadline survives a restart.
+A snoozed pull request leaves the tray. With the default All filters, it stays listed in the window, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new review request ends its snooze early. A new notification about a single pull request also has a **Snooze** button, which uses the Settings default. One that covers several pull requests doesn't. Each snooze's deadline survives a restart.
 
 ### Repositories
 
