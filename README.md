@@ -86,7 +86,7 @@ The scan goes up to five levels deep. It skips hidden folders and `node_modules`
 
 Octowatcher reads each checkout's Git config, resolving `.git` files and the shared metadata of linked worktrees even when the main clone is outside watched folders. A submodule is included when its folder is watched explicitly; scans do not descend into its parent checkout to find it. It understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them.
 
-If a watched folder is missing or unreadable, or a checkout’s Git metadata cannot be read, the window shows a warning with details in **Repositories**. Octowatcher retains previously discovered repositories in the affected folders, including across restarts, and retries on the next scan. A successful scan updates the list; removing a watched folder removes its checkouts from the list.
+If a watched folder is missing or unreadable, or a checkout’s Git metadata cannot be read, the window shows a warning with details in **Repositories**. Octowatcher retains previously discovered repositories in the affected folders, including across restarts, and retries on the next scan. Git configs are streamed without a total file-size limit; individual lines exceeding 64 KiB produce the same warning and retention behavior. A successful scan updates the list; removing a watched folder removes its checkouts from the list.
 
 ### Settings
 

@@ -7,6 +7,7 @@ use std::{
 };
 
 const MAX_DEPTH: usize = 5;
+const MAX_CONFIG_LINE_BYTES: u64 = 64 * 1024;
 const SKIPPED_DIRS: &[&str] = &[
     "node_modules",
     "target",
@@ -378,12 +379,29 @@ fn ssh_aliases_for_github(config: &str) -> Vec<String> {
 }
 
 fn github_slugs(config: &Path, hosts: &[String]) -> std::io::Result<Vec<String>> {
-    use std::io::{BufRead, BufReader};
-    // Large valid configs remain supported without allocating the entire file.
-    let reader = BufReader::new(open_metadata(config)?);
+    use std::io::{BufRead, BufReader, Error, ErrorKind, Read};
+    // Stream arbitrary-size configs, bounding allocation before reading each
+    // line. An oversized line warns and retains the checkout's cached state.
+    let mut reader = BufReader::new(open_metadata(config)?);
+    let mut bytes = Vec::new();
     let mut slugs = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
+    loop {
+        bytes.clear();
+        let count = reader
+            .by_ref()
+            .take(MAX_CONFIG_LINE_BYTES + 1)
+            .read_until(b'\n', &mut bytes)?;
+        if count == 0 {
+            break;
+        }
+        if count as u64 > MAX_CONFIG_LINE_BYTES {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Git config line exceeds 64 KiB",
+            ));
+        }
+        let line =
+            std::str::from_utf8(&bytes).map_err(|err| Error::new(ErrorKind::InvalidData, err))?;
         let Some((key, value)) = line.trim().split_once('=') else {
             continue;
         };
@@ -664,8 +682,10 @@ mod tests {
         }
         f.checkout("local", &["git@gitlab.com:o/local.git"]);
         f.checkout("local/nested", &["git@github.com:o/nested.git"]);
-        let scan =
-            discover_with_hosts(&[f.0.clone()], &["github-work".into(), "github.com".into()]);
+        let scan = discover_with_hosts(
+            std::slice::from_ref(&f.0),
+            &["github-work".into(), "github.com".into()],
+        );
         assert!(scan.issues.is_empty());
         assert_eq!(scan.repos.len(), 1);
         assert_eq!(scan.repos[0].paths, vec![at_limit]);
@@ -833,6 +853,33 @@ mod tests {
     }
 
     #[test]
+    fn review_regression_oversized_config_line_warns_and_retains_known_checkout() {
+        let f = Fixture::new();
+        let clone = f.checkout("watched/clone", &["git@github.com:o/r.git"]);
+        let root = f.path("watched");
+        let previous = discover(std::slice::from_ref(&root)).repos;
+        let config = clone.join(".git/config");
+        let original = fs::read(&config).unwrap();
+        let mut oversized = vec![b'#'; 2 * 1024 * 1024];
+        oversized.push(b'\n');
+        oversized.extend_from_slice(&original);
+        fs::write(&config, &oversized).unwrap();
+        let mut scan = discover(std::slice::from_ref(&root));
+        assert_eq!(scan.issues.len(), 1);
+        assert_eq!(scan.issues[0].path, clone);
+        assert!(scan.issues[0].message.contains("config line exceeds"));
+        scan.retain_unavailable(&previous);
+        assert_eq!(scan.repos, previous);
+        // An unterminated oversized line must hit the same bound.
+        fs::write(&config, &oversized[..2 * 1024 * 1024]).unwrap();
+        assert_eq!(discover(std::slice::from_ref(&root)).issues.len(), 1);
+        fs::write(config, original).unwrap();
+        let recovered = discover(&[root]);
+        assert!(recovered.issues.is_empty());
+        assert_eq!(recovered.repos, previous);
+    }
+
+    #[test]
     fn review_regression_valid_config_larger_than_one_mib_is_discovered() {
         let f = Fixture::new();
         let clone = f.checkout("clone", &[]);
@@ -840,7 +887,7 @@ mod tests {
         contents.push_str("[remote \"origin\"]\nurl = https://github.com/o/large.git\n");
         assert!(contents.len() > 1024 * 1024);
         fs::write(clone.join(".git/config"), contents).unwrap();
-        let scan = discover(&[f.0.clone()]);
+        let scan = discover(std::slice::from_ref(&f.0));
         assert_eq!(
             scan.repos.len(),
             1,
@@ -864,7 +911,7 @@ mod tests {
         let clone = f.checkout("bad-config", &["git@github.com:o/r.git"]);
         fs::remove_file(clone.join(".git/config")).unwrap();
         fs::create_dir(clone.join(".git/config")).unwrap();
-        let scan = discover(&[f.0.clone()]);
+        let scan = discover(std::slice::from_ref(&f.0));
         assert!(scan.repos.is_empty());
         assert_eq!(scan.issues.len(), 3);
     }
