@@ -3,9 +3,10 @@
 
 use std::{
     collections::BTreeSet,
-    io::Read as _,
+    io::{self, Read},
+    os::unix::{io::AsRawFd, process::CommandExt as _},
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
 };
@@ -53,6 +54,8 @@ query($q: String!, $me: String!) {
 /// gh is the authority for configured hosts. Ask only for names, never tokens.
 /// JSON mode keeps hosts with expired credentials in the list, allowing their
 /// local clones and cached reviews to remain visible until authentication recovers.
+/// Unlike text mode, JSON mode exits successfully even for authentication errors
+/// (gh 2.81+: https://cli.github.com/manual/gh_auth_status).
 pub fn known_hosts() -> Result<Vec<String>> {
     known_hosts_with(gh_request)
 }
@@ -272,10 +275,13 @@ fn gh_output(args: &[&str], output: Output) -> Result<String> {
     Ok(String::from_utf8(output.stdout)?)
 }
 
-/// Drain both pipes while waiting: GraphQL responses can exceed a pipe buffer.
-/// On timeout, terminate and reap the child before returning an error.
+/// Drain both pipes without blocking: GraphQL responses can exceed a pipe buffer,
+/// and descendants can keep a pipe open after the direct child exits. One deadline
+/// covers both process execution and pipe reads, with no reader threads to join.
 fn command_output(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
     let mut child = command
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -283,45 +289,81 @@ fn command_output(command: &mut Command, timeout: Duration) -> Result<Output> {
         .context("could not run `gh`; is the GitHub CLI installed?")?;
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
-    let out = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let err = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.read_to_end(&mut bytes).map(|_| bytes)
-    });
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10));
+    let result = (|| {
+        nonblocking(&stdout)?;
+        nonblocking(&stderr)?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (mut out_closed, mut err_closed) = (false, false);
+        let mut status = None;
+        loop {
+            if Instant::now() >= deadline {
+                bail!("GitHub CLI timed out after {} seconds", timeout.as_secs());
             }
-            outcome => {
-                child.kill().ok();
-                child.wait().ok();
-                break match outcome {
-                    Err(error) => Err(error.into()),
-                    _ => Err(anyhow::anyhow!(
-                        "GitHub CLI timed out after {} seconds",
-                        timeout.as_secs()
-                    )),
-                };
+            if !out_closed {
+                out_closed = drain_pipe(&mut stdout, &mut out)?;
             }
+            if !err_closed {
+                err_closed = drain_pipe(&mut stderr, &mut err)?;
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if out_closed
+                && err_closed
+                && let Some(status) = status
+            {
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
-    };
-    let stdout = out
-        .join()
-        .map_err(|_| anyhow::anyhow!("could not read gh stdout"))??;
-    let stderr = err
-        .join()
-        .map_err(|_| anyhow::anyhow!("could not read gh stderr"))??;
-    Ok(Output {
-        status: status?,
-        stdout,
-        stderr,
-    })
+    })();
+    if result.is_err() {
+        terminate_request(&mut child);
+    }
+    result
+}
+
+fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: the pipe owns this live descriptor throughout both fcntl calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Limit each drain so continuous output cannot starve stderr or the deadline.
+fn drain_pipe(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> io::Result<bool> {
+    let mut buffer = [0; 8192];
+    for _ in 0..16 {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn terminate_request(child: &mut Child) {
+    // SAFETY: process_group(0) gives this request its own group whose id is the
+    // child's pid; the negative id targets only it and its descendants.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    // Also kill the direct child if it changed groups, and reap it on every error.
+    child.kill().ok();
+    child.wait().ok();
 }
 
 /// Apps launched from Finder get a bare PATH, so look in the usual places too.
@@ -591,6 +633,39 @@ mod tests {
     }
 
     #[test]
+    fn cli_timeout_does_not_wait_for_descendants_holding_pipes() {
+        for script in ["sleep 5 & exec sleep 5", "sleep 5 & exit 0"] {
+            let started = Instant::now();
+            let error = command_output(
+                Command::new("/bin/sh").args(["-c", script]),
+                Duration::from_millis(50),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("timed out"), "{script}: {error}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{script}");
+            // A failed request must leave the next host free to run immediately.
+            let next = command_output(
+                Command::new("/bin/sh").args(["-c", "printf healthy"]),
+                Duration::from_secs(2),
+            )
+            .unwrap();
+            assert_eq!(next.stdout, b"healthy");
+        }
+    }
+
+    #[test]
+    fn continuous_output_cannot_starve_the_cli_deadline() {
+        let started = Instant::now();
+        let error = command_output(
+            Command::new("/bin/sh").args(["-c", "yes stdout & yes stderr >&2 & wait"]),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
     fn cli_output_drains_large_responses_and_preserves_failure_details() {
         let output = command_output(
             Command::new("/bin/sh").args(["-c", "printf 'bad credentials' >&2; exit 1"]),
@@ -600,11 +675,15 @@ mod tests {
         let error = gh_output(&["api"], output).unwrap_err();
         assert!(error.to_string().contains("bad credentials"));
         let output = command_output(
-            Command::new("/bin/sh").args(["-c", "head -c 131072 /dev/zero"]),
+            Command::new("/bin/sh").args([
+                "-c",
+                "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2",
+            ]),
             Duration::from_secs(2),
         )
         .unwrap();
         assert!(output.status.success());
         assert_eq!(output.stdout.len(), 131072);
+        assert_eq!(output.stderr.len(), 131072);
     }
 }
