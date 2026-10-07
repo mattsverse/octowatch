@@ -21,6 +21,9 @@ serde_json = "1.0.151"
 tray-icon = "0.26"
 tempfile = "3"
 
+[dev-dependencies]
+gpui = { version = "0.2.2", features = ["test-support"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-usernotifications = "0.3.1"
 objc2 = "0.6"

@@ -18,13 +18,13 @@ use gpui::{
 
 use discovery::LocalRepo;
 use notifications::Response;
-use store::{PendingReview, Snooze, Store};
+use store::{PendingReview, Store};
 use tray::{Tray, UpdateItem};
 use updater::Release;
 
 /// Choices offered in Settings for minutes between GitHub checks.
 const POLL_CHOICES: [u64; 7] = [1, 2, 5, 10, 15, 30, 60];
-/// Choices offered in Settings for minutes a review stays snoozed.
+/// Choices offered in Settings and for an individual review's snooze.
 const SNOOZE_CHOICES: [u64; 6] = [5, 10, 15, 30, 60, 120];
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
@@ -67,6 +67,8 @@ struct Octowatcher {
     /// `None` until the first scan of the roots finishes.
     repos: Option<Vec<LocalRepo>>,
     tab: Tab,
+    /// The one PR whose duration picker is open; never persisted as a default.
+    snooze_picker: Option<(String, u64)>,
     last_checked: Option<DateTime<Local>>,
     /// Each source keeps its own error, so a successful GitHub check doesn't
     /// hide a tray, save, permission or delivery error.
@@ -156,6 +158,7 @@ impl Octowatcher {
             store,
             repos: None,
             tab: Tab::Reviews,
+            snooze_picker: None,
             last_checked: None,
             fetch_error: None,
             tray_error,
@@ -245,29 +248,27 @@ impl Octowatcher {
         cx.notify();
     }
 
-    /// Hides a pending review from the list and the tray for the snooze
-    /// length, then notifies about it again.
+    /// Notification actions keep using the global default.
     fn snooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
-        let Some(pr) = self.store.pending.iter().find(|pr| pr.key() == key) else {
-            return;
-        };
-        let snooze = Snooze {
-            repo: key.0.clone(),
-            number: key.1,
-            until: Local::now().timestamp() + self.store.snooze_minutes as i64 * 60,
-            requested_at: pr.requested_at.clone(),
-        };
-        self.store.snoozed.retain(|s| s.key() != key);
-        self.store.snoozed.push(snooze);
-        self.snoozes_changed(cx);
+        self.snooze_for_minutes(key, self.store.snooze_minutes, cx);
+    }
+
+    fn snooze_for_minutes(&mut self, key: (String, u64), minutes: u64, cx: &mut Context<Self>) {
+        self.snooze_picker = None;
+        if self.store.snooze(&key, minutes, Local::now().timestamp()) {
+            self.snoozes_changed(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn unsnooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
-        self.store.snoozed.retain(|s| s.key() != key);
+        self.store.unsnooze(&key);
         self.snoozes_changed(cx);
     }
 
     fn snoozes_changed(&mut self, cx: &mut Context<Self>) {
+        self.dismiss_stale_snooze_picker();
         self.save();
         self.sync_tray();
         self.schedule_wake(cx);
@@ -276,7 +277,7 @@ impl Octowatcher {
 
     /// Sets a timer for the earliest snooze to run out.
     fn schedule_wake(&mut self, cx: &mut Context<Self>) {
-        let Some(until) = self.store.snoozed.iter().map(|s| s.until).min() else {
+        let Some(until) = self.store.next_snooze_until() else {
             self.wake_task = None;
             return;
         };
@@ -354,6 +355,7 @@ impl Octowatcher {
             .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
             .collect();
         let reconciled = self.store.reconcile(fetched);
+        self.dismiss_stale_snooze_picker();
         // Saving the snoozes also saves the pending list.
         if reconciled.snoozes_changed {
             self.snoozes_changed(cx);
@@ -467,6 +469,18 @@ impl Octowatcher {
             self.sync_tray();
         }
         cx.notify();
+    }
+
+    fn dismiss_stale_snooze_picker(&mut self) {
+        if let Some(key) = &self.snooze_picker
+            && !self
+                .store
+                .pending
+                .iter()
+                .any(|pr| pr.key() == *key && self.store.snooze_for(pr).is_none())
+        {
+            self.snooze_picker = None;
+        }
     }
 
     fn add_root(&mut self, cx: &mut Context<Self>) {
@@ -918,7 +932,9 @@ impl Octowatcher {
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .when(active, |s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+            .when(active, |s| {
+                s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+            })
             .when(!active, |s| {
                 s.text_color(rgb(theme::SUBTEXT))
                     .hover(|s| s.bg(rgb(theme::SURFACE)))
@@ -926,6 +942,7 @@ impl Octowatcher {
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.tab = tab;
+                this.snooze_picker = None;
                 cx.notify();
             }))
     }
@@ -946,6 +963,7 @@ impl Octowatcher {
             .children(self.store.pending.iter().enumerate().map(|(ix, pr)| {
                 let url = pr.url.clone();
                 let key = pr.key();
+                let picker_open = self.snooze_picker.as_ref() == Some(&key);
                 let snoozed_until = self.store.snooze_for(pr).map(|snooze| {
                     DateTime::from_timestamp(snooze.until, 0)
                         .map(|at| at.with_timezone(&Local).format("%H:%M").to_string())
@@ -960,12 +978,13 @@ impl Octowatcher {
                         },
                     ))
                 } else {
-                    button(("snooze", ix), "Snooze").on_click(cx.listener(
-                        move |this, _: &ClickEvent, _, cx| {
+                    button(("snooze", ix), "Snooze…")
+                        .debug_selector(move || format!("snooze-{ix}"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
-                            this.snooze(key.clone(), cx);
-                        },
-                    ))
+                            this.snooze_picker = if picker_open { None } else { Some(key.clone()) };
+                            cx.notify();
+                        }))
                 };
                 let badge = if pr.rereview {
                     Some(("re-review", theme::PEACH))
@@ -974,6 +993,7 @@ impl Octowatcher {
                 };
                 div()
                     .id(("review", ix))
+                    .debug_selector(move || format!("review-{ix}"))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -1008,15 +1028,28 @@ impl Octowatcher {
                             .truncate()
                             .child(pr.title.clone()),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::MUTED))
-                            .child(match &snoozed_until {
-                                Some(at) => format!("by {} · snoozed until {at}", pr.author),
-                                None => format!("by {}", pr.author),
-                            }),
-                    )
+                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(
+                        match &snoozed_until {
+                            Some(at) => format!("by {} · snoozed until {at}", pr.author),
+                            None => format!("by {}", pr.author),
+                        },
+                    ))
+                    .when(picker_open && snoozed_until.is_none(), |card| {
+                        let key = pr.key();
+                        card.child(snooze_picker(
+                            ix,
+                            self.store.snooze_minutes,
+                            cx,
+                            move |this, minutes, cx| {
+                                if let Some(minutes) = minutes {
+                                    this.snooze_for_minutes(key.clone(), minutes, cx);
+                                } else {
+                                    this.snooze_picker = None;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                    })
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)))
             }))
     }
@@ -1186,7 +1219,7 @@ impl Octowatcher {
                 cx,
             ))
             .child(self.render_choices(
-                "Snooze a review for",
+                "Default snooze length",
                 "snooze-minutes",
                 &SNOOZE_CHOICES,
                 self.store.snooze_minutes,
@@ -1231,11 +1264,7 @@ impl Octowatcher {
                     .gap_2()
                     .children(choices.iter().map(|&minutes| {
                         let active = minutes == current;
-                        let label = if minutes < 60 {
-                            format!("{minutes} min")
-                        } else {
-                            format!("{} h", minutes / 60)
-                        };
+                        let label = minutes_label(minutes);
                         div()
                             .id((id, minutes as usize))
                             .px_3()
@@ -1243,7 +1272,9 @@ impl Octowatcher {
                             .rounded_md()
                             .text_xs()
                             .cursor_pointer()
-                            .when(active, |s| s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE)))
+                            .when(active, |s| {
+                                s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE))
+                            })
                             .when(!active, |s| {
                                 s.bg(rgb(theme::SURFACE))
                                     .text_color(rgb(theme::SUBTEXT))
@@ -1258,7 +1289,73 @@ impl Octowatcher {
     }
 }
 
-fn button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful<gpui::Div> {
+/// Inline choices stay inside the card, but none of their clicks open its URL.
+fn snooze_picker<T: 'static>(
+    ix: usize,
+    default_minutes: u64,
+    cx: &mut Context<T>,
+    pick: impl Fn(&mut T, Option<u64>, &mut Context<T>) + Clone + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    // Keep a default saved by an older build available even if it isn't a preset.
+    let choices = SNOOZE_CHOICES
+        .into_iter()
+        .chain((!SNOOZE_CHOICES.contains(&default_minutes)).then_some(default_minutes));
+    div()
+        .id(("snooze-picker", ix))
+        .debug_selector(move || format!("snooze-picker-{ix}"))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .pt_2()
+        .cursor_default()
+        .child(section_title("Snooze for"))
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .children(choices.map(|minutes| {
+                    let pick = pick.clone();
+                    let is_default = minutes == default_minutes;
+                    let label = if is_default {
+                        format!("{} (default)", minutes_label(minutes))
+                    } else {
+                        minutes_label(minutes)
+                    };
+                    button(("snooze-duration", minutes as usize), label)
+                        .debug_selector(move || format!("snooze-duration-{ix}-{minutes}"))
+                        .when(is_default, |s| {
+                            s.border_1().border_color(rgb(theme::ACCENT))
+                        })
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            pick(this, Some(minutes), cx);
+                        }))
+                }))
+                .child(
+                    button("cancel-snooze", "Cancel")
+                        .debug_selector(move || format!("cancel-snooze-{ix}"))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            cx.stop_propagation();
+                            pick(this, None, cx);
+                        })),
+                ),
+        )
+        .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
+}
+
+fn minutes_label(minutes: u64) -> String {
+    if minutes < 60 || !minutes.is_multiple_of(60) {
+        format!("{minutes} min")
+    } else {
+        format!("{} h", minutes / 60)
+    }
+}
+
+fn button(
+    id: impl Into<gpui::ElementId>,
+    label: impl Into<SharedString>,
+) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_3()
@@ -1269,7 +1366,7 @@ fn button(id: impl Into<gpui::ElementId>, label: &'static str) -> gpui::Stateful
         .text_color(rgb(theme::ACCENT))
         .hover(|s| s.bg(rgb(theme::SURFACE_HOVER)))
         .cursor_pointer()
-        .child(label)
+        .child(label.into())
 }
 
 fn pill(label: &'static str, color: u32) -> gpui::Div {
@@ -1484,5 +1581,184 @@ pub fn show_window(cx: &mut App) {
     #[cfg(target_os = "linux")]
     if let Some(window) = existing {
         window.update(cx, |_, window, _| window.remove_window()).ok();
+    }
+}
+
+#[cfg(test)]
+mod snooze_tests {
+    use super::*;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+
+    fn review(number: u64) -> PendingReview {
+        PendingReview {
+            repo: "owner/repo".into(),
+            number,
+            title: format!("Review {number}"),
+            url: format!("https://github.com/owner/repo/pull/{number}"),
+            author: "author".into(),
+            is_draft: false,
+            rereview: false,
+            requested_at: None,
+        }
+    }
+
+    fn click(cx: &mut VisualTestContext, selector: &'static str) {
+        let bounds = cx.debug_bounds(selector).expect("visible control");
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    // No startup, tray, GitHub, config-file or notification side effects.
+    fn app_for_picker_test() -> Octowatcher {
+        Octowatcher {
+            store: Store {
+                pending: vec![review(1), review(2)],
+                ..Store::default()
+            },
+            repos: Some(Vec::new()),
+            tab: Tab::Reviews,
+            snooze_picker: None,
+            last_checked: None,
+            fetch_error: None,
+            tray_error: None,
+            save_error: None,
+            notification_error: None,
+            login_state: login::State::Unavailable("Test build".into()),
+            login_error: None,
+            #[cfg(target_os = "linux")]
+            restart_path: None,
+            announced_launch: true,
+            tray: None,
+            update: None,
+            scan_task: None,
+            fetch_task: None,
+            poll_task: None,
+            wake_task: None,
+            update_check: None,
+            _startup_and_updates: Task::ready(()),
+        }
+    }
+
+    #[test]
+    fn picker_tracks_the_pr_key_and_closes_when_the_review_disappears_or_is_snoozed() {
+        let mut app = app_for_picker_test();
+        let key = review(1).key();
+        app.snooze_picker = Some(key.clone());
+        app.store.pending.reverse();
+        app.dismiss_stale_snooze_picker();
+        assert_eq!(app.snooze_picker, Some(key.clone()));
+        app.store.snooze(&key, 30, 1_000);
+        app.dismiss_stale_snooze_picker();
+        assert_eq!(app.snooze_picker, None);
+        app.snooze_picker = Some(key);
+        app.store.pending.retain(|pr| pr.number != 1);
+        app.dismiss_stale_snooze_picker();
+        assert_eq!(app.snooze_picker, None);
+    }
+
+    #[gpui::test]
+    fn opening_switching_and_canceling_pickers_never_opens_the_pr(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| app_for_picker_test());
+        let closed_height = cx.debug_bounds("review-0").unwrap().size.height;
+        click(cx, "snooze-0");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.snooze_picker.clone()),
+            Some(review(1).key())
+        );
+        assert!(cx.debug_bounds("snooze-picker-0").is_some());
+        assert!(cx.debug_bounds("review-0").unwrap().size.height > closed_height);
+        click(cx, "snooze-1");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.snooze_picker.clone()),
+            Some(review(2).key())
+        );
+        // GPUI retains old debug selectors; check the card's current layout.
+        assert_eq!(
+            cx.debug_bounds("review-0").unwrap().size.height,
+            closed_height
+        );
+        assert!(cx.debug_bounds("snooze-picker-1").is_some());
+        click(cx, "cancel-snooze-1");
+        assert!(view.read_with(cx, |v, _| v.snooze_picker.is_none()
+            && v.store.snoozed.is_empty()));
+        assert_eq!(cx.opened_url(), None);
+        click(cx, "snooze-0");
+        click(cx, "snooze-0");
+        assert!(view.read_with(cx, |v, _| v.snooze_picker.is_none()));
+        assert_eq!(cx.opened_url(), None);
+        click(cx, "review-0");
+        assert_eq!(cx.opened_url(), Some(review(1).url));
+    }
+
+    struct PickerHarness {
+        store: Store,
+        picked: Vec<Option<u64>>,
+    }
+
+    impl Render for PickerHarness {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .id("card")
+                .w(px(360.))
+                .p_3()
+                .text_sm()
+                .child(snooze_picker(
+                    0,
+                    self.store.snooze_minutes,
+                    cx,
+                    |this, minutes, _| {
+                        this.picked.push(minutes);
+                        if let Some(minutes) = minutes {
+                            this.store.snooze(&review(1).key(), minutes, 1_000);
+                        }
+                    },
+                ))
+                .on_click(|_: &ClickEvent, _, cx| cx.open_url(&review(1).url))
+        }
+    }
+
+    #[gpui::test]
+    fn every_duration_and_picker_background_stop_click_propagation(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| PickerHarness {
+            store: Store {
+                pending: vec![review(1)],
+                snooze_minutes: 15,
+                ..Store::default()
+            },
+            picked: Vec::new(),
+        });
+        for (minutes, selector) in [
+            (5, "snooze-duration-0-5"),
+            (10, "snooze-duration-0-10"),
+            (15, "snooze-duration-0-15"),
+            (30, "snooze-duration-0-30"),
+            (60, "snooze-duration-0-60"),
+            (120, "snooze-duration-0-120"),
+        ] {
+            click(cx, selector);
+            view.read_with(cx, |v, _| {
+                assert_eq!(v.picked.last(), Some(&Some(minutes)));
+                assert_eq!(
+                    v.store.next_snooze_until(),
+                    Some(1_000 + minutes as i64 * 60)
+                );
+                assert_eq!(v.store.snooze_minutes, 15);
+            });
+            assert_eq!(cx.opened_url(), None);
+        }
+        // The panel heading/padding must also consume the card's click.
+        let panel = cx.debug_bounds("snooze-picker-0").unwrap();
+        cx.simulate_click(
+            panel.origin + gpui::point(px(2.), px(2.)),
+            Modifiers::none(),
+        );
+        assert_eq!(cx.opened_url(), None);
+        assert_eq!(view.read_with(cx, |v, _| v.picked.len()), 6);
+        click(cx, "cancel-snooze-0");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.picked.last().copied()),
+            Some(None)
+        );
+        assert_eq!(cx.opened_url(), None);
     }
 }
