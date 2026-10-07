@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::discovery::LocalRepo;
@@ -33,6 +33,15 @@ pub struct Store {
     pub snoozed: Vec<Snooze>,
     /// Last observed login registration; the OS remains authoritative.
     pub launch_at_login: bool,
+    /// Account the cached reviews and snoozes belong to. Older files omit it.
+    pub sync_account: Option<String>,
+    /// Active account per host; legacy sync_account belongs to github.com.
+    pub sync_accounts: BTreeMap<String, String>,
+    /// Unix seconds of the last complete, successful review sync.
+    pub last_successful_sync: Option<i64>,
+    /// Prevent replacement of a state file that couldn't be read or preserved.
+    #[serde(skip)]
+    pub(crate) recovery_blocked: Option<String>,
     /// Saved gh accounts seen before, including accounts since signed out.
     pub known_accounts: BTreeSet<String>,
     /// Verified login aliases used to migrate older name-based preferences.
@@ -46,7 +55,10 @@ pub struct Store {
     /// Successful checks in this session, never trusted across a restart.
     #[serde(skip)]
     pub available_accounts: BTreeSet<String>,
-    /// Discovered repos in this session, never trusted across a restart.
+    /// Known account caches may be shown stale; this never authorizes delivery.
+    #[serde(skip)]
+    pub stale_accounts: BTreeSet<String>,
+    /// Watched repos from this scan or the last saved checkout snapshot.
     #[serde(skip)]
     pub local_repos: BTreeSet<String>,
     /// Failed repository checks keep their cache hidden in this session.
@@ -81,6 +93,10 @@ impl Default for Store {
             snooze_minutes: 5,
             snoozed: Vec::new(),
             launch_at_login: false,
+            sync_account: None,
+            sync_accounts: BTreeMap::new(),
+            last_successful_sync: None,
+            recovery_blocked: None,
             known_accounts: BTreeSet::new(),
             account_ids: BTreeMap::new(),
             disabled_account_ids: BTreeSet::new(),
@@ -88,6 +104,7 @@ impl Default for Store {
             disabled_accounts: BTreeSet::new(),
             repo_accounts: BTreeMap::new(),
             available_accounts: BTreeSet::new(),
+            stale_accounts: BTreeSet::new(),
             local_repos: BTreeSet::new(),
             unavailable_repos: BTreeSet::new(),
             available_hosts: BTreeSet::new(),
@@ -213,16 +230,101 @@ impl Store {
         Ok(dir.join("octowatcher").join("state.json"))
     }
 
-    pub fn load() -> Self {
-        let mut store = Self::path()
-            .ok()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|json| Self::from_json(&json).ok())
-            .unwrap_or_default();
-        if store.roots.is_empty() {
-            store.roots = default_roots();
+    pub fn load() -> (Self, Option<String>) {
+        match Self::path() {
+            Ok(path) => Self::load_from(&path),
+            Err(err) => Self::load_failed(format!("{err:#}")),
         }
-        store
+    }
+
+    fn initial() -> Self {
+        Self {
+            roots: default_roots(),
+            ..Self::default()
+        }
+    }
+
+    fn load_failed(error: String) -> (Self, Option<String>) {
+        let message = format!(
+            "Could not load saved state: {error}. Defaults are in use; saving is paused to protect the original. Fix the file or its permissions, then restart Octowatcher."
+        );
+        let mut store = Self::initial();
+        store.recovery_blocked = Some(message.clone());
+        (store, Some(message))
+    }
+
+    fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
+        let json = match fs::read(path) {
+            Ok(json) => json,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (Self::initial(), None);
+            }
+            Err(err) => return Self::load_failed(format!("{}: {err}", path.display())),
+        };
+        match String::from_utf8(json.clone())
+            .map_err(anyhow::Error::from)
+            .and_then(|json| Self::from_json(&json))
+        {
+            Ok(store) => (store, None),
+            Err(err) => {
+                // A unique backup is kept before defaults can ever be saved.
+                let backup = (|| -> Result<PathBuf> {
+                    let parent = path.parent().context("state file has no parent")?;
+                    let file = tempfile::Builder::new()
+                        .prefix("state-recovery-")
+                        .suffix(".json")
+                        .tempfile_in(parent)?;
+                    fs::write(file.path(), &json)?;
+                    Ok(file.keep()?.1)
+                })();
+                match backup {
+                    Ok(backup) => (
+                        Self::initial(),
+                        Some(format!(
+                            "Saved state was invalid ({err}). Defaults are in use. Original contents preserved at {}. Review your watched folders and settings; restore the backup to state.json and restart if needed.",
+                            backup.display()
+                        )),
+                    ),
+                    Err(backup_err) => Self::load_failed(format!(
+                        "{} is invalid ({err}); could not preserve it: {backup_err:#}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Cached data from an unknown (legacy) or different account cannot be
+    /// assigned to the current account, even when its next review query fails.
+    #[cfg(test)]
+    pub fn activate_account(&mut self, login: &str) -> bool {
+        self.activate_host_account("github.com", login)
+    }
+
+    pub fn activate_host_account(&mut self, host: &str, login: &str) -> bool {
+        let previous = self.sync_accounts.get(host).or_else(|| {
+            (host == "github.com")
+                .then_some(self.sync_account.as_ref())
+                .flatten()
+        });
+        let changed = !previous.is_some_and(|previous| previous.eq_ignore_ascii_case(login));
+        let saved_login = if changed {
+            login.to_string()
+        } else {
+            previous.cloned().unwrap()
+        };
+        self.sync_accounts
+            .insert(host.to_string(), saved_login.clone());
+        if host == "github.com" {
+            self.sync_account = Some(saved_login);
+        }
+        if changed {
+            self.pending.retain(|pr| pr.repository().host != host);
+            self.snoozed.retain(|pr| pr.host != host);
+            self.notification_queue.retain(|pr| pr.host != host);
+            self.last_successful_sync = None;
+        }
+        changed
     }
 
     /// Legacy entries have no trustworthy receiving identity. Keep preferences,
@@ -295,6 +397,16 @@ impl Store {
             .collect();
         store.migrate_account_preferences();
         store.prune_notifications();
+        store.local_repos = crate::discovery::within_roots(&store.discovered, &store.roots)
+            .iter()
+            .map(|repo| repo.id.store_key())
+            .collect();
+        store.stale_accounts = store
+            .pending
+            .iter()
+            .filter(|pr| pr.host == PUBLIC_HOST && pr.account_id != 0 && !pr.account.is_empty())
+            .map(|pr| pr.account.to_lowercase())
+            .collect();
         Ok(store)
     }
 
@@ -324,12 +436,19 @@ impl Store {
     /// Keep aliases for stale gh config names, but display the current login.
     pub fn record_account(&mut self, login: &str, id: u64) {
         let login = login.to_lowercase();
+        let was_stale = self
+            .stale_accounts
+            .iter()
+            .any(|name| self.account_ids.get(name) == Some(&id));
         self.migrate_account_preferences();
         self.account_ids.insert(login.clone(), id);
         self.migrate_account_preferences();
         self.known_accounts
             .retain(|name| name == &login || self.account_ids.get(name) != Some(&id));
         self.known_accounts.insert(login.clone());
+        if was_stale {
+            self.stale_accounts.insert(login.clone());
+        }
         for pr in self
             .pending
             .iter_mut()
@@ -439,7 +558,8 @@ impl Store {
                         .confirmed_requests
                         .get(&pr.key())
                         .is_some_and(|at| at == &pr.requested_at))
-                    && self.available_accounts.contains(&pr.account.to_lowercase())
+                    && (self.available_accounts.contains(&pr.account.to_lowercase())
+                        || self.stale_accounts.contains(&pr.account.to_lowercase()))
                     && self
                         .account_ids
                         .get(&pr.account.to_lowercase())
@@ -457,7 +577,13 @@ impl Store {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+        self.save_to(&Self::path()?)
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(error) = &self.recovery_blocked {
+            bail!("{error}");
+        }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -596,6 +722,8 @@ impl Store {
             .iter()
             .filter_map(|pr| {
                 if !self.visible(pr)
+                    || (pr.host == PUBLIC_HOST
+                        && !self.available_accounts.contains(&pr.account.to_lowercase()))
                     || (pr.host != PUBLIC_HOST && !self.available_hosts.contains(&pr.host))
                     || self.snooze_for(pr).is_some()
                     || (pr.is_draft && !self.notify_drafts)
@@ -880,9 +1008,24 @@ mod tests {
     fn invalid_appearance_preserves_the_rest_of_the_store() {
         let mut original = Store {
             roots: vec!["/projects".into()],
-            disabled: ["o/off".into()].into(),
-            pending: vec![pr("o/r", 1, Some(T1)), pr("o/r", 2, Some(T1))],
-            snoozed: vec![snooze("o/r", 1, Some(T1))],
+            disabled: ["o/off".into(), "github.example.com/o/off".into()].into(),
+            pending: vec![
+                pr("o/r", 1, Some(T1)),
+                pr("o/r", 2, Some(T1)),
+                PendingReview {
+                    host: "github.example.com".into(),
+                    ..pr("o/r", 1, Some(T1))
+                },
+            ],
+            snoozed: vec![
+                snooze("o/r", 1, Some(T1)),
+                Snooze {
+                    host: "github.example.com".into(),
+                    ..snooze("o/r", 1, Some(T1))
+                },
+            ],
+            sync_account: Some("viewer".into()),
+            last_successful_sync: Some(1_700_000_000),
             poll_minutes: 15,
             snooze_minutes: 30,
             notifications_muted: true,
@@ -912,6 +1055,80 @@ mod tests {
                 serde_json::to_value(&original).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn old_settings_and_explicitly_empty_roots_survive_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"roots":[],"disabled":["o/r"],"poll_minutes":5,"snooze_minutes":15}"#,
+        )
+        .unwrap();
+        let (store, warning) = Store::load_from(&path);
+        assert!(warning.is_none());
+        assert!(store.roots.is_empty());
+        assert!(!store.is_enabled(&RepositoryId::new("github.com", "o/r")));
+        assert_eq!((store.poll_minutes, store.snooze_minutes), (5, 15));
+        assert_eq!(store.sync_account, None);
+        assert_eq!(store.last_successful_sync, None);
+    }
+
+    #[test]
+    fn corrupt_state_is_visible_and_preserved_before_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let original = b"{broken json";
+        std::fs::write(&path, original).unwrap();
+        let (store, warning) = Store::load_from(&path);
+        assert!(warning.unwrap().contains("Original contents preserved"));
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("state-recovery-")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        store.save_to(&path).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert!(Store::load_from(&path).1.is_none());
+    }
+
+    #[test]
+    fn unreadable_state_blocks_saving_instead_of_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the expected file path reliably fails on either OS,
+        // even when tests run under a user that bypasses file permissions.
+        let (store, warning) = Store::load_from(dir.path());
+        assert!(warning.unwrap().contains("saving is paused"));
+        let target = dir.path().join("replacement.json");
+        assert!(store.save_to(&target).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn account_and_success_time_persist_and_same_account_keeps_snoozes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = Store::default();
+        store.activate_account("Alice");
+        store.last_successful_sync = Some(123);
+        store.pending.push(pr("o/r", 1, None));
+        store.snoozed.push(snooze("o/r", 1, None));
+        assert!(!store.activate_account("alice"));
+        store.save_to(&path).unwrap();
+        let (store, warning) = Store::load_from(&path);
+        assert!(warning.is_none());
+        assert_eq!(store.sync_account.as_deref(), Some("Alice"));
+        assert_eq!(store.last_successful_sync, Some(123));
+        assert_eq!(store.pending.len(), 1);
+        assert_eq!(store.snoozed.len(), 1);
     }
 
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
@@ -1712,7 +1929,7 @@ mod tests {
             "pending": [],
             "snoozed": []
         }"#;
-        let mut store: Store = serde_json::from_str(legacy).unwrap();
+        let mut store = Store::from_json(legacy).unwrap();
         assert!(!store.launch_at_login);
         assert_eq!(store.poll_minutes, 15);
         assert_eq!(store.snooze_minutes, 30);
@@ -1722,8 +1939,10 @@ mod tests {
         );
         assert!(store.disabled.contains("owner/repo"));
         store.launch_at_login = true;
+        store.last_successful_sync = Some(123);
         let saved = serde_json::to_string(&store).unwrap();
-        let restored: Store = serde_json::from_str(&saved).unwrap();
+        let restored = Store::from_json(&saved).unwrap();
+        assert_eq!(restored.last_successful_sync, Some(123));
         assert!(restored.launch_at_login);
         assert_eq!(restored.poll_minutes, 15);
         assert_eq!(restored.roots, store.roots);
@@ -1895,6 +2114,7 @@ mod tests {
     #[test]
     fn unavailable_account_retains_cache_and_expired_snooze_until_recovery() {
         let mut store = fixture_store();
+        store.stale_accounts.clear(); // Explicit authentication failure hides the cache.
         store.local_repos.insert("owner/repo".into());
         store.available_accounts.insert("bob".into());
         store.snoozed[0].until = 50;
@@ -2012,6 +2232,7 @@ mod tests {
         assert_eq!(store.snoozed.len(), 2);
 
         store.available_accounts.remove("bob");
+        store.stale_accounts.remove("bob"); // Authentication failure, rather than a network outage.
         assert_eq!(store.next_snooze_until(), Some(8_200));
         assert!(!store.snooze(&bob.key(), 30, 1_100));
         assert!(store.take_expired(1_500).is_empty());

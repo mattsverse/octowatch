@@ -997,6 +997,7 @@ mod tests {
         assert_eq!(store.notifications_due(), vec![due[1].clone()]);
         let target = Target::Single(due[1].1.clone());
         store.available_accounts.remove("bob");
+        store.stale_accounts.remove("bob"); // Authentication failure hides the account.
         assert_eq!(
             target.respond(Response::Action("snooze".into()), &store),
             None

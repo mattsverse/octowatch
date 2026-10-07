@@ -37,10 +37,12 @@ impl Instance {
     /// `None` means another process accepted this launch. Quiet login launches
     /// don't raise its window; ordinary launches queue a reopen request.
     pub fn acquire(background: bool) -> Result<Option<Self>> {
-        // Other users cannot reserve a name inside our home directory. Keep
-        // this independent of XDG_CONFIG_HOME and the executable's location.
+        // Prefer the stable home location; use the OS's private per-user
+        // directory when HOME permits other users to create/replace entries.
+        // Neither location depends on XDG_CONFIG_HOME or the executable.
         let home = dirs::home_dir().context("no home directory for instance lock")?;
-        let directory = private_directory(&home)?;
+        let runtime = runtime_directory();
+        let directory = instance_directory(&home, runtime.as_deref())?;
         Self::acquire_in(&directory, background)
     }
 
@@ -141,15 +143,64 @@ fn current_uid() -> libc::uid_t {
     unsafe { libc::geteuid() }
 }
 
+#[cfg(target_os = "linux")]
+fn runtime_directory() -> Option<PathBuf> {
+    // Login and terminal launches normally share XDG_RUNTIME_DIR. The
+    // conventional OS path also works when a shell omits that variable.
+    dirs::runtime_dir().or_else(|| Some(PathBuf::from(format!("/run/user/{}", current_uid()))))
+}
+
+#[cfg(target_os = "macos")]
+fn runtime_directory() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // Darwin's private user cache is stable across launches and, unlike its
+    // temporary directory, is not periodically cleaned while a lock is held.
+    // SAFETY: a zero length query accepts a null buffer.
+    let size = unsafe { libc::confstr(libc::_CS_DARWIN_USER_CACHE_DIR, std::ptr::null_mut(), 0) };
+    if size == 0 {
+        return None;
+    }
+    let mut bytes = vec![0; size];
+    // SAFETY: bytes has the queried buffer size and remains live for this call.
+    let written = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_CACHE_DIR,
+            bytes.as_mut_ptr().cast(),
+            bytes.len(),
+        )
+    };
+    if written == 0 || written > bytes.len() {
+        return None;
+    }
+    bytes.truncate(written - 1); // confstr's size includes the final NUL.
+    Some(PathBuf::from(std::ffi::OsString::from_vec(bytes)))
+}
+
+fn protected_parent(path: &Path, private: bool) -> bool {
+    path.is_absolute()
+        && fs::metadata(path).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && metadata.uid() == current_uid()
+                && metadata.mode() & if private { 0o077 } else { 0o022 } == 0
+        })
+}
+
+fn instance_directory(home: &Path, runtime: Option<&Path>) -> Result<PathBuf> {
+    if protected_parent(home, false) {
+        return private_directory(home);
+    }
+    let runtime = runtime
+        .filter(|path| protected_parent(path, true))
+        .context("instance lock needs a protected home or a private per-user runtime directory")?;
+    private_directory(runtime)
+}
+
 fn private_directory(home: &Path) -> Result<PathBuf> {
     // Validate the parent too: a private leaf in a shared writable directory
     // could already have been reserved by another local user.
     let uid = current_uid();
-    let parent = fs::metadata(home)?;
-    if !parent.is_dir() || parent.uid() != uid || parent.mode() & 0o022 != 0 {
-        bail!(
-            "the instance lock needs a home directory owned by you and not writable by other users"
-        );
+    if !protected_parent(home, false) {
+        bail!("the instance lock directory must be owned by you and not writable by other users");
     }
     let directory = home.join(".octowatcher-instance");
     match DirBuilder::new().mode(0o700).create(&directory) {
@@ -368,6 +419,46 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         symlink(target.path(), home.path().join(".octowatcher-instance")).unwrap();
         assert!(private_directory(home.path()).is_err());
+    }
+
+    #[test]
+    fn group_writable_home_uses_private_runtime_and_hands_off_launches() {
+        let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let directory = instance_directory(home.path(), Some(runtime.path())).unwrap();
+        assert!(directory.starts_with(runtime.path()));
+        assert!(!home.path().join(".octowatcher-instance").exists());
+        let owner = Instance::acquire_in(&directory, true).unwrap().unwrap();
+        assert!(Instance::acquire_in(&directory, true).unwrap().is_none());
+        assert!(owner.reopen.try_recv().is_err());
+        assert!(Instance::acquire_in(&directory, false).unwrap().is_none());
+        assert_eq!(owner.reopen.try_recv(), Ok(()));
+        drop(owner);
+        assert!(Instance::acquire_in(&directory, false).unwrap().is_some());
+        // A protected HOME keeps the same lock regardless of runtime env.
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            instance_directory(home.path(), Some(runtime.path()))
+                .unwrap()
+                .starts_with(home.path())
+        );
+    }
+
+    #[test]
+    fn unprotected_home_requires_a_private_runtime_parent() {
+        let home = tempfile::tempdir().unwrap();
+        fs::set_permissions(home.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(instance_directory(home.path(), None).is_err());
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(instance_directory(home.path(), Some(runtime.path())).is_err());
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), runtime.path().join(".octowatcher-instance"))
+            .unwrap();
+        assert!(instance_directory(home.path(), Some(runtime.path())).is_err());
     }
 
     fn wait_for(path: &Path) {

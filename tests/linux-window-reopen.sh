@@ -4,7 +4,10 @@
 set -euo pipefail
 binary=$(realpath "${1:?usage: $0 /path/to/octowatcher}")
 if [[ ${OCTOWATCHER_REOPEN_TEST_SESSION:-} != 1 ]]; then
-    exec dbus-run-session -- env OCTOWATCHER_REOPEN_TEST_SESSION=1 "$0" "$binary"
+    for mode in 700 775; do
+        dbus-run-session -- env OCTOWATCHER_REOPEN_TEST_SESSION=1 OCTOWATCHER_TEST_HOME_MODE="$mode" "$0" "$binary"
+    done
+    exit 0
 fi
 workspace=$(mktemp -d)
 app_pid= wm_pid= xvfb_pid=
@@ -19,6 +22,11 @@ export HOME="$workspace/home" XDG_CONFIG_HOME="$workspace/config" XDG_RUNTIME_DI
 unset WAYLAND_DISPLAY GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
 export GH_CONFIG_DIR="$workspace/gh-config"
 mkdir -m 700 "$HOME" "$XDG_CONFIG_HOME" "$XDG_RUNTIME_DIR"
+chmod "${OCTOWATCHER_TEST_HOME_MODE:-700}" "$HOME"
+instance_parent="$HOME"
+if [[ ${OCTOWATCHER_TEST_HOME_MODE:-700} == 775 ]]; then
+    instance_parent="$XDG_RUNTIME_DIR"
+fi
 mkdir -p "$XDG_CONFIG_HOME/octowatcher" "$workspace/empty" "$workspace/bin"
 # No repository discovery, notifications or GitHub authentication in this test.
 printf '{"roots":["%s"],"request_auth":true}\n' "$workspace/empty" > "$XDG_CONFIG_HOME/octowatcher/state.json"
@@ -57,7 +65,7 @@ only_one_visible_window() {
     [[ $(wc -l <<< "$windows") -eq 1 ]]
 }
 window_exists() { [[ -n $(window_for_app) ]]; }
-await test -s "$HOME/.octowatcher-instance/instance.lock"
+await test -s "$instance_parent/.octowatcher-instance/instance.lock"
 # Allow the cold launch to finish initialization on the virtual display.
 sleep 1
 kill -0 "$app_pid"
@@ -104,4 +112,4 @@ wait "$app_pid"
 app_pid=$!
 await window_exists
 await only_one_visible_window
-echo 'PASS: quiet startup, duplicate handoff, Close/minimize, Quit and restart'
+echo "PASS: HOME mode ${OCTOWATCHER_TEST_HOME_MODE:-700}, quiet startup, duplicate handoff, Close/minimize, Quit and restart"

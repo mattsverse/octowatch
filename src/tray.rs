@@ -36,7 +36,7 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(pending: &[PendingReview], muted: bool) -> Result<Self> {
+    pub fn new(pending: &[PendingReview], status: Option<&str>, muted: bool) -> Result<Self> {
         // GPUI has its own X11/Wayland event loop; it doesn't initialize GTK
         // for the AppIndicator and its menu. An initialization failure must
         // return an error so quiet startup can fall back to opening a window.
@@ -50,16 +50,27 @@ impl Tray {
         let builder = builder.with_icon(tray_icon());
         let icon = builder
             .with_tooltip("Octowatcher")
-            .with_menu(Box::new(build_menu(pending, UpdateItem::Check, muted)?))
+            .with_menu(Box::new(build_menu(
+                pending,
+                UpdateItem::Check,
+                status,
+                muted,
+            )?))
             .build()?;
         let tray = Self { icon };
         tray.set_count(pending.len());
         Ok(tray)
     }
 
-    pub fn update(&self, pending: &[PendingReview], update: UpdateItem, muted: bool) -> Result<()> {
+    pub fn update(
+        &self,
+        pending: &[PendingReview],
+        update: UpdateItem,
+        status: Option<&str>,
+        muted: bool,
+    ) -> Result<()> {
         self.icon
-            .set_menu(Some(Box::new(build_menu(pending, update, muted)?)));
+            .set_menu(Some(Box::new(build_menu(pending, update, status, muted)?)));
         self.set_count(pending.len());
         Ok(())
     }
@@ -137,9 +148,16 @@ pub fn listen(cx: &mut App) {
     .detach();
 }
 
-fn build_menu(pending: &[PendingReview], update: UpdateItem, muted: bool) -> Result<Menu> {
+fn build_menu(
+    pending: &[PendingReview],
+    update: UpdateItem,
+    status: Option<&str>,
+    muted: bool,
+) -> Result<Menu> {
     let menu = Menu::new();
-    if pending.is_empty() {
+    if let Some(status) = status {
+        menu.append(&MenuItem::new(status, false, None))?;
+    } else if pending.is_empty() {
         menu.append(&MenuItem::new(
             "Nothing waiting on your review.",
             false,
