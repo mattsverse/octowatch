@@ -11,6 +11,7 @@ use crate::store::PendingReview;
 const SHOW_ID: &str = "show";
 const QUIT_ID: &str = "quit";
 const REFRESH_ID: &str = "refresh";
+const MUTE_ID: &str = "mute-notifications";
 const RESTART_ID: &str = "restart";
 const CHECK_UPDATES_ID: &str = "check-updates";
 const INSTALL_ID: &str = "install-update";
@@ -35,7 +36,7 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(pending: &[PendingReview], status: Option<&str>) -> Result<Self> {
+    pub fn new(pending: &[PendingReview], status: Option<&str>, muted: bool) -> Result<Self> {
         let builder = TrayIconBuilder::new();
         // Templates are a macOS notion; elsewhere the icon is drawn as is.
         #[cfg(target_os = "macos")]
@@ -44,7 +45,12 @@ impl Tray {
         let builder = builder.with_icon(tray_icon());
         let icon = builder
             .with_tooltip("Octowatcher")
-            .with_menu(Box::new(build_menu(pending, UpdateItem::Check, status)?))
+            .with_menu(Box::new(build_menu(
+                pending,
+                UpdateItem::Check,
+                status,
+                muted,
+            )?))
             .build()?;
         let tray = Self { icon };
         tray.set_count(pending.len());
@@ -56,9 +62,10 @@ impl Tray {
         pending: &[PendingReview],
         update: UpdateItem,
         status: Option<&str>,
+        muted: bool,
     ) -> Result<()> {
         self.icon
-            .set_menu(Some(Box::new(build_menu(pending, update, status)?)));
+            .set_menu(Some(Box::new(build_menu(pending, update, status, muted)?)));
         self.set_count(pending.len());
         Ok(())
     }
@@ -81,6 +88,8 @@ pub fn listen(cx: &mut App) {
             let id = event.id.as_ref();
             let handled = if id == SHOW_ID {
                 cx.update(crate::show_window)
+            } else if id == MUTE_ID {
+                cx.update(crate::toggle_notifications_muted)
             } else if id == REFRESH_ID {
                 cx.update(crate::refresh)
             } else if id == RESTART_ID {
@@ -104,7 +113,12 @@ pub fn listen(cx: &mut App) {
     .detach();
 }
 
-fn build_menu(pending: &[PendingReview], update: UpdateItem, status: Option<&str>) -> Result<Menu> {
+fn build_menu(
+    pending: &[PendingReview],
+    update: UpdateItem,
+    status: Option<&str>,
+    muted: bool,
+) -> Result<Menu> {
     let menu = Menu::new();
     if let Some(status) = status {
         menu.append(&MenuItem::new(status, false, None))?;
@@ -132,6 +146,16 @@ fn build_menu(pending: &[PendingReview], update: UpdateItem, status: Option<&str
     }
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&MenuItem::with_id(REFRESH_ID, "Refresh Now", true, None))?;
+    menu.append(&MenuItem::with_id(
+        MUTE_ID,
+        if muted {
+            "Resume Review Notifications"
+        } else {
+            "Mute Review Notifications"
+        },
+        true,
+        None,
+    ))?;
     let item = match update {
         UpdateItem::Check => MenuItem::with_id(CHECK_UPDATES_ID, "Check for Updates…", true, None),
         UpdateItem::Checking => MenuItem::new("Checking for Updates…", false, None),
