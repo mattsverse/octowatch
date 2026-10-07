@@ -2,7 +2,7 @@
 //! and no token ever needs to be stored by the app.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap, HashSet},
     io::{self, Read},
     os::unix::{io::AsRawFd, process::CommandExt as _},
     path::Path,
@@ -12,38 +12,74 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use serde::Deserialize;
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::{Deserialize, de::DeserializeOwned};
 
 use crate::{
-    repository::{PUBLIC_HOST, normalize_host},
+    repository::{PUBLIC_HOST, RepositoryId, normalize_host},
     store::PendingReview,
 };
 
-/// Search for open PRs, by someone else, where the viewer (or one of their
-/// teams) is a requested reviewer. GitHub drops the viewer from the request
-/// list once they review, so a PR leaves this search when the review lands.
-const QUERY: &str = r#"
-query($q: String!, $me: String!) {
-  search(query: $q, type: ISSUE, first: 100) {
-    nodes {
-      ... on PullRequest {
-        number
-        title
-        url
-        isDraft
-        author { login }
-        repository { nameWithOwner }
-        reviewRequests(first: 50) {
-          nodes { requestedReviewer { __typename ... on User { login } } }
+// Enumerate watched repositories rather than global search: search has a
+// 1,000-result ceiling and its dashboard qualifiers need not share API behavior.
+const REPOSITORY_QUERY: &str = r#"
+query($owner: String!, $name: String!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    nameWithOwner
+    isArchived
+    pullRequests(first: 100, after: $after, states: OPEN) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        id number title url isDraft state author { login }
+        reviewRequests(first: 100) {
+          pageInfo { hasNextPage endCursor }
+          nodes { requestedReviewer { __typename ... on User { login } ... on Team { id } } }
         }
-        reviews(last: 1, author: $me) { nodes { submittedAt } }
-        timelineItems(last: 20, itemTypes: [REVIEW_REQUESTED_EVENT]) {
-          nodes {
-            ... on ReviewRequestedEvent {
-              createdAt
-              requestedReviewer { __typename ... on User { login } }
-            }
+      }
+    }
+  }
+}
+"#;
+
+const REQUESTS_QUERY: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      reviewRequests(first: 100, after: $after) {
+        pageInfo { hasNextPage endCursor }
+        nodes { requestedReviewer { __typename ... on User { login } ... on Team { id } } }
+      }
+    }
+  }
+}
+"#;
+
+const MEMBERS_QUERY: &str = r#"
+query($id: ID!, $me: String!, $after: String) {
+  node(id: $id) {
+    ... on Team {
+      members(first: 100, after: $after, query: $me, membership: ALL) {
+        pageInfo { hasNextPage endCursor }
+        nodes { login }
+      }
+    }
+  }
+}
+"#;
+
+const HISTORY_QUERY: &str = r#"
+query($id: ID!, $after: String) {
+  node(id: $id) {
+    ... on PullRequest {
+      timelineItems(first: 100, after: $after, itemTypes: [REVIEW_REQUESTED_EVENT, PULL_REQUEST_REVIEW]) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          __typename
+          ... on ReviewRequestedEvent {
+            createdAt
+            requestedReviewer { __typename ... on User { login } ... on Team { id } }
           }
+          ... on PullRequestReview { submittedAt state author { login } }
         }
       }
     }
@@ -99,150 +135,361 @@ fn parse_hosts(output: &str) -> Result<Vec<String>> {
     Ok(hosts.into_iter().collect())
 }
 
-#[derive(Debug, Default)]
-pub struct FetchResults {
-    pub reviews: Vec<PendingReview>,
-    pub successful_hosts: BTreeSet<String>,
+/// Confirmed requests can enter the queue even when some team lookups fail.
+/// Only complete repository snapshots may remove saved requests.
+#[derive(Default)]
+pub struct FetchedReviews {
+    pub pending: Vec<PendingReview>,
+    pub completed_repos: HashSet<RepositoryId>,
     pub errors: Vec<String>,
 }
 
-/// Poll only hosts with enabled local repositories. Each failure is isolated.
-pub fn fetch_awaiting_reviews(hosts: &BTreeSet<String>) -> FetchResults {
-    fetch_hosts_with(hosts, |host| fetch_host_with(host, gh_request))
+pub fn fetch_awaiting_reviews(repos: &HashSet<RepositoryId>) -> Result<FetchedReviews> {
+    fetch_repositories_with(repos, gh_request)
 }
 
-fn fetch_hosts_with(
-    hosts: &BTreeSet<String>,
-    mut fetch: impl FnMut(&str) -> Result<Vec<PendingReview>>,
-) -> FetchResults {
-    let mut results = FetchResults::default();
+fn fetch_repositories_with(
+    repos: &HashSet<RepositoryId>,
+    mut run: impl FnMut(&[&str]) -> Result<String>,
+) -> Result<FetchedReviews> {
+    let hosts: BTreeSet<_> = repos.iter().map(|repo| repo.host.clone()).collect();
+    let mut fetched = FetchedReviews::default();
     for host in hosts {
-        match fetch(host) {
-            Ok(reviews) => {
-                results.successful_hosts.insert(host.clone());
-                results.reviews.extend(reviews);
+        let me = run(&["api", "--hostname", &host, "user", "--jq", ".login"])
+            .with_context(|| {
+                format!("could not read viewer; check `gh auth status --hostname {host}`")
+            })
+            .and_then(|login| {
+                let login = login.trim().to_string();
+                if login.is_empty() {
+                    bail!(
+                        "`gh api user` returned no login; check `gh auth status --hostname {host}`"
+                    );
+                }
+                Ok(login)
+            });
+        let me = match me {
+            Ok(me) => me,
+            Err(err) => {
+                fetched.errors.push(format!("{host}: {err:#}"));
+                continue;
             }
-            Err(err) => results.errors.push(format!("{host}: {err:#}")),
+        };
+        let host_repos = repos
+            .iter()
+            .filter(|repo| repo.host == host)
+            .cloned()
+            .collect();
+        let result = fetch_with(&host_repos, &me, &mut |query, variables| {
+            let mut args = vec![
+                "api".to_string(),
+                "--hostname".into(),
+                host.clone(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+            ];
+            for (name, value) in variables {
+                args.extend(["-f".into(), format!("{name}={value}")]);
+            }
+            run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        })?;
+        fetched.pending.extend(result.pending);
+        fetched.completed_repos.extend(result.completed_repos);
+        fetched.errors.extend(result.errors);
+    }
+    Ok(fetched)
+}
+
+type Variables = Vec<(&'static str, String)>;
+type Api<'a> = dyn FnMut(&str, Variables) -> Result<String> + 'a;
+type Memberships = HashMap<(String, String), std::result::Result<bool, String>>;
+
+fn fetch_with(
+    repos: &HashSet<RepositoryId>,
+    me: &str,
+    api: &mut Api<'_>,
+) -> Result<FetchedReviews> {
+    let mut fetched = FetchedReviews::default();
+    // Membership can change between polls; cache it only within this poll.
+    let mut memberships = HashMap::new();
+    let mut repos: Vec<_> = repos.iter().collect();
+    repos.sort();
+    for repo in repos {
+        let mut errors = Vec::new();
+        match fetch_repo(repo, me, &mut memberships, &mut errors, api) {
+            Ok(pending) => {
+                fetched.pending.extend(pending);
+                if errors.is_empty() {
+                    fetched.completed_repos.insert(repo.clone());
+                }
+            }
+            Err(err) => errors.push(format!("{err:#}")),
+        }
+        fetched
+            .errors
+            .extend(errors.into_iter().map(|error| format!("{repo}: {error}")));
+    }
+    Ok(fetched)
+}
+
+fn fetch_repo(
+    repo: &RepositoryId,
+    me: &str,
+    memberships: &mut Memberships,
+    errors: &mut Vec<String>,
+    api: &mut Api<'_>,
+) -> Result<Vec<PendingReview>> {
+    let (owner, name) = repo
+        .slug
+        .split_once('/')
+        .context("invalid repository slug")?;
+    let variables = vec![("owner", owner.into()), ("name", name.into())];
+    let mut cursor = Cursor::default();
+    let mut pending = HashMap::new();
+    loop {
+        let data: RepositoryData = request(api, REPOSITORY_QUERY, cursor.variables(&variables))?;
+        let repository = data.repository.context("repository unavailable")?;
+        if repository.is_archived {
+            return Ok(Vec::new());
+        }
+        for mut pr in repository.pull_requests.nodes {
+            if pr.state != "OPEN"
+                || pr
+                    .author
+                    .as_ref()
+                    .is_some_and(|a| a.login.eq_ignore_ascii_case(me))
+            {
+                continue;
+            }
+            let id = vec![("id", pr.id.clone())];
+            let mut requests_cursor = Cursor::default();
+            while requests_cursor.advance(&pr.review_requests.page_info)? {
+                let data: NodeData<RequestsData> =
+                    request(api, REQUESTS_QUERY, requests_cursor.variables(&id))?;
+                let page = data
+                    .node
+                    .context("pull request unavailable")?
+                    .review_requests;
+                pr.review_requests.nodes.extend(page.nodes);
+                pr.review_requests.page_info = page.page_info;
+            }
+            let mut relevant = HashSet::new();
+            for review in &pr.review_requests.nodes {
+                let reviewer = review
+                    .requested_reviewer
+                    .as_ref()
+                    .context("requested reviewer unavailable")?;
+                match reviewer {
+                    Reviewer::User { login } if login.eq_ignore_ascii_case(me) => {
+                        relevant.insert(reviewer.key().unwrap());
+                    }
+                    Reviewer::Team { id } => {
+                        // An unreadable team does not negate a known direct or
+                        // other team request. Report uncertainty so this repo
+                        // cannot clear saved state, but keep checking known targets.
+                        match memberships
+                            .entry((repo.host.clone(), id.clone()))
+                            .or_insert_with(|| {
+                                is_member(id, me, api).map_err(|err| format!("{err:#}"))
+                            }) {
+                            Ok(true) => {
+                                relevant.insert(reviewer.key().unwrap());
+                            }
+                            Ok(false) => {}
+                            Err(err) => errors.push(format!("PR #{}: team {id}: {err}", pr.number)),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if relevant.is_empty() {
+                continue;
+            }
+            let mut history = Vec::new();
+            let mut history_cursor = Cursor::default();
+            loop {
+                let data: NodeData<HistoryData> =
+                    request(api, HISTORY_QUERY, history_cursor.variables(&id))?;
+                let page = data
+                    .node
+                    .context("pull request unavailable")?
+                    .timeline_items;
+                history.extend(page.nodes);
+                if !history_cursor.advance(&page.page_info)? {
+                    break;
+                }
+            }
+            if let Some(review) = pr.into_pending(
+                &repo.host,
+                &repository.name_with_owner,
+                me,
+                &relevant,
+                history,
+            )? {
+                pending.insert(review.key(), review);
+            }
+        }
+        if !cursor.advance(&repository.pull_requests.page_info)? {
+            break;
         }
     }
-    results
+    let mut pending: Vec<_> = pending.into_values().collect();
+    pending.sort_by_key(PendingReview::key);
+    Ok(pending)
 }
 
-fn fetch_host_with(
-    host: &str,
-    mut run: impl FnMut(&[&str]) -> Result<String>,
-) -> Result<Vec<PendingReview>> {
-    // Resolve the viewer per request, per host. A process-global login could
-    // leak the identity from github.com into an Enterprise review query.
-    let me = run(&["api", "--hostname", host, "user", "--jq", ".login"])
-        .with_context(|| {
-            format!("could not read viewer; check `gh auth status --hostname {host}`")
-        })?
-        .trim()
-        .to_string();
-    if me.is_empty() {
-        bail!("`gh api user` returned no login; check `gh auth status --hostname {host}`");
+fn is_member(id: &str, me: &str, api: &mut Api<'_>) -> Result<bool> {
+    let variables = vec![("id", id.into()), ("me", me.into())];
+    let mut cursor = Cursor::default();
+    loop {
+        let data: NodeData<MembersData> =
+            request(api, MEMBERS_QUERY, cursor.variables(&variables))?;
+        let page = data.node.context("team membership unavailable")?.members;
+        if page
+            .nodes
+            .iter()
+            .any(|member| member.login.eq_ignore_ascii_case(me))
+        {
+            return Ok(true);
+        }
+        if !cursor.advance(&page.page_info)? {
+            return Ok(false);
+        }
     }
-    let search = "is:pr is:open archived:false review-requested:@me -author:@me";
-    let output = run(&[
-        "api",
-        "--hostname",
-        host,
-        "graphql",
-        "-f",
-        &format!("query={QUERY}"),
-        "-f",
-        &format!("q={search}"),
-        "-f",
-        &format!("me={me}"),
-    ])
-    .context("could not fetch reviews (check authentication and server GraphQL compatibility)")?;
-    parse_reviews(&output, host, &me)
 }
 
-fn parse_reviews(output: &str, host: &str, me: &str) -> Result<Vec<PendingReview>> {
-    let response: Response =
-        serde_json::from_str(output).context("unexpected GitHub GraphQL response")?;
+impl Pr {
+    fn into_pending(
+        self,
+        host: &str,
+        repo: &str,
+        me: &str,
+        relevant: &HashSet<String>,
+        history: Vec<HistoryItem>,
+    ) -> Result<Option<PendingReview>> {
+        let mut requests = HashMap::new();
+        let mut last_review = None;
+        for item in history {
+            match item {
+                HistoryItem::ReviewRequestedEvent {
+                    created_at,
+                    requested_reviewer,
+                } => {
+                    if let Some(key) = requested_reviewer.and_then(|reviewer| reviewer.key())
+                        && relevant.contains(&key)
+                    {
+                        let date = timestamp(&created_at)?;
+                        let previous = requests.entry(key).or_insert(date);
+                        *previous = (*previous).max(date);
+                    }
+                }
+                HistoryItem::PullRequestReview {
+                    submitted_at,
+                    state,
+                    author,
+                } => {
+                    if state != "PENDING"
+                        && author.is_some_and(|a| a.login.eq_ignore_ascii_case(me))
+                    {
+                        let date = timestamp(
+                            &submitted_at.context("submitted review timestamp unavailable")?,
+                        )?;
+                        last_review = Some(
+                            last_review.map_or(date, |previous: DateTime<Utc>| previous.max(date)),
+                        );
+                    }
+                }
+            }
+        }
+        // Never infer completion or freshness from a truncated/inaccessible history.
+        if requests.len() != relevant.len() {
+            bail!("review request history incomplete for PR #{}", self.number);
+        }
+        let requested_at = requests
+            .into_values()
+            .max()
+            .context("no relevant request timestamp")?;
+        // A timestamp tie cannot prove that the review satisfied the latest
+        // request. Preserve the existing conservative behavior: keep it visible.
+        if last_review.is_some_and(|reviewed| reviewed > requested_at) {
+            return Ok(None);
+        }
+        Ok(Some(PendingReview {
+            host: host.into(),
+            repo: repo.into(),
+            number: self.number,
+            title: self.title,
+            url: self.url,
+            author: self
+                .author
+                .map(|a| a.login)
+                .unwrap_or_else(|| "ghost".into()),
+            is_draft: self.is_draft,
+            rereview: last_review.is_some(),
+            requested_at: Some(requested_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
+        }))
+    }
+}
+
+fn timestamp(value: &str) -> Result<DateTime<Utc>> {
+    Ok(DateTime::parse_from_rfc3339(value)
+        .context("invalid GitHub timestamp")?
+        .with_timezone(&Utc))
+}
+
+// Reject GraphQL partial data even when `gh` exits successfully. Strict node
+// decoding rejects null connection entries instead of silently dropping them.
+fn request<T: DeserializeOwned>(api: &mut Api<'_>, query: &str, variables: Variables) -> Result<T> {
+    let output = api(query, variables)?;
+    let response: GraphqlResponse =
+        serde_json::from_str(&output).context("unexpected GitHub response")?;
     if !response.errors.is_empty() {
         bail!(
-            "GitHub GraphQL error (check permissions and server compatibility): {}",
+            "GitHub GraphQL: {}",
             response
                 .errors
                 .into_iter()
-                .map(|e| e.message)
+                .map(|error| error.message)
                 .collect::<Vec<_>>()
                 .join("; ")
         );
     }
-    let data = response
-        .data
-        .context("GitHub GraphQL response contained no data")?;
-    Ok(data
-        .search
-        .nodes
-        .into_iter()
-        .flatten()
-        .filter_map(|pr| pr.into_pending(host, me))
-        .collect())
+    // Read errors before decoding typed data: partial fields can be missing
+    // precisely because GitHub denied access, and the error explains why.
+    serde_json::from_value(response.data.context("GitHub returned no data")?)
+        .context("incomplete GitHub response")
 }
 
-impl Pr {
-    fn into_pending(self, host: &str, me: &str) -> Option<PendingReview> {
-        let author = self
-            .author
-            .map(|a| a.login)
-            .unwrap_or_else(|| "ghost".into());
-        if author.eq_ignore_ascii_case(me) {
-            return None;
+#[derive(Default)]
+struct Cursor {
+    after: Option<String>,
+    seen: HashSet<String>,
+}
+
+impl Cursor {
+    fn variables(&self, base: &Variables) -> Variables {
+        let mut variables = base.clone();
+        if let Some(after) = &self.after {
+            variables.push(("after", after.clone()));
         }
-        // A request counts when it names the viewer or a team (the search
-        // already guarantees the viewer belongs to it).
-        let concerns_me = |reviewer: &Option<Reviewer>| match reviewer {
-            Some(Reviewer::User { login }) => login.eq_ignore_ascii_case(me),
-            Some(Reviewer::Team) => true,
-            _ => false,
-        };
-        if !self
-            .review_requests
-            .nodes
-            .iter()
-            .any(|r| concerns_me(&r.requested_reviewer))
-        {
-            return None;
+        variables
+    }
+
+    fn advance(&mut self, page: &PageInfo) -> Result<bool> {
+        if !page.has_next_page {
+            return Ok(false);
         }
-        let requested_at = self
-            .timeline_items
-            .nodes
-            .into_iter()
-            .flatten()
-            .filter(|event| concerns_me(&event.requested_reviewer))
-            .filter_map(|event| event.created_at)
-            .max();
-        let last_review = self
-            .reviews
-            .nodes
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.submitted_at)
-            .max();
-        // A team request survives a member's review, so check the dates too.
-        // GitHub timestamps share one format, so string order is time order.
-        if let (Some(requested), Some(reviewed)) = (&requested_at, &last_review)
-            && reviewed > requested
-        {
-            return None;
+        let cursor = page
+            .end_cursor
+            .clone()
+            .filter(|cursor| !cursor.is_empty())
+            .context("missing pagination cursor")?;
+        if !self.seen.insert(cursor.clone()) {
+            bail!("GitHub pagination cursor repeated");
         }
-        Some(PendingReview {
-            host: host.to_ascii_lowercase(),
-            repo: self.repository.name_with_owner,
-            number: self.number,
-            title: self.title,
-            url: self.url,
-            author,
-            is_draft: self.is_draft,
-            rereview: last_review.is_some(),
-            requested_at,
-        })
+        self.after = Some(cursor);
+        Ok(true)
     }
 }
 
@@ -375,50 +622,65 @@ fn gh_binary() -> &'static str {
 }
 
 #[derive(Deserialize)]
-struct Response {
-    data: Option<Data>,
+struct GraphqlResponse {
+    data: Option<serde_json::Value>,
     #[serde(default)]
-    errors: Vec<GraphQLError>,
+    errors: Vec<GraphqlError>,
 }
 
 #[derive(Deserialize)]
-struct GraphQLError {
+struct GraphqlError {
     message: String,
 }
 
 #[derive(Deserialize)]
-struct Data {
-    search: Nodes<Option<Pr>>,
-}
-
-#[derive(Deserialize)]
-struct Nodes<T> {
-    nodes: Vec<T>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Pr {
-    number: u64,
-    title: String,
-    url: String,
-    is_draft: bool,
-    author: Option<Login>,
-    repository: Repository,
-    review_requests: Nodes<ReviewRequest>,
-    reviews: Nodes<Option<Review>>,
-    timeline_items: Nodes<Option<RequestEvent>>,
-}
-
-#[derive(Deserialize)]
-struct Login {
-    login: String,
+struct RepositoryData {
+    repository: Option<Repository>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Repository {
     name_with_owner: String,
+    is_archived: bool,
+    pull_requests: Connection<Pr>,
+}
+
+#[derive(Deserialize)]
+struct NodeData<T> {
+    node: Option<T>,
+}
+
+#[derive(Deserialize)]
+struct Connection<T> {
+    nodes: Vec<T>,
+    #[serde(rename = "pageInfo")]
+    page_info: PageInfo,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Pr {
+    id: String,
+    number: u64,
+    title: String,
+    url: String,
+    is_draft: bool,
+    state: String,
+    author: Option<Login>,
+    review_requests: Connection<ReviewRequest>,
+}
+
+#[derive(Deserialize)]
+struct Login {
+    login: String,
 }
 
 #[derive(Deserialize)]
@@ -433,257 +695,55 @@ enum Reviewer {
     User {
         login: String,
     },
-    Team,
+    Team {
+        id: String,
+    },
     #[serde(other)]
     Other,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Review {
-    submitted_at: Option<String>,
+impl Reviewer {
+    fn key(&self) -> Option<String> {
+        match self {
+            Self::User { login } => Some(format!("user:{}", login.to_lowercase())),
+            Self::Team { id } => Some(format!("team:{id}")),
+            Self::Other => None,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RequestEvent {
-    created_at: Option<String>,
-    requested_reviewer: Option<Reviewer>,
+struct RequestsData {
+    review_requests: Connection<ReviewRequest>,
+}
+
+#[derive(Deserialize)]
+struct MembersData {
+    members: Connection<Login>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HistoryData {
+    timeline_items: Connection<HistoryItem>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "__typename")]
+enum HistoryItem {
+    #[serde(rename_all = "camelCase")]
+    ReviewRequestedEvent {
+        created_at: String,
+        requested_reviewer: Option<Reviewer>,
+    },
+    #[serde(rename_all = "camelCase")]
+    PullRequestReview {
+        submitted_at: Option<String>,
+        state: String,
+        author: Option<Login>,
+    },
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn response(host: &str, viewer: &str) -> String {
-        json!({"data":{"search":{"nodes":[{
-            "number":17,"title":"Review me","url":format!("https://{host}/owner/repo/pull/17"),
-            "isDraft":false,"author":{"login":"author"},"repository":{"nameWithOwner":"Owner/Repo"},
-            "reviewRequests":{"nodes":[{"requestedReviewer":{"__typename":"User","login":viewer}}]},
-            "reviews":{"nodes":[]},"timelineItems":{"nodes":[]}
-        }]}}})
-        .to_string()
-    }
-
-    #[test]
-    fn discovers_configured_hosts_including_unhealthy_ones() {
-        // Auth status JSON can succeed even when one host's credentials fail.
-        // Host names, rather than successful account states, are the authority.
-        assert_eq!(
-            parse_hosts(r#"["GITHUB.EXAMPLE.COM","acme.ghe.com","github.com"]"#).unwrap(),
-            vec!["acme.ghe.com", "github.com", "github.example.com"]
-        );
-        assert_eq!(parse_hosts("[]").unwrap(), vec!["github.com"]);
-        for invalid in [
-            r#"["https://ghe.example"]"#,
-            r#"["ghe.example:8443"]"#,
-            r#"["-option"]"#,
-            "{}",
-        ] {
-            assert!(parse_hosts(invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn requires_machine_readable_cli_version() {
-        assert!(
-            check_cli_version("gh version 2.81.0 (2025-10-01)\nhttps://github.com/cli/cli").is_ok()
-        );
-        assert!(check_cli_version("gh version 2.102.0 (2026-09-30)").is_ok());
-        let error = check_cli_version("gh version 2.80.0 (2025-09-23)").unwrap_err();
-        assert!(error.to_string().contains("2.81"));
-        assert!(check_cli_version("unrecognized version").is_err());
-    }
-
-    #[test]
-    fn routes_viewer_and_reviews_explicitly_for_each_host() {
-        let mut reviews = Vec::new();
-        for (host, viewer) in [
-            ("github.com", "public-user"),
-            ("github.example.com", "server-user"),
-            ("acme.ghe.com", "cloud-user"),
-        ] {
-            let mut calls = Vec::new();
-            reviews.extend(
-                fetch_host_with(host, |args| {
-                    calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-                    assert_eq!(&args[..3], ["api", "--hostname", host]);
-                    match args[3] {
-                        "user" => Ok(format!("{viewer}\n")),
-                        "graphql" => {
-                            assert!(args.contains(&format!("me={viewer}").as_str()));
-                            Ok(response(host, viewer))
-                        }
-                        _ => panic!("unexpected endpoint"),
-                    }
-                })
-                .unwrap(),
-            );
-            assert_eq!(calls.len(), 2);
-        }
-        let keys: BTreeSet<_> = reviews.iter().map(PendingReview::key).collect();
-        assert_eq!(keys.len(), 3);
-        assert!(
-            reviews
-                .iter()
-                .all(|pr| pr.repo == "Owner/Repo" && pr.number == 17)
-        );
-    }
-
-    #[test]
-    fn authentication_and_schema_failures_do_not_become_empty_successes() {
-        let mut calls = 0;
-        let error = fetch_host_with("github.example.com", |_| {
-            calls += 1;
-            bail!("HTTP 401: bad credentials")
-        })
-        .unwrap_err();
-        assert_eq!(calls, 1);
-        assert!(format!("{error:#}").contains("gh auth status --hostname github.example.com"));
-        assert!(fetch_host_with("github.com", |_| Ok("\n".into())).is_err());
-        for output in [
-            r#"{"errors":[{"message":"Field isDraft does not exist"}]}"#,
-            r#"{"data":{"search":{"nodes":[]}},"errors":[{"message":"permission denied"}]}"#,
-            r#"{"data":null}"#,
-        ] {
-            assert!(
-                parse_reviews(output, "github.example.com", "me").is_err(),
-                "{output}"
-            );
-        }
-        assert!(
-            parse_reviews(
-                r#"{"data":{"search":{"nodes":[]}}}"#,
-                "github.example.com",
-                "me"
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn host_failures_do_not_block_other_hosts() {
-        let hosts = BTreeSet::from([
-            "github.com".into(),
-            "github.example.com".into(),
-            "acme.ghe.com".into(),
-        ]);
-        let results = fetch_hosts_with(&hosts, |host| {
-            if host == "github.example.com" {
-                bail!("unsupported GraphQL schema");
-            }
-            parse_reviews(&response(host, "me"), host, "me")
-        });
-        assert_eq!(results.reviews.len(), 2);
-        assert_eq!(
-            results.successful_hosts,
-            BTreeSet::from(["github.com".into(), "acme.ghe.com".into()])
-        );
-        assert_eq!(
-            results.errors,
-            ["github.example.com: unsupported GraphQL schema"]
-        );
-    }
-
-    #[test]
-    fn host_discovery_requests_only_names_and_reports_cli_failures() {
-        let mut calls = 0;
-        let hosts = known_hosts_with(|args| {
-            calls += 1;
-            match args {
-                ["--version"] => Ok("gh version 2.81.0 (2025-10-01)".into()),
-                [
-                    "auth",
-                    "status",
-                    "--active",
-                    "--json",
-                    "hosts",
-                    "--jq",
-                    ".hosts | keys",
-                ] => Ok(r#"["github.example.com"]"#.into()),
-                _ => panic!("unexpected gh invocation: {args:?}"),
-            }
-        })
-        .unwrap();
-        assert_eq!(calls, 2);
-        assert_eq!(hosts, ["github.com", "github.example.com"]);
-        let error = known_hosts_with(|args| {
-            if args == ["--version"] {
-                Ok("gh version 2.81.0".into())
-            } else {
-                bail!("could not read configuration")
-            }
-        })
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("could not discover GitHub hosts"));
-    }
-
-    #[test]
-    fn cli_timeout_terminates_the_request_instead_of_blocking_polling() {
-        let started = Instant::now();
-        let error = command_output(
-            Command::new("/bin/sh").args(["-c", "exec sleep 5"]),
-            Duration::from_millis(30),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn cli_timeout_does_not_wait_for_descendants_holding_pipes() {
-        for script in ["sleep 5 & exec sleep 5", "sleep 5 & exit 0"] {
-            let started = Instant::now();
-            let error = command_output(
-                Command::new("/bin/sh").args(["-c", script]),
-                Duration::from_millis(50),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("timed out"), "{script}: {error}");
-            assert!(started.elapsed() < Duration::from_secs(2), "{script}");
-            // A failed request must leave the next host free to run immediately.
-            let next = command_output(
-                Command::new("/bin/sh").args(["-c", "printf healthy"]),
-                Duration::from_secs(2),
-            )
-            .unwrap();
-            assert_eq!(next.stdout, b"healthy");
-        }
-    }
-
-    #[test]
-    fn continuous_output_cannot_starve_the_cli_deadline() {
-        let started = Instant::now();
-        let error = command_output(
-            Command::new("/bin/sh").args(["-c", "yes stdout & yes stderr >&2 & wait"]),
-            Duration::from_millis(50),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn cli_output_drains_large_responses_and_preserves_failure_details() {
-        let output = command_output(
-            Command::new("/bin/sh").args(["-c", "printf 'bad credentials' >&2; exit 1"]),
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        let error = gh_output(&["api"], output).unwrap_err();
-        assert!(error.to_string().contains("bad credentials"));
-        let output = command_output(
-            Command::new("/bin/sh").args([
-                "-c",
-                "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2",
-            ]),
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout.len(), 131072);
-        assert_eq!(output.stderr.len(), 131072);
-    }
-}
+mod tests;
