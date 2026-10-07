@@ -428,6 +428,7 @@ impl Store {
                     && self.monitors(&pr.account, &pr.repo)))
     }
 
+    #[cfg(test)]
     pub fn visible_pending(&self) -> Vec<PendingReview> {
         self.pending
             .iter()
