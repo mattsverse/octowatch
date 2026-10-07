@@ -7,6 +7,8 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::theme::Appearance;
+
 /// Everything that survives a restart, saved as JSON in the platform config dir.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -30,6 +32,8 @@ pub struct Store {
     /// Prevent replacement of a state file that couldn't be read or preserved.
     #[serde(skip)]
     pub(crate) recovery_blocked: Option<String>,
+    /// System appearance or a persistent light/dark override.
+    pub appearance: Appearance,
 }
 
 impl Default for Store {
@@ -44,6 +48,7 @@ impl Default for Store {
             sync_account: None,
             last_successful_sync: None,
             recovery_blocked: None,
+            appearance: Appearance::default(),
         }
     }
 }
@@ -307,6 +312,85 @@ fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PendingReview, Snooze, Store};
+    use crate::theme::Appearance;
+
+    #[test]
+    fn legacy_settings_default_to_system_without_losing_state() {
+        let original = Store {
+            roots: vec!["/projects".into()],
+            disabled: ["o/off".into()].into(),
+            pending: vec![pr("o/r", 1, Some(T1))],
+            snoozed: vec![snooze("o/r", 1, Some(T1))],
+            poll_minutes: 15,
+            snooze_minutes: 30,
+            ..Store::default()
+        };
+        let mut legacy = serde_json::to_value(&original).unwrap();
+        legacy.as_object_mut().unwrap().remove("appearance");
+        let restored: Store = serde_json::from_value(legacy).unwrap();
+        assert_eq!(restored.appearance, Appearance::System);
+        assert_eq!(restored.roots, original.roots);
+        assert_eq!(restored.disabled, original.disabled);
+        assert_eq!(restored.pending, original.pending);
+        assert_eq!(restored.snoozed, original.snoozed);
+        assert_eq!(restored.poll_minutes, 15);
+        assert_eq!(restored.snooze_minutes, 30);
+    }
+
+    #[test]
+    fn appearance_choices_survive_state_serialization() {
+        for (appearance, value) in [
+            (Appearance::System, "system"),
+            (Appearance::Light, "light"),
+            (Appearance::Dark, "dark"),
+        ] {
+            let store = Store {
+                appearance,
+                ..Store::default()
+            };
+            let json = serde_json::to_vec_pretty(&store).unwrap();
+            let restored: Store = serde_json::from_slice(&json).unwrap();
+            assert_eq!(restored.appearance, appearance);
+            assert_eq!(serde_json::to_value(store).unwrap()["appearance"], value);
+        }
+    }
+
+    #[test]
+    fn invalid_appearance_preserves_the_rest_of_the_store() {
+        let original = Store {
+            roots: vec!["/projects".into()],
+            disabled: ["o/off".into()].into(),
+            pending: vec![pr("o/r", 1, Some(T1))],
+            snoozed: vec![snooze("o/r", 1, Some(T1))],
+            sync_account: Some("viewer".into()),
+            last_successful_sync: Some(1_700_000_000),
+            poll_minutes: 15,
+            snooze_minutes: 30,
+            ..Store::default()
+        };
+        for appearance in [
+            serde_json::json!("high_contrast"),
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::json!(2.5),
+            serde_json::json!([]),
+            serde_json::json!(["dark"]),
+            serde_json::json!({"light": null}),
+        ] {
+            let mut saved = serde_json::to_value(&original).unwrap();
+            saved["appearance"] = appearance.clone();
+            let restored: Store = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap())
+                .unwrap_or_else(|error| panic!("appearance {appearance}: {error}"));
+            assert_eq!(restored.appearance, Appearance::System);
+            // The next save must retain all existing data, normalizing only the
+            // unsupported preference to the safe default.
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
+    }
 
     #[test]
     fn old_settings_and_explicitly_empty_roots_survive_loading() {
