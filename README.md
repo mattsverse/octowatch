@@ -64,9 +64,17 @@ The window has three tabs.
 
 ### Reviews
 
-This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
+This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu lists the awake reviews.
 
-**Snooze** hides a pull request from the tray for the snooze length set in Settings. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new notification about a single pull request also has a **Snooze** button. One that covers several pull requests doesn't. Snoozes survive a restart.
+**Search and filters** help you find reviews in a busy queue. Search matches title, owner/repository, author, and PR number without regard to case. Every space-separated term must match, and terms can match different fields: `acme alice login` finds login PRs by Alice in an Acme repository. A plain number is a substring search; `#123` matches exactly PR number 123.
+
+Choose a repository, **Ready** (non-draft) or **Draft**, **First review** or **Re-review**, and **Awake** or **Snoozed**. These filters combine with search and each other. All four default to **All**, including snoozed reviews. Repository choices come from the full review list; a selected repository stays selected even if its last PR disappears during a refresh.
+
+The list shows **X of Y reviews**. The Reviews tab keeps the total count, including snoozed PRs. Search and filters only change this window's list: they do not change watched repositories, the tray's awake count/list, or notifications. Your view choices survive refreshes, tab changes, and closing/reopening the window, and reset when you restart the app.
+
+Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. When no PRs match, the window shows a no-results message and a reset button.
+
+**Snooze** hides a pull request from the tray for the snooze length set in Settings. With the default All filters, it stays listed in the window, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new notification about a single pull request also has a **Snooze** button. One that covers several pull requests doesn't. Snoozes survive a restart.
 
 ### Repositories
 
