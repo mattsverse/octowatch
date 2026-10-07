@@ -3,6 +3,54 @@
 /// A button on a notification: its identifier, then its label.
 pub type Action = (&'static str, &'static str);
 
+#[derive(Debug, Clone, Default)]
+pub enum Permission {
+    #[default]
+    Checking,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Allowed(String),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Denied,
+    Unknown(String),
+}
+
+/// Read permission without prompting. Linux notification servers expose no
+/// portable per-application permission query, so do not claim authorization.
+pub async fn permission() -> Permission {
+    #[cfg(target_os = "macos")]
+    {
+        use mac_usernotifications::{
+            AuthorizationStatus as Auth, NotificationSettingStatus as Setting,
+        };
+        match mac_usernotifications::get_notification_settings().await {
+            Ok(settings) => match settings.authorization_status {
+                Auth::Denied => Permission::Denied,
+                Auth::Authorized | Auth::Provisional | Auth::Ephemeral => Permission::Allowed(
+                    if settings.alert_enabled == Setting::Enabled {
+                        "Allowed"
+                    } else {
+                        "Allowed; banners are off or delivered quietly"
+                    }
+                    .into(),
+                ),
+                Auth::NotDetermined => {
+                    Permission::Unknown("Permission has not been granted yet".into())
+                }
+                Auth::Unknown => {
+                    Permission::Unknown("macOS returned an unknown authorization status".into())
+                }
+            },
+            Err(err) => Permission::Unknown(format!(
+                "Cannot read permission: {err}. macOS requires a signed .app bundle."
+            )),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Permission::Unknown("Permission cannot be queried on this desktop. Use Send test notification and check desktop notification settings.".into())
+    }
+}
+
 /// What the user did with a notification.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Response {

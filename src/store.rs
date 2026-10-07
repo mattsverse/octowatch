@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
 };
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 /// Everything that survives a restart, saved as JSON in the platform config dir.
@@ -23,6 +23,13 @@ pub struct Store {
     pub snooze_minutes: u64,
     /// Reviews the user put aside for now.
     pub snoozed: Vec<Snooze>,
+    /// Account the cached reviews and snoozes belong to. Older files omit it.
+    pub sync_account: Option<String>,
+    /// Unix seconds of the last complete, successful review sync.
+    pub last_successful_sync: Option<i64>,
+    /// Prevent replacement of a state file that couldn't be read or preserved.
+    #[serde(skip)]
+    recovery_blocked: Option<String>,
 }
 
 impl Default for Store {
@@ -34,6 +41,9 @@ impl Default for Store {
             poll_minutes: 2,
             snooze_minutes: 5,
             snoozed: Vec::new(),
+            sync_account: None,
+            last_successful_sync: None,
+            recovery_blocked: None,
         }
     }
 }
@@ -92,20 +102,92 @@ impl Store {
         Ok(dir.join("octowatcher").join("state.json"))
     }
 
-    pub fn load() -> Self {
-        let mut store = Self::path()
-            .ok()
-            .and_then(|path| fs::read_to_string(path).ok())
-            .and_then(|json| serde_json::from_str::<Self>(&json).ok())
-            .unwrap_or_default();
-        if store.roots.is_empty() {
-            store.roots = default_roots();
+    pub fn load() -> (Self, Option<String>) {
+        match Self::path() {
+            Ok(path) => Self::load_from(&path),
+            Err(err) => Self::load_failed(format!("{err:#}")),
         }
-        store
+    }
+
+    fn initial() -> Self {
+        Self {
+            roots: default_roots(),
+            ..Self::default()
+        }
+    }
+
+    fn load_failed(error: String) -> (Self, Option<String>) {
+        let message = format!(
+            "Could not load saved state: {error}. Defaults are in use; saving is paused to protect the original. Fix the file or its permissions, then restart Octowatcher."
+        );
+        let mut store = Self::initial();
+        store.recovery_blocked = Some(message.clone());
+        (store, Some(message))
+    }
+
+    fn load_from(path: &std::path::Path) -> (Self, Option<String>) {
+        let json = match fs::read(path) {
+            Ok(json) => json,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return (Self::initial(), None);
+            }
+            Err(err) => return Self::load_failed(format!("{}: {err}", path.display())),
+        };
+        match serde_json::from_slice(&json) {
+            Ok(store) => (store, None),
+            Err(err) => {
+                // A unique backup is kept before defaults can ever be saved.
+                let backup = (|| -> Result<PathBuf> {
+                    let parent = path.parent().context("state file has no parent")?;
+                    let file = tempfile::Builder::new()
+                        .prefix("state-recovery-")
+                        .suffix(".json")
+                        .tempfile_in(parent)?;
+                    fs::write(file.path(), &json)?;
+                    Ok(file.keep()?.1)
+                })();
+                match backup {
+                    Ok(backup) => (
+                        Self::initial(),
+                        Some(format!(
+                            "Saved state was invalid ({err}). Defaults are in use. Original contents preserved at {}. Review your watched folders and settings; restore the backup to state.json and restart if needed.",
+                            backup.display()
+                        )),
+                    ),
+                    Err(backup_err) => Self::load_failed(format!(
+                        "{} is invalid ({err}); could not preserve it: {backup_err:#}",
+                        path.display()
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Cached data from an unknown (legacy) or different account cannot be
+    /// assigned to the current account, even when its next review query fails.
+    pub fn activate_account(&mut self, login: &str) -> bool {
+        if self
+            .sync_account
+            .as_ref()
+            .is_some_and(|previous| previous.eq_ignore_ascii_case(login))
+        {
+            return false;
+        }
+        self.pending.clear();
+        self.snoozed.clear();
+        self.last_successful_sync = None;
+        self.sync_account = Some(login.to_string());
+        true
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
+        self.save_to(&Self::path()?)
+    }
+
+    fn save_to(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(error) = &self.recovery_blocked {
+            bail!("{error}");
+        }
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
@@ -200,6 +282,80 @@ fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PendingReview, Snooze, Store};
+
+    #[test]
+    fn old_settings_and_explicitly_empty_roots_survive_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::write(
+            &path,
+            r#"{"roots":[],"disabled":["o/r"],"poll_minutes":5,"snooze_minutes":15}"#,
+        )
+        .unwrap();
+        let (store, warning) = Store::load_from(&path);
+        assert!(warning.is_none());
+        assert!(store.roots.is_empty());
+        assert!(!store.is_enabled("o/r"));
+        assert_eq!((store.poll_minutes, store.snooze_minutes), (5, 15));
+        assert_eq!(store.sync_account, None);
+        assert_eq!(store.last_successful_sync, None);
+    }
+
+    #[test]
+    fn corrupt_state_is_visible_and_preserved_before_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let original = b"{broken json";
+        std::fs::write(&path, original).unwrap();
+        let (store, warning) = Store::load_from(&path);
+        assert!(warning.unwrap().contains("Original contents preserved"));
+        let backup = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("state-recovery-")
+            })
+            .unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        store.save_to(&path).unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), original);
+        assert!(Store::load_from(&path).1.is_none());
+    }
+
+    #[test]
+    fn unreadable_state_blocks_saving_instead_of_overwriting() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory at the expected file path reliably fails on either OS,
+        // even when tests run under a user that bypasses file permissions.
+        let (store, warning) = Store::load_from(dir.path());
+        assert!(warning.unwrap().contains("saving is paused"));
+        let target = dir.path().join("replacement.json");
+        assert!(store.save_to(&target).is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn account_and_success_time_persist_and_same_account_keeps_snoozes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let mut store = Store::default();
+        store.activate_account("Alice");
+        store.last_successful_sync = Some(123);
+        store.pending.push(pr("o/r", 1, None));
+        store.snoozed.push(snooze("o/r", 1, None));
+        assert!(!store.activate_account("alice"));
+        store.save_to(&path).unwrap();
+        let (store, warning) = Store::load_from(&path);
+        assert!(warning.is_none());
+        assert_eq!(store.sync_account.as_deref(), Some("Alice"));
+        assert_eq!(store.last_successful_sync, Some(123));
+        assert_eq!(store.pending.len(), 1);
+        assert_eq!(store.snoozed.len(), 1);
+    }
 
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
         PendingReview {

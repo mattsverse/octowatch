@@ -1,5 +1,6 @@
 mod discovery;
 mod github;
+mod health;
 mod notifications;
 mod store;
 mod tray;
@@ -15,6 +16,7 @@ use gpui::{
 };
 
 use discovery::LocalRepo;
+use health::{ReviewsStatus, SyncHealth};
 use notifications::Response;
 use store::{PendingReview, Snooze, Store};
 use tray::{Tray, UpdateItem};
@@ -65,13 +67,16 @@ struct Octowatcher {
     /// `None` until the first scan of the roots finishes.
     repos: Option<Vec<LocalRepo>>,
     tab: Tab,
-    last_checked: Option<DateTime<Local>>,
+    health: SyncHealth,
+    folder_issues: Vec<String>,
+    load_warning: Option<String>,
+    permission: notifications::Permission,
     /// Each source keeps its own error, so a successful GitHub check doesn't
     /// hide a tray, save, permission or delivery error.
-    fetch_error: Option<String>,
     tray_error: Option<String>,
     save_error: Option<String>,
     notification_error: Option<String>,
+    notifications_ready: bool,
     /// Whether the reviews waiting at launch were announced yet.
     announced_launch: bool,
     tray: Option<Tray>,
@@ -82,6 +87,8 @@ struct Octowatcher {
     /// Fires when the earliest snooze runs out.
     wake_task: Option<Task<()>>,
     update_check: Option<Task<()>>,
+    permission_task: Option<Task<()>>,
+    _health_clock: Task<()>,
     /// Requests notification permission, starts polling, then schedules updates.
     _startup_and_updates: Task<()>,
 }
@@ -89,26 +96,39 @@ struct Octowatcher {
 impl Octowatcher {
     fn new(cx: &mut Context<Self>) -> Self {
         let startup_and_updates = cx.spawn(async move |this, cx| {
+            // Discovery and sync do not depend on answering the OS prompt.
+            if this
+                .update(cx, |this, cx| {
+                    this.schedule_poll(cx);
+                    this.rescan(cx);
+                    this.check_permission(cx);
+                })
+                .is_err()
+            {
+                return;
+            }
             // Ask without blocking the UI, before any background notification
             // can be sent. macOS only prompts when permission is undecided.
             #[cfg(target_os = "macos")]
-            let notification_error = match notifications::request_auth().await {
-                Ok(true) => None,
-                Ok(false) => Some(
-                    "Notifications are disabled. Enable Allow Notifications for Octowatcher in System Settings → Notifications."
+            let _authorization = futures_lite::future::race(notifications::request_auth(), async {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                Err(
+                    "Notification permission request timed out; check System Settings and Refresh"
                         .into(),
-                ),
-                Err(err) => Some(format!("could not request notification permission: {err}")),
-            };
+                )
+            })
+            .await;
             if this
                 .update(cx, |this, cx| {
-                    #[cfg(target_os = "macos")]
-                    {
-                        this.notification_error = notification_error;
+                    this.notifications_ready = true;
+                    if this.health.verified && !this.announced_launch {
+                        this.announced_launch = true;
+                        this.announce_waiting(cx);
                     }
-                    this.schedule_poll(cx);
                     this.schedule_wake(cx);
-                    this.rescan(cx);
+                    this.check_permission(cx);
                 })
                 .is_err()
             {
@@ -129,20 +149,40 @@ impl Octowatcher {
                 cx.background_executor().timer(UPDATE_INTERVAL).await;
             }
         });
-        let store = Store::load();
-        let (tray, tray_error) = match Tray::new(&store.awake()) {
+        let (store, load_warning) = Store::load();
+        // Saved reviews are unverified for the active account at launch.
+        let (tray, tray_error) = match Tray::new(&[], ReviewsStatus::Loading.tray_message()) {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
         };
+        let health_clock = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(30))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.sync_tray();
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             store,
             repos: None,
             tab: Tab::Reviews,
-            last_checked: None,
-            fetch_error: None,
+            health: SyncHealth::default(),
+            folder_issues: Vec::new(),
+            load_warning,
+            permission: notifications::Permission::default(),
             tray_error,
             save_error: None,
             notification_error: None,
+            notifications_ready: !cfg!(target_os = "macos"),
             announced_launch: false,
             tray,
             update: None,
@@ -151,6 +191,8 @@ impl Octowatcher {
             poll_task: None,
             wake_task: None,
             update_check: None,
+            permission_task: None,
+            _health_clock: health_clock,
             _startup_and_updates: startup_and_updates,
         }
     }
@@ -236,19 +278,23 @@ impl Octowatcher {
     fn wake(&mut self, cx: &mut Context<Self>) {
         let woken = self.store.take_expired(Local::now().timestamp());
         self.snoozes_changed(cx);
-        self.notify(woken, cx);
+        if self.health.verified && self.notifications_ready {
+            self.notify(woken, cx);
+        }
     }
 
     /// Rediscovers local clones, then checks GitHub again.
     fn rescan(&mut self, cx: &mut Context<Self>) {
+        self.health.verified = false;
         let roots = self.store.roots.clone();
         self.scan_task = Some(cx.spawn(async move |this, cx| {
-            let repos = cx
+            let scan = cx
                 .background_executor()
                 .spawn(async move { discovery::discover(&roots) })
                 .await;
             this.update(cx, |this, cx| {
-                this.repos = Some(repos);
+                this.repos = Some(scan.repos);
+                this.folder_issues = scan.issues;
                 this.scan_task = None;
                 // Results fetched against the old repo list are stale.
                 this.fetch_task = None;
@@ -256,34 +302,69 @@ impl Octowatcher {
             })
             .ok();
         }));
+        self.sync_tray();
         cx.notify();
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.check_permission(cx);
         // Filtering needs the repo list, and the scan refreshes once it's done.
-        if self.repos.is_none() || self.fetch_task.is_some() {
+        if self.repos.is_none() || self.scan_task.is_some() || self.fetch_task.is_some() {
             return;
         }
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { github::fetch_awaiting_reviews() })
+                .spawn(async { github::check() })
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
-                this.last_checked = Some(Local::now());
-                match result {
-                    Ok(fetched) => {
-                        this.fetch_error = None;
-                        this.reconcile(fetched, cx);
-                    }
-                    Err(err) => this.fetch_error = Some(format!("{err:#}")),
+                let (fetched, changed_account) =
+                    this.health
+                        .apply(result, &mut this.store, Local::now().timestamp());
+                if changed_account {
+                    this.announced_launch = false;
+                    this.schedule_wake(cx);
+                    this.sync_tray();
                 }
+                match fetched {
+                    Some(fetched) => {
+                        this.reconcile(fetched, cx);
+                        // Account and success time persist even for an unchanged list.
+                        this.save();
+                    }
+                    None if changed_account => this.save(),
+                    None => {}
+                }
+                this.sync_tray();
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    fn check_permission(&mut self, cx: &mut Context<Self>) {
+        if self.permission_task.is_some() {
+            return;
+        }
+        self.permission_task = Some(cx.spawn(async move |this, cx| {
+            let permission = futures_lite::future::race(notifications::permission(), async {
+                cx.background_executor()
+                    .timer(Duration::from_secs(10))
+                    .await;
+                notifications::Permission::Unknown(
+                    "Permission check timed out. Refresh to retry.".into(),
+                )
+            })
+            .await;
+            this.update(cx, |this, cx| {
+                this.permission = permission;
+                this.permission_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     /// Replaces the pending list with what GitHub reports now, keeping only
@@ -303,6 +384,9 @@ impl Octowatcher {
         } else if reconciled.pending_changed {
             self.save();
             self.sync_tray();
+        }
+        if !self.notifications_ready {
+            return;
         }
         if self.announced_launch {
             self.notify(reconciled.fresh, cx);
@@ -399,6 +483,7 @@ impl Octowatcher {
     fn toggle_repo(&mut self, slug: &str, cx: &mut Context<Self>) {
         let key = slug.to_lowercase();
         if self.store.disabled.remove(&key) {
+            self.health.verified = false;
             self.save();
             self.refresh(cx);
         } else {
@@ -578,14 +663,18 @@ impl Octowatcher {
         };
         let summary = format!("Octowatcher {} is available", release.version);
         let url = release.url.clone();
-        self.show_notification(summary, body.into(), Some(action), cx, move |this, response, cx| {
-            match response {
+        self.show_notification(
+            summary,
+            body.into(),
+            Some(action),
+            cx,
+            move |this, response, cx| match response {
                 Response::Action(id) if id == "update" => this.install_update(cx),
                 Response::Action(id) if id == "download" => cx.open_url(&url),
                 Response::Clicked => show_window(cx),
                 _ => {}
-            }
-        });
+            },
+        );
     }
 
     /// Swaps in the available update, then offers to restart into it.
@@ -652,8 +741,13 @@ impl Octowatcher {
             Some(Update::Ready(version)) => UpdateItem::Ready(version),
             Some(Update::Manual(_)) | None => UpdateItem::Check,
         };
+        let awake = if self.health.verified {
+            self.store.awake()
+        } else {
+            Vec::new()
+        };
         self.tray_error = tray
-            .update(&self.store.awake(), item)
+            .update(&awake, item, self.review_status().tray_message())
             .err()
             .map(|err| format!("could not update tray menu: {err:#}"));
     }
@@ -666,16 +760,28 @@ impl Octowatcher {
             .map(|err| format!("could not save state: {err:#}"));
     }
 
-    /// The header has room for one error, so the first set one wins.
-    fn displayed_error(&self) -> Option<&str> {
+    fn errors(&self) -> Vec<&str> {
         [
-            &self.fetch_error,
+            &self.load_warning,
+            &self.health.error,
             &self.save_error,
             &self.tray_error,
             &self.notification_error,
         ]
         .into_iter()
-        .find_map(Option::as_deref)
+        .filter_map(Option::as_deref)
+        .collect()
+    }
+
+    fn review_status(&self) -> ReviewsStatus {
+        self.health.status(
+            &self.store,
+            Local::now().timestamp(),
+            self.repos.is_none() || self.scan_task.is_some(),
+            self.fetch_task.is_some(),
+            self.watched_slugs().len(),
+            !self.folder_issues.is_empty(),
+        )
     }
 }
 
@@ -730,15 +836,108 @@ impl Render for Octowatcher {
 }
 
 impl Octowatcher {
+    fn last_sync_text(&self) -> String {
+        match self
+            .store
+            .last_successful_sync
+            .and_then(|at| DateTime::from_timestamp(at, 0))
+        {
+            Some(at) => format!(
+                "Last successful sync: {}",
+                at.with_timezone(&Local).format("%b %d, %H:%M")
+            ),
+            None => "Last successful sync: never".into(),
+        }
+    }
+
+    fn render_health(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let github = match &self.health.readiness {
+            github::Readiness::Checking => "Checking GitHub CLI and active github.com account…".into(),
+            github::Readiness::Missing => "GitHub CLI not found. Install gh, run gh auth login --hostname github.com in a terminal, then Refresh.".into(),
+            github::Readiness::NotRunnable => "GitHub CLI could not start. Check its installation and executable permissions, then Refresh.".into(),
+            github::Readiness::SignedOut => "GitHub CLI is available; authentication needs attention. Run gh auth login --hostname github.com in a terminal, then Refresh.".into(),
+            github::Readiness::Offline => format!("GitHub CLI is available; GitHub cannot be reached (offline or network error). Check your connection or proxy, then Refresh.{}", self.store.sync_account.as_ref().map(|login| format!(" Last verified account: @{login}.")).unwrap_or_default()),
+            github::Readiness::Unavailable => format!("GitHub CLI is available; account readiness could not be verified. Check your connection, proxy, or GitHub availability, then Refresh.{}", self.store.sync_account.as_ref().map(|login| format!(" Last verified account: @{login}.")).unwrap_or_default()),
+            github::Readiness::Ready(login) => format!("GitHub CLI ready · active account @{login} on github.com.{}", if self.health.error.is_some() { " Review sync failed; cached reviews may be stale." } else { "" }),
+        };
+        let folders = if self.repos.is_none() || self.scan_task.is_some() {
+            "Scanning watched folders…".into()
+        } else if self.store.roots.is_empty() {
+            "No watched folders. Add a folder containing GitHub clones.".into()
+        } else if !self.folder_issues.is_empty() {
+            format!(
+                "Folder scan incomplete: {} issue(s). Fix the paths or access permissions, then Rescan.",
+                self.folder_issues.len()
+            )
+        } else if self.repos.as_ref().is_some_and(Vec::is_empty) {
+            "No GitHub clones found. Add a project folder or clone a repository there, then Rescan."
+                .into()
+        } else if self.watched_slugs().is_empty() {
+            "Every discovered repository is off. Enable a repository in Repositories.".into()
+        } else {
+            format!(
+                "{} repositories enabled in {} watched folder(s).",
+                self.watched_slugs().len(),
+                self.store.roots.len()
+            )
+        };
+        let permission = match &self.permission {
+            notifications::Permission::Checking => "Checking notification permission…".into(),
+            notifications::Permission::Allowed(detail) => detail.clone(),
+            notifications::Permission::Denied => "Disabled. Enable Allow Notifications for Octowatcher in System Settings → Notifications, then Refresh.".into(),
+            notifications::Permission::Unknown(detail) => format!("Unknown · {detail}"),
+        };
+        let sync = match self.review_status() {
+            ReviewsStatus::Loading => {
+                "Checking setup and reviews. Saved results are unverified until sync succeeds."
+            }
+            ReviewsStatus::Setup => {
+                "Folder setup needs attention. Review coverage may be incomplete."
+            }
+            ReviewsStatus::Unavailable => {
+                "Sync failed. Cached reviews may be stale; an empty cache cannot confirm there are no requests. Automatic checks continue at your configured interval."
+            }
+            ReviewsStatus::Offline => {
+                "GitHub cannot be reached. Cached reviews may be stale; check your connection or proxy and Refresh. Automatic checks continue at your configured interval."
+            }
+            ReviewsStatus::Stale => {
+                "Reviews may be stale. Refresh to verify the current list. Automatic checks continue at your configured interval."
+            }
+            ReviewsStatus::Ready => "Reviews are up to date for your enabled repositories.",
+        };
+        div().flex().flex_col().gap_3().p_3().rounded_lg().bg(rgb(theme::SURFACE))
+            .child(section_title("Setup & health"))
+            .child(health_row("GitHub", github))
+            .when(matches!(self.health.readiness, github::Readiness::Missing), |s| s.child(button("install-gh", "Install GitHub CLI").on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.open_url("https://cli.github.com/")))))
+            .when(matches!(self.health.readiness, github::Readiness::Missing | github::Readiness::SignedOut), |s| s.child(button("copy-login", "Copy login command").on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string("gh auth login --hostname github.com".into()))))))
+            .child(health_row("Watched folders", folders))
+            .child(div().flex().flex_wrap().gap_2()
+                .child(button("health-folders", "Manage folders").on_click(cx.listener(|this, _: &ClickEvent, _, cx| { this.tab = Tab::Repositories; cx.notify(); })))
+                .child(button("health-add-folder", "Add folder…").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_root(cx))))
+                .child(button("health-rescan", "Rescan").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rescan(cx)))))
+            .child(health_row("Notification permission", permission))
+            .child(div().flex().flex_wrap().gap_2()
+                .when(cfg!(target_os = "macos"), |s| s.child(button("health-notification-settings", "Notification settings").on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.open_url("x-apple.systempreferences:com.apple.Notifications-Settings.extension")))))
+                .child(button("health-test-notification", "Send test notification").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send_test_notification(cx)))))
+            .child(health_row("Review sync", format!("{} · {sync}", self.last_sync_text())))
+            .child(button("health-refresh", "Refresh").on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))))
+            .children(self.errors().into_iter().chain(self.folder_issues.iter().map(String::as_str)).map(|error| div().text_xs().text_color(rgb(theme::RED)).child(error.to_string())))
+    }
+
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status: SharedString = if self.scan_task.is_some() {
             "Scanning folders…".into()
         } else if self.fetch_task.is_some() {
             "Checking GitHub…".into()
-        } else if let Some(at) = self.last_checked {
-            format!("Checked at {}", at.format("%H:%M")).into()
         } else {
-            "".into()
+            match self.review_status() {
+                ReviewsStatus::Loading => "Checking setup…".into(),
+                ReviewsStatus::Setup => "Setup needs attention".into(),
+                ReviewsStatus::Unavailable => "Sync failed · reviews unverified".into(),
+                ReviewsStatus::Offline => "GitHub unreachable · reviews stale".into(),
+                ReviewsStatus::Stale => "Reviews may be stale".into(),
+                ReviewsStatus::Ready => "Reviews up to date".into(),
+            }
         };
         let repo_count = self.repos.as_ref().map_or(0, Vec::len);
 
@@ -768,21 +967,38 @@ impl Octowatcher {
                             .items_center()
                             .gap_3()
                             .child(div().text_xs().text_color(rgb(theme::MUTED)).child(status))
-                            .child(button("refresh", "Refresh").on_click(cx.listener(
-                                |this, _: &ClickEvent, _, cx| this.refresh(cx),
-                            ))),
+                            .child(button("refresh", "Refresh").on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx)),
+                            )),
                     ),
             )
-            .children(
-                self.displayed_error()
-                    .map(str::to_owned)
-                    .map(|err| {
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
                         div()
                             .text_xs()
-                            .text_color(rgb(theme::RED))
-                            .child(err)
-                    }),
+                            .text_color(rgb(theme::SUBTEXT))
+                            .child(self.last_sync_text()),
+                    )
+                    .child(
+                        button("health-details", "Setup & health").on_click(cx.listener(
+                            |this, _: &ClickEvent, _, cx| {
+                                this.tab = Tab::Settings;
+                                cx.notify();
+                            },
+                        )),
+                    ),
             )
+            .when(!self.errors().is_empty(), |s| {
+                s.child(div().text_xs().text_color(rgb(theme::RED)).child(format!(
+                    "{} issue(s) need attention — see Setup & health",
+                    self.errors().len()
+                )))
+            })
             .children(self.render_update(cx))
             .child(
                 div()
@@ -803,32 +1019,32 @@ impl Octowatcher {
     }
 
     fn render_update(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (message, action) = match self.update.as_ref()? {
-            Update::Available(release) => (
-                format!("Octowatcher {} is available.", release.version),
-                Some(button("install-update", "Update").on_click(
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx)),
-                )),
-            ),
-            Update::Installing(version) => (format!("Installing Octowatcher {version}…"), None),
-            Update::Ready(version) => (
-                format!("Octowatcher {version} is installed."),
-                Some(
-                    button("restart", "Restart")
-                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
-                ),
-            ),
-            Update::Manual(release) => {
-                let url = release.url.clone();
-                (
+        let (message, action) =
+            match self.update.as_ref()? {
+                Update::Available(release) => (
                     format!("Octowatcher {} is available.", release.version),
+                    Some(button("install-update", "Update").on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx)),
+                    )),
+                ),
+                Update::Installing(version) => (format!("Installing Octowatcher {version}…"), None),
+                Update::Ready(version) => (
+                    format!("Octowatcher {version} is installed."),
                     Some(
-                        button("download-update", "Download")
-                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url))),
+                        button("restart", "Restart")
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
                     ),
-                )
-            }
-        };
+                ),
+                Update::Manual(release) => {
+                    let url = release.url.clone();
+                    (
+                        format!("Octowatcher {} is available.", release.version),
+                        Some(button("download-update", "Download").on_click(
+                            cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)),
+                        )),
+                    )
+                }
+            };
         Some(
             div()
                 .flex()
@@ -857,7 +1073,9 @@ impl Octowatcher {
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .when(active, |s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+            .when(active, |s| {
+                s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+            })
             .when(!active, |s| {
                 s.text_color(rgb(theme::SUBTEXT))
                     .hover(|s| s.bg(rgb(theme::SURFACE)))
@@ -870,18 +1088,40 @@ impl Octowatcher {
     }
 
     fn render_reviews(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = self.review_status();
+        let needs_health = status != ReviewsStatus::Ready
+            || !self.errors().is_empty()
+            || matches!(self.permission, notifications::Permission::Denied)
+            || (cfg!(target_os = "macos")
+                && matches!(self.permission, notifications::Permission::Unknown(_)));
         if self.store.pending.is_empty() {
             return div()
                 .flex()
-                .justify_center()
-                .pt_16()
-                .text_color(rgb(theme::MUTED))
-                .child("Nothing waiting on your review.");
+                .flex_col()
+                .gap_6()
+                .when(needs_health, |s| s.child(self.render_health(cx)))
+                .child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .pt_6()
+                        .text_color(rgb(theme::SUBTEXT))
+                        .child(status.empty_message()),
+                );
         }
         div()
             .flex()
             .flex_col()
             .gap_2()
+            .when(needs_health, |s| s.child(self.render_health(cx)))
+            .when(status != ReviewsStatus::Ready, |s| {
+                s.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme::PEACH))
+                        .child("Last known reviews · may be stale until a successful sync."),
+                )
+            })
             .children(self.store.pending.iter().enumerate().map(|(ix, pr)| {
                 let url = pr.url.clone();
                 let key = pr.key();
@@ -947,15 +1187,12 @@ impl Octowatcher {
                             .truncate()
                             .child(pr.title.clone()),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::MUTED))
-                            .child(match &snoozed_until {
-                                Some(at) => format!("by {} · snoozed until {at}", pr.author),
-                                None => format!("by {}", pr.author),
-                            }),
-                    )
+                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(
+                        match &snoozed_until {
+                            Some(at) => format!("by {} · snoozed until {at}", pr.author),
+                            None => format!("by {}", pr.author),
+                        },
+                    ))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)))
             }))
     }
@@ -985,12 +1222,14 @@ impl Octowatcher {
                 div()
                     .flex()
                     .gap_2()
-                    .child(button("add-root", "Add folder…").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.add_root(cx),
-                    )))
-                    .child(button("rescan", "Rescan").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.rescan(cx),
-                    ))),
+                    .child(
+                        button("add-root", "Add folder…")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_root(cx))),
+                    )
+                    .child(
+                        button("rescan", "Rescan")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rescan(cx))),
+                    ),
             );
 
         let repos = self.repos.as_deref().unwrap_or_default();
@@ -1047,9 +1286,9 @@ impl Octowatcher {
                     } else {
                         pill("off", theme::MUTED)
                     })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_repo(&slug, cx)
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&slug, cx)),
+                    )
             }));
 
         div().flex().flex_col().gap_6().child(roots).child(list)
@@ -1060,6 +1299,7 @@ impl Octowatcher {
             .flex()
             .flex_col()
             .gap_6()
+            .child(self.render_health(cx))
             .child(self.render_choices(
                 "Check GitHub for review requests every",
                 "poll",
@@ -1082,15 +1322,13 @@ impl Octowatcher {
                     .flex_col()
                     .gap_2()
                     .child(section_title("Notifications"))
-                    .child(
-                        div().flex().child(
-                            button("test-notification", "Send test notification").on_click(
-                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.send_test_notification(cx)
-                                }),
-                            ),
+                    .child(div().flex().child(
+                        button("test-notification", "Send test notification").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.send_test_notification(cx)
+                            }),
                         ),
-                    ),
+                    )),
             )
     }
 
@@ -1128,7 +1366,9 @@ impl Octowatcher {
                             .rounded_md()
                             .text_xs()
                             .cursor_pointer()
-                            .when(active, |s| s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE)))
+                            .when(active, |s| {
+                                s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE))
+                            })
                             .when(!active, |s| {
                                 s.bg(rgb(theme::SURFACE))
                                     .text_color(rgb(theme::SUBTEXT))
@@ -1174,6 +1414,20 @@ fn section_title(label: &'static str) -> gpui::Div {
         .font_weight(FontWeight::BOLD)
         .text_color(rgb(theme::SUBTEXT))
         .child(label)
+}
+
+fn health_row(label: &'static str, detail: String) -> gpui::Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(section_title(label))
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(theme::SUBTEXT))
+                .child(detail),
+        )
 }
 
 fn display_path(path: &std::path::Path) -> String {

@@ -12,6 +12,7 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Snoozes a review for later.** Snooze a pull request from its notification or from the window. It leaves the tray until the snooze runs out, then notifies you again. A new review request on it ends the snooze early.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
+- **Shows setup and health.** See the active GitHub account, watched-folder readiness, notification permission, and last successful sync, with recovery actions when a check fails.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
 ## Requirements
@@ -66,6 +67,14 @@ The window has three tabs.
 
 This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
 
+While setup or a check needs attention, this tab shows **Setup & health** with guidance and recovery actions. The header keeps the sync status and **last successful sync** visible. An empty list says **Nothing waiting on your review** only after a successful check with enabled repositories and a complete folder scan. Before then it distinguishes loading, folder setup, and unverified results.
+
+If a check fails, the last known reviews stay visible with a stale warning. An empty cache cannot confirm that no reviews are waiting. The success time does not advance on failure and survives a restart; saved results remain unverified until this launch completes a sync. Results also become stale after two check intervals plus one minute without a successful sync. The tray menu shows setup or stale status too.
+
+Choose **Refresh** to retry immediately. Automatic checks continue at the interval in Settings, without rapid retries. Each GitHub CLI API subprocess is limited to 30 seconds, so a hung account lookup or review query cannot permanently stop checks (a full check can use two such subprocesses). Update downloads have a separate ten-minute limit.
+
+Octowatcher rechecks the effective `github.com` account each sync. After you change it with `gh auth switch --hostname github.com`, choose **Refresh**. A detected account change clears the previous account's cached reviews and snoozes; folder choices and settings stay intact. Cached reviews from an older state file without an account are reloaded from GitHub before being assigned to an account. This uses one account at a time, and GitHub CLI environment-token overrides still take precedence.
+
 **Snooze** hides a pull request from the tray for the snooze length set in Settings. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new notification about a single pull request also has a **Snooze** button. One that covers several pull requests doesn't. Snoozes survive a restart.
 
 ### Repositories
@@ -79,6 +88,10 @@ The scan goes up to five levels deep. It skips hidden folders and `node_modules`
 Octowatcher reads the remotes from each clone's `.git/config` and understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them.
 
 ### Settings
+
+**Setup & health** is always available here, or through the header shortcut. It shows all state-loading, saving, tray, notification-delivery, folder-scan, and GitHub errors together. Missing or signed-out GitHub CLI setup offers an installation link and a **Copy login command** action; run that command in your terminal, then **Refresh**. **Manage folders**, **Add folder…**, and **Rescan** help recover folder setup.
+
+On macOS, notification permission is read from the OS. **Notification settings** opens System Settings; after changing permission, **Refresh** to recheck it. Banners may be off even when permission is allowed. A signed `.app` bundle is required; a bare development binary reports permission as unknown. On Linux there is no portable permission query, so the panel reports **Unknown** and offers **Send test notification**. Permission and delivery errors are separate; a successful delivery does not establish OS permission or that you saw a banner. Folder scans and GitHub checks start independently of the permission prompt.
 
 This tab sets how often Octowatcher checks GitHub: every 1, 2, 5, 10, 15, 30 or 60 minutes. The default is 2 minutes.
 
@@ -98,6 +111,8 @@ Octowatcher saves your settings (folders, switched-off repositories, check inter
 | Linux | `~/.config/octowatcher/state.json` |
 
 Delete this file to reset Octowatcher. Everything it sends to GitHub goes through `gh`.
+
+If this file is invalid, Octowatcher reports the recovery in **Setup & health** and preserves its original contents in a uniquely named `state-recovery-*.json` beside it before allowing defaults to be saved. Review the default folders and settings, or restore the backup to `state.json` and restart. If the file cannot be read or a backup cannot be made, saving is paused to protect it; fix the file or directory permissions and restart. Intentionally removing every watched folder is preserved across restarts.
 
 ## Troubleshooting
 

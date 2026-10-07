@@ -5,7 +5,14 @@ use std::{
 };
 
 const MAX_DEPTH: usize = 5;
-const SKIPPED_DIRS: &[&str] = &["node_modules", "target", "vendor", "build", "dist", "Library"];
+const SKIPPED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "vendor",
+    "build",
+    "dist",
+    "Library",
+];
 
 /// A GitHub repository with at least one clone on this machine.
 #[derive(Debug, Clone)]
@@ -15,13 +22,20 @@ pub struct LocalRepo {
     pub paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Default)]
+pub struct Scan {
+    pub repos: Vec<LocalRepo>,
+    pub issues: Vec<String>,
+}
+
 /// Walks `roots` for git clones and groups them by GitHub repository. A clone
 /// with several GitHub remotes (a fork and its upstream) counts for each.
-pub fn discover(roots: &[PathBuf]) -> Vec<LocalRepo> {
+pub fn discover(roots: &[PathBuf]) -> Scan {
     let hosts = github_hosts();
     let mut found: BTreeMap<String, LocalRepo> = BTreeMap::new();
+    let mut issues = Vec::new();
     for root in roots {
-        walk(root, 0, &hosts, &mut |repo_dir, slugs| {
+        walk(root, 0, &hosts, &mut issues, &mut |repo_dir, slugs| {
             for slug in slugs {
                 found
                     .entry(slug.to_lowercase())
@@ -34,19 +48,32 @@ pub fn discover(roots: &[PathBuf]) -> Vec<LocalRepo> {
             }
         });
     }
-    found.into_values().collect()
+    Scan {
+        repos: found.into_values().collect(),
+        issues,
+    }
 }
 
 fn walk(
     dir: &Path,
     depth: usize,
     hosts: &[String],
+    issues: &mut Vec<String>,
     on_repo: &mut impl FnMut(&Path, Vec<String>),
 ) {
     let git_dir = dir.join(".git");
     // A `.git` file means a worktree or submodule: its main clone is found elsewhere.
     if git_dir.is_dir() {
-        let slugs = github_slugs(&git_dir.join("config"), hosts);
+        let slugs = match github_slugs(&git_dir.join("config"), hosts) {
+            Ok(slugs) => slugs,
+            Err(err) => {
+                issues.push(format!(
+                    "Cannot read {}: {err}",
+                    git_dir.join("config").display()
+                ));
+                return;
+            }
+        };
         if !slugs.is_empty() {
             on_repo(dir, slugs);
         }
@@ -55,12 +82,27 @@ fn walk(
     if depth >= MAX_DEPTH {
         return;
     }
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            issues.push(format!("Cannot scan {}: {err}", dir.display()));
+            return;
+        }
     };
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                issues.push(format!("Cannot scan {}: {err}", dir.display()));
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(err) => {
+                issues.push(format!("Cannot inspect {}: {err}", entry.path().display()));
+                continue;
+            }
         };
         if !file_type.is_dir() {
             continue;
@@ -70,7 +112,7 @@ fn walk(
         if name.starts_with('.') || SKIPPED_DIRS.contains(&name.as_ref()) {
             continue;
         }
-        walk(&entry.path(), depth + 1, hosts, on_repo);
+        walk(&entry.path(), depth + 1, hosts, issues, on_repo);
     }
 }
 
@@ -112,10 +154,8 @@ fn ssh_aliases_for_github(config: &str) -> Vec<String> {
     aliases
 }
 
-fn github_slugs(config: &Path, hosts: &[String]) -> Vec<String> {
-    let Ok(contents) = fs::read_to_string(config) else {
-        return Vec::new();
-    };
+fn github_slugs(config: &Path, hosts: &[String]) -> std::io::Result<Vec<String>> {
+    let contents = fs::read_to_string(config)?;
     let mut slugs: Vec<String> = contents
         .lines()
         .filter_map(|line| {
@@ -125,7 +165,7 @@ fn github_slugs(config: &Path, hosts: &[String]) -> Vec<String> {
         .collect();
     slugs.sort_by_key(|slug| slug.to_lowercase());
     slugs.dedup_by_key(|slug| slug.to_lowercase());
-    slugs
+    Ok(slugs)
 }
 
 /// Extracts `owner/name` from the SSH, scp-like and HTTPS forms of a remote
@@ -152,6 +192,30 @@ mod tests {
     use super::{parse_github_url, ssh_aliases_for_github};
 
     #[test]
+    fn distinguishes_empty_missing_folders_and_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = super::discover(&[dir.path().to_path_buf()]);
+        assert!(empty.repos.is_empty());
+        assert!(empty.issues.is_empty());
+        let root = dir.path().join("projects");
+        let missing = super::discover(std::slice::from_ref(&root));
+        assert!(missing.repos.is_empty());
+        assert_eq!(missing.issues.len(), 1);
+        std::fs::create_dir_all(root.join("clone/.git")).unwrap();
+        let unreadable_config = super::discover(std::slice::from_ref(&root));
+        assert_eq!(unreadable_config.issues.len(), 1);
+        std::fs::write(
+            root.join("clone/.git/config"),
+            "[remote \"origin\"]\nurl = git@github.com:o/r.git\n",
+        )
+        .unwrap();
+        let recovered = super::discover(&[root]);
+        assert!(recovered.issues.is_empty());
+        assert_eq!(recovered.repos.len(), 1);
+        assert_eq!(recovered.repos[0].slug, "o/r");
+    }
+
+    #[test]
     fn parses_remote_forms() {
         let hosts = vec!["github.com".to_string(), "github-work".to_string()];
         for url in [
@@ -163,9 +227,16 @@ mod tests {
             "https://github.com/owner/repo/",
             "git@github-work:owner/repo.git",
         ] {
-            assert_eq!(parse_github_url(url, &hosts).as_deref(), Some("owner/repo"), "{url}");
+            assert_eq!(
+                parse_github_url(url, &hosts).as_deref(),
+                Some("owner/repo"),
+                "{url}"
+            );
         }
-        assert_eq!(parse_github_url("git@gitlab.com:owner/repo.git", &hosts), None);
+        assert_eq!(
+            parse_github_url("git@gitlab.com:owner/repo.git", &hosts),
+            None
+        );
         assert_eq!(parse_github_url("https://github.com/owner", &hosts), None);
         assert_eq!(parse_github_url("/some/local/path", &hosts), None);
     }

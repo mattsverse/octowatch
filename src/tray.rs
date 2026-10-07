@@ -35,7 +35,7 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(pending: &[PendingReview]) -> Result<Self> {
+    pub fn new(pending: &[PendingReview], status: Option<&str>) -> Result<Self> {
         let builder = TrayIconBuilder::new();
         // Templates are a macOS notion; elsewhere the icon is drawn as is.
         #[cfg(target_os = "macos")]
@@ -44,16 +44,21 @@ impl Tray {
         let builder = builder.with_icon(tray_icon());
         let icon = builder
             .with_tooltip("Octowatcher")
-            .with_menu(Box::new(build_menu(pending, UpdateItem::Check)?))
+            .with_menu(Box::new(build_menu(pending, UpdateItem::Check, status)?))
             .build()?;
         let tray = Self { icon };
         tray.set_count(pending.len());
         Ok(tray)
     }
 
-    pub fn update(&self, pending: &[PendingReview], update: UpdateItem) -> Result<()> {
+    pub fn update(
+        &self,
+        pending: &[PendingReview],
+        update: UpdateItem,
+        status: Option<&str>,
+    ) -> Result<()> {
         self.icon
-            .set_menu(Some(Box::new(build_menu(pending, update)?)));
+            .set_menu(Some(Box::new(build_menu(pending, update, status)?)));
         self.set_count(pending.len());
         Ok(())
     }
@@ -99,10 +104,16 @@ pub fn listen(cx: &mut App) {
     .detach();
 }
 
-fn build_menu(pending: &[PendingReview], update: UpdateItem) -> Result<Menu> {
+fn build_menu(pending: &[PendingReview], update: UpdateItem, status: Option<&str>) -> Result<Menu> {
     let menu = Menu::new();
-    if pending.is_empty() {
-        menu.append(&MenuItem::new("Nothing waiting on your review.", false, None))?;
+    if let Some(status) = status {
+        menu.append(&MenuItem::new(status, false, None))?;
+    } else if pending.is_empty() {
+        menu.append(&MenuItem::new(
+            "Nothing waiting on your review.",
+            false,
+            None,
+        ))?;
     }
     for pr in pending {
         let mut label = format!("{}#{}: {}", pr.repo, pr.number, truncate(&pr.title));
@@ -158,10 +169,23 @@ fn tray_icon() -> Icon {
     const PNG: &[u8] = include_bytes!("../assets/tray.png");
     let mut decoder = png::Decoder::new(std::io::Cursor::new(PNG));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = decoder.read_info().expect("bundled tray icon is a valid PNG");
-    let mut rgba = vec![0; reader.output_buffer_size().expect("tray icon fits in memory")];
-    let info = reader.next_frame(&mut rgba).expect("bundled tray icon decodes");
-    assert_eq!(info.color_type, png::ColorType::Rgba, "tray icon must be RGBA");
+    let mut reader = decoder
+        .read_info()
+        .expect("bundled tray icon is a valid PNG");
+    let mut rgba = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .expect("tray icon fits in memory")
+    ];
+    let info = reader
+        .next_frame(&mut rgba)
+        .expect("bundled tray icon decodes");
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "tray icon must be RGBA"
+    );
     rgba.truncate(info.buffer_size());
     Icon::from_rgba(rgba, info.width, info.height).expect("icon buffer matches its size")
 }
