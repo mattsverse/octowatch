@@ -127,7 +127,7 @@ struct Octowatcher {
 struct DiscoveryChanges {
     cache_changed: bool,
     reviews: store::Reconciled,
-    scan_succeeded: bool,
+    start_fetch: bool,
 }
 
 impl Octowatcher {
@@ -384,7 +384,7 @@ impl Octowatcher {
                     }
                     // A later scan queues a fresh check for its current hosts.
                     // Do not cancel and overlap synchronous gh subprocesses.
-                    if changes.scan_succeeded {
+                    if changes.start_fetch {
                         this.fetch_reviews(cx);
                     }
                 }
@@ -401,7 +401,6 @@ impl Octowatcher {
         &mut self,
         result: anyhow::Result<discovery::ScanResult>,
     ) -> Option<DiscoveryChanges> {
-        let scan_succeeded = result.is_ok();
         let repos = match result {
             Ok(scan) => {
                 self.scan_error = None;
@@ -433,7 +432,10 @@ impl Octowatcher {
         Some(DiscoveryChanges {
             cache_changed,
             reviews,
-            scan_succeeded,
+            // Even a failed host lookup leaves a known, root-filtered snapshot.
+            // Replace any result discarded during scanning and keep cached hosts
+            // refreshing while discovery is unavailable.
+            start_fetch: self.refresh_queue.request_fetch(self.fetch_task.is_some()),
         })
     }
 
@@ -3192,7 +3194,7 @@ mod snooze_tests {
             let changes = app
                 .apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
                 .unwrap();
-            assert!(!changes.scan_succeeded);
+            assert!(changes.start_fetch);
             assert!(changes.cache_changed);
             assert!(changes.reviews.pending_changed && changes.reviews.notifications_changed);
             assert_eq!(app.store.pending, vec![enterprise.clone()]);
@@ -3208,6 +3210,65 @@ mod snooze_tests {
                     .contains("host discovery failed")
             );
         });
+    }
+
+    #[gpui::test]
+    fn failed_discovery_still_checks_cached_hosts_in_both_completion_orders(
+        cx: &mut TestAppContext,
+    ) {
+        for fetch_finishes_first in [true, false] {
+            let app = cx.new(app_for_picker_test);
+            app.update(cx, |app, _| {
+                let cached = review(1).repository();
+                app.store.roots = vec!["/missing/watched".into()];
+                app.store.discovered = vec![LocalRepo {
+                    id: cached.clone(),
+                    paths: vec!["/missing/watched/clone".into()],
+                }];
+                // The old GitHub check overlaps a newer Refresh scan.
+                assert!(app.refresh_queue.request_fetch(false));
+                app.fetch_task = Some(Task::ready(()));
+                assert!(app.refresh_queue.request_scan(false));
+                if fetch_finishes_first {
+                    app.fetch_task = None;
+                    // Production discards this result while the scan is active.
+                    assert!(!app.refresh_queue.fetch_finished(true));
+                }
+                assert!(!app.refresh_queue.scan_finished(false));
+                let changes = app
+                    .apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
+                    .unwrap();
+                assert_eq!(app.watched_repositories(), HashSet::from([cached.clone()]));
+                if fetch_finishes_first {
+                    assert!(
+                        changes.start_fetch,
+                        "failed scan must replace the discarded check"
+                    );
+                } else {
+                    assert!(!changes.start_fetch, "do not overlap the older check");
+                    app.fetch_task = None;
+                    assert!(
+                        app.refresh_queue.fetch_finished(false),
+                        "failed scan must queue a check"
+                    );
+                }
+                assert!(app.refresh_queue.request_fetch(false));
+                assert!(!app.refresh_queue.fetch_finished(false), "no retry loop");
+
+                // A persistent discovery error must not block subsequent checks.
+                assert!(app.refresh_queue.request_scan(false));
+                assert!(!app.refresh_queue.scan_finished(false));
+                let changes = app
+                    .apply_discovery(Err(anyhow::anyhow!("host discovery still failed")))
+                    .unwrap();
+                assert!(
+                    changes.start_fetch,
+                    "scheduled checks must continue using cached hosts"
+                );
+                assert_eq!(app.watched_repositories(), HashSet::from([cached]));
+                assert!(app.scan_error.is_some());
+            });
+        }
     }
 
     #[gpui::test]
@@ -3236,7 +3297,7 @@ mod snooze_tests {
             let changes = app
                 .apply_discovery(Ok(discovery::ScanResult::default()))
                 .unwrap();
-            assert!(changes.scan_succeeded);
+            assert!(changes.start_fetch);
             assert!(changes.reviews.pending_changed);
             assert!(app.snooze_picker.is_none());
         });
