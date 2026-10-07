@@ -248,6 +248,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unknown_appearance_preserves_the_rest_of_the_store() {
+        let original = Store {
+            roots: vec!["/projects".into()],
+            disabled: ["o/off".into()].into(),
+            pending: vec![pr("o/r", 1, Some(T1))],
+            snoozed: vec![snooze("o/r", 1, Some(T1))],
+            poll_minutes: 15,
+            snooze_minutes: 30,
+            ..Store::default()
+        };
+        let mut future = serde_json::to_value(&original).unwrap();
+        future["appearance"] = "high_contrast".into();
+        let restored: Store =
+            serde_json::from_slice(&serde_json::to_vec(&future).unwrap()).unwrap();
+        assert_eq!(restored.appearance, Appearance::System);
+        // The next save must retain all existing data, normalizing only the
+        // unsupported preference to the safe default.
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+    }
+
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
         PendingReview {
             repo: repo.to_string(),

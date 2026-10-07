@@ -1112,7 +1112,7 @@ impl Octowatcher {
                             .child("System follows your desktop’s light or dark appearance."),
                     ),
             )
-            .child(self.render_choices(
+            .child(Self::render_choices(
                 theme,
                 "Check GitHub for review requests every",
                 "poll",
@@ -1121,7 +1121,7 @@ impl Octowatcher {
                 Self::set_poll_minutes,
                 cx,
             ))
-            .child(self.render_choices(
+            .child(Self::render_choices(
                 theme,
                 "Snooze a review for",
                 "snooze-minutes",
@@ -1148,7 +1148,6 @@ impl Octowatcher {
 
     /// A row of minute lengths to pick one from.
     fn render_choices(
-        &self,
         theme: Palette,
         title: &'static str,
         id: &'static str,

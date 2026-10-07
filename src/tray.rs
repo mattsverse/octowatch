@@ -233,7 +233,12 @@ mod tests {
         let mut black = 0;
         let mut white = 0;
         let mut transparent = 0;
-        for (original, pixel) in source.chunks_exact(4).zip(outlined.chunks_exact(4)) {
+        for (original, pixel) in source
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(outlined.as_chunks::<4>().0.iter())
+        {
             if original[3] == 255 {
                 assert_eq!(pixel, original, "opaque glyph details are preserved");
             }

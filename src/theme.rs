@@ -5,10 +5,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Appearance {
-    #[default]
-    System,
     Light,
     Dark,
+    /// Unknown saved names fall back without invalidating the rest of the store.
+    #[default]
+    #[serde(other)]
+    System,
 }
 
 impl Appearance {
