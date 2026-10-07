@@ -13,6 +13,7 @@ mod updater;
 use std::{
     cell::RefCell,
     collections::{BTreeSet, HashMap, HashSet},
+    future::Future,
     path::PathBuf,
     time::Duration,
 };
@@ -101,7 +102,7 @@ struct Octowatcher {
     tray_error: Option<String>,
     save_error: Option<String>,
     notification_error: Option<String>,
-    /// Hosts whose cached reviews have been validated by a successful check.
+    /// Hosts with confirmed requests or at least one complete repository check.
     announced_hosts: BTreeSet<String>,
     /// Retained until the launch batch is accepted, including after failures.
     launch_summary: bool,
@@ -111,6 +112,8 @@ struct Octowatcher {
     update: Option<Update>,
     scan_task: Option<Task<()>>,
     fetch_task: Option<Task<()>>,
+    /// Coalesces refreshes requested while a GitHub check is already running.
+    refresh_pending: bool,
     poll_task: Option<Task<()>>,
     /// Fires when the earliest snooze runs out.
     wake_task: Option<Task<()>>,
@@ -165,6 +168,7 @@ impl Octowatcher {
             }
         });
         let store = Store::load();
+        let review_delivery = Delivery::for_launch(&store);
         let review_search = cx.new(SearchInput::new);
         let search_subscription = cx.subscribe(
             &review_search,
@@ -206,12 +210,13 @@ impl Octowatcher {
             notification_error: None,
             announced_hosts: BTreeSet::new(),
             launch_summary: true,
-            review_delivery: Delivery::default(),
+            review_delivery,
             notification_tasks: HashMap::new(),
             tray,
             update: None,
             scan_task: None,
             fetch_task: None,
+            refresh_pending: false,
             poll_task: None,
             wake_task: None,
             update_check: None,
@@ -364,26 +369,44 @@ impl Octowatcher {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        // Filtering needs the repo list, and the scan refreshes once it's done.
-        if self.repos.is_none() || self.fetch_task.is_some() {
+        self.refresh_with(
+            |watched| async move { github::fetch_awaiting_reviews(&watched) },
+            cx,
+        );
+    }
+
+    fn refresh_with<F, Fut>(&mut self, fetch: F, cx: &mut Context<Self>)
+    where
+        F: Fn(HashSet<RepositoryId>) -> Fut + Clone + Send + 'static,
+        Fut: Future<Output = anyhow::Result<github::FetchedReviews>> + Send + 'static,
+    {
+        // Scope the API request to enabled local repos after discovery finishes.
+        if self.repos.is_none() {
             return;
         }
-        let hosts = self
-            .watched_repositories()
-            .into_iter()
-            .map(|id| id.host)
-            .collect();
+        if self.fetch_task.is_some() {
+            self.refresh_pending = true;
+            return;
+        }
+        self.refresh_pending = false;
+        let watched = self.watched_repositories();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { github::fetch_awaiting_reviews(&hosts) })
-                .await;
+            let result = cx.background_executor().spawn(fetch(watched)).await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
                 this.last_checked = Some(Local::now());
-                this.fetch_error = (!result.errors.is_empty()).then(|| result.errors.join("\n"));
-                this.reconcile(result, cx);
+                match result {
+                    Ok(fetched) => {
+                        this.fetch_error =
+                            (!fetched.errors.is_empty()).then(|| fetched.errors.join("\n"));
+                        this.reconcile(fetched, cx);
+                    }
+                    Err(err) => this.fetch_error = Some(format!("{err:#}")),
+                }
                 cx.notify();
+                if std::mem::take(&mut this.refresh_pending) {
+                    this.refresh_with(fetch.clone(), cx);
+                }
             })
             .ok();
         }));
@@ -391,47 +414,51 @@ impl Octowatcher {
     }
 
     /// Replaces the pending list with what GitHub reports now, keeping only
-    /// enabled local repos. A PR that drops out (reviewed, request removed,
-    /// closed) is gone; one seen for the first time raises a notification.
+    /// enabled local repos. Complete snapshots remove reviewed, withdrawn or
+    /// closed requests; incomplete checks preserve uncertain saved state.
+    /// Confirmed requests enter the queue and raise notifications even when
+    /// another team's membership could not be checked.
     /// The first check after launch announces everything waiting instead.
-    fn reconcile(&mut self, fetched: github::FetchResults, cx: &mut Context<Self>) {
+    fn reconcile(&mut self, fetched: github::FetchedReviews, cx: &mut Context<Self>) {
         let watched = self.watched_repositories();
-        let first_hosts: BTreeSet<String> = fetched
-            .successful_hosts
-            .difference(&self.announced_hosts)
-            .cloned()
-            .collect();
+        let can_announce_launch = !fetched.pending.is_empty()
+            || !fetched.completed_repos.is_empty()
+            || watched.is_empty();
+        let confirmed = fetched.pending.clone();
         let reconciled =
             self.store
-                .reconcile_hosts(fetched.reviews, &fetched.successful_hosts, &watched);
+                .reconcile_repositories(fetched.pending, &fetched.completed_repos, &watched);
         if reconciled.pending_changed {
             self.review_filter_cache.invalidate_reviews();
         }
         self.dismiss_stale_snooze_picker();
-        let first_check = !first_hosts.is_empty();
-        if first_check {
-            // Preserve launch summaries, but keep suppressed drafts queued.
-            self.store.queue_startup_notifications(&first_hosts);
-            if self.store.notification_queue.is_empty() {
-                self.launch_summary = false;
-            }
+        let notification_sequence = self.store.notification_sequence;
+        self.review_delivery.confirm(&mut self.store, &confirmed);
+        let first_check = self.announced_hosts.is_empty() && can_announce_launch;
+        self.announced_hosts
+            .extend(confirmed.iter().map(|pr| pr.repository().host));
+        self.announced_hosts
+            .extend(fetched.completed_repos.iter().map(|repo| repo.host.clone()));
+        if first_check && self.store.notification_queue.is_empty() {
+            self.launch_summary = false;
         }
         if reconciled.snoozes_changed {
             self.snoozes_changed(cx);
-        } else if reconciled.pending_changed || reconciled.notifications_changed || first_check {
+        } else if reconciled.pending_changed
+            || reconciled.notifications_changed
+            || self.store.notification_sequence != notification_sequence
+        {
             self.save();
             self.sync_tray();
         }
-        if !fetched.successful_hosts.is_empty() {
-            self.announced_hosts.extend(fetched.successful_hosts);
-            self.deliver_reviews(cx);
-        }
+        self.deliver_reviews(cx);
     }
 
     /// Sends eligible, undelivered review events in one batch. A failed send
     /// stays persisted and is attempted at the next successful GitHub poll.
     fn deliver_reviews(&mut self, cx: &mut Context<Self>) {
-        // Validate cached requests against GitHub before any launch delivery.
+        // Require a confirmed check before delivery. Delivery also holds each
+        // unchecked saved review until GitHub confirms that request.
         if self.announced_hosts.is_empty() {
             return;
         }
@@ -2292,6 +2319,7 @@ mod review_view_tests {
             update: None,
             scan_task: None,
             fetch_task: None,
+            refresh_pending: false,
             poll_task: None,
             wake_task: None,
             update_check: None,
@@ -2998,6 +3026,132 @@ mod snooze_tests {
                 }
             }
         }
+    }
+
+    #[gpui::test]
+    fn enabling_repo_during_fetch_checks_it_without_waiting_for_a_poll(cx: &mut TestAppContext) {
+        use std::sync::{Arc, Mutex};
+
+        for fail_first in [false, true] {
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                let mut app = app_for_picker_test(cx);
+                app.store.pending.clear();
+                app.store
+                    .disabled
+                    .insert(RepositoryId::new("github.com", "owner/new"));
+                app.repos = Some(vec![
+                    LocalRepo {
+                        id: RepositoryId::new("github.com", "owner/old"),
+                        paths: vec![],
+                    },
+                    LocalRepo {
+                        id: RepositoryId::new("github.com", "owner/new"),
+                        paths: vec![],
+                    },
+                ]);
+                app
+            });
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (release, blocked) = async_channel::bounded::<()>(1);
+            let fetch = {
+                let calls = calls.clone();
+                move |watched| {
+                    let calls = calls.clone();
+                    let blocked = blocked.clone();
+                    async move {
+                        let first = {
+                            let mut calls = calls.lock().unwrap();
+                            calls.push(watched);
+                            calls.len() == 1
+                        };
+                        if first {
+                            blocked.recv().await.unwrap();
+                        }
+                        if first && fail_first {
+                            Err(anyhow::anyhow!("first check failed"))
+                        } else {
+                            Ok(github::FetchedReviews::default())
+                        }
+                    }
+                }
+            };
+            view.update(cx, |app, cx| app.refresh_with(fetch.clone(), cx));
+            cx.run_until_parked();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![HashSet::from([RepositoryId::new(
+                    "github.com",
+                    "owner/old"
+                )])]
+            );
+            // Reproduce the enable action's refresh while the first check is blocked.
+            view.update(cx, |app, cx| {
+                app.store
+                    .disabled
+                    .remove(&RepositoryId::new("github.com", "owner/new"));
+                app.refresh_with(fetch.clone(), cx);
+                // Several requests during one check should coalesce into one follow-up.
+                app.refresh_with(fetch.clone(), cx);
+            });
+            cx.run_until_parked();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            release.try_send(()).unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![
+                    HashSet::from([RepositoryId::new("github.com", "owner/old")]),
+                    HashSet::from([
+                        RepositoryId::new("github.com", "owner/old"),
+                        RepositoryId::new("github.com", "owner/new")
+                    ]),
+                ],
+                "the newly enabled repo must be checked before another timer tick"
+            );
+            assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
+        }
+    }
+
+    #[gpui::test]
+    fn confirmed_requests_can_finish_launch_announcement_during_a_partial_check(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut app = app_for_picker_test(cx);
+            app.announced_hosts.clear();
+            app.store.pending = vec![review(1)];
+            app.review_delivery = Delivery::for_launch(&app.store);
+            // No notification or persistence side effects: this request is
+            // already saved, snoozed, and unchanged by the partial response.
+            app.store
+                .snooze(&review(1).key(), 60, Local::now().timestamp());
+            app.repos = Some(vec![LocalRepo {
+                id: RepositoryId::new("github.com", "owner/repo"),
+                paths: vec![],
+            }]);
+            app
+        });
+        view.update(cx, |app, cx| {
+            app.reconcile(
+                github::FetchedReviews {
+                    errors: vec!["GitHub unavailable".into()],
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        assert!(view.read_with(cx, |app, _| app.announced_hosts.is_empty()));
+        view.update(cx, |app, cx| {
+            app.reconcile(
+                github::FetchedReviews {
+                    pending: vec![review(1)],
+                    completed_repos: HashSet::new(),
+                    errors: vec!["unreadable team".into()],
+                },
+                cx,
+            )
+        });
+        assert!(view.read_with(cx, |app, _| !app.announced_hosts.is_empty()));
     }
 
     #[gpui::test]
