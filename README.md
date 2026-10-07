@@ -106,6 +106,8 @@ Octowatcher reads the remotes from each clone's `.git/config` and understands sc
 
 It also reads straightforward literal `Host` / `HostName` aliases from `~/.ssh/config`. For example, `git@github-work:owner/repo.git` maps to the host named by `HostName` in the `Host github-work` block. Aliases work for SSH remotes only, and each alias stays scoped to its destination host. Octowatcher does not evaluate `Include`, `Match`, wildcard or negated SSH host rules; use a direct host remote or a literal alias for those configurations.
 
+GitHub’s [SSH-over-443 configuration](https://docs.github.com/en/authentication/troubleshooting-ssh/using-ssh-over-the-https-port) is supported: `ssh://git@ssh.github.com:443/owner/repo.git`, a `Host github.com` override to `HostName ssh.github.com`, and literal aliases to that endpoint all keep the `github.com/owner/repo` identity. API calls continue to target github.com.
+
 ### Enterprise hosts
 
 Log in to each host through GitHub CLI, then choose **Rescan** in Repositories (or restart Octowatcher):
