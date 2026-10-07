@@ -1,11 +1,16 @@
 mod discovery;
 mod github;
 mod notifications;
+mod repository;
 mod store;
 mod tray;
 mod updater;
 
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeSet, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use chrono::{DateTime, Local};
 use gpui::{
@@ -16,6 +21,7 @@ use gpui::{
 
 use discovery::LocalRepo;
 use notifications::Response;
+use repository::RepositoryId;
 use store::{PendingReview, Snooze, Store};
 use tray::{Tray, UpdateItem};
 use updater::Release;
@@ -69,11 +75,12 @@ struct Octowatcher {
     /// Each source keeps its own error, so a successful GitHub check doesn't
     /// hide a tray, save, permission or delivery error.
     fetch_error: Option<String>,
+    scan_error: Option<String>,
     tray_error: Option<String>,
     save_error: Option<String>,
     notification_error: Option<String>,
-    /// Whether the reviews waiting at launch were announced yet.
-    announced_launch: bool,
+    /// Hosts whose first successful check has announced waiting reviews.
+    announced_hosts: BTreeSet<String>,
     tray: Option<Tray>,
     update: Option<Update>,
     scan_task: Option<Task<()>>,
@@ -140,10 +147,11 @@ impl Octowatcher {
             tab: Tab::Reviews,
             last_checked: None,
             fetch_error: None,
+            scan_error: None,
             tray_error,
             save_error: None,
             notification_error: None,
-            announced_launch: false,
+            announced_hosts: BTreeSet::new(),
             tray,
             update: None,
             scan_task: None,
@@ -190,12 +198,13 @@ impl Octowatcher {
 
     /// Hides a pending review from the list and the tray for the snooze
     /// length, then notifies about it again.
-    fn snooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+    fn snooze(&mut self, key: (RepositoryId, u64), cx: &mut Context<Self>) {
         let Some(pr) = self.store.pending.iter().find(|pr| pr.key() == key) else {
             return;
         };
         let snooze = Snooze {
-            repo: key.0.clone(),
+            host: key.0.host.clone(),
+            repo: key.0.slug.clone(),
             number: key.1,
             until: Local::now().timestamp() + self.store.snooze_minutes as i64 * 60,
             requested_at: pr.requested_at.clone(),
@@ -205,7 +214,7 @@ impl Octowatcher {
         self.snoozes_changed(cx);
     }
 
-    fn unsnooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+    fn unsnooze(&mut self, key: (RepositoryId, u64), cx: &mut Context<Self>) {
         self.store.snoozed.retain(|s| s.key() != key);
         self.snoozes_changed(cx);
     }
@@ -245,14 +254,23 @@ impl Octowatcher {
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             let repos = cx
                 .background_executor()
-                .spawn(async move { discovery::discover(&roots) })
+                .spawn(async move {
+                    github::known_hosts().map(|hosts| discovery::discover(&roots, &hosts))
+                })
                 .await;
             this.update(cx, |this, cx| {
-                this.repos = Some(repos);
                 this.scan_task = None;
-                // Results fetched against the old repo list are stale.
-                this.fetch_task = None;
-                this.refresh(cx);
+                match repos {
+                    Ok(repos) => {
+                        this.scan_error = None;
+                        this.repos = Some(repos);
+                        // Results fetched against the old repo list are stale.
+                        this.fetch_task = None;
+                        this.refresh(cx);
+                    }
+                    Err(err) => this.scan_error = Some(format!("{err:#}")),
+                }
+                cx.notify();
             })
             .ok();
         }));
@@ -264,21 +282,21 @@ impl Octowatcher {
         if self.repos.is_none() || self.fetch_task.is_some() {
             return;
         }
+        let hosts = self
+            .watched_repositories()
+            .into_iter()
+            .map(|id| id.host)
+            .collect();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { github::fetch_awaiting_reviews() })
+                .spawn(async move { github::fetch_awaiting_reviews(&hosts) })
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
                 this.last_checked = Some(Local::now());
-                match result {
-                    Ok(fetched) => {
-                        this.fetch_error = None;
-                        this.reconcile(fetched, cx);
-                    }
-                    Err(err) => this.fetch_error = Some(format!("{err:#}")),
-                }
+                this.fetch_error = (!result.errors.is_empty()).then(|| result.errors.join("\n"));
+                this.reconcile(result, cx);
                 cx.notify();
             })
             .ok();
@@ -290,13 +308,16 @@ impl Octowatcher {
     /// enabled local repos. A PR that drops out (reviewed, request removed,
     /// closed) is gone; one seen for the first time raises a notification.
     /// The first check after launch announces everything waiting instead.
-    fn reconcile(&mut self, fetched: Vec<PendingReview>, cx: &mut Context<Self>) {
-        let watched = self.watched_slugs();
-        let fetched: Vec<PendingReview> = fetched
-            .into_iter()
-            .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
+    fn reconcile(&mut self, fetched: github::FetchResults, cx: &mut Context<Self>) {
+        let watched = self.watched_repositories();
+        let first_hosts = fetched
+            .successful_hosts
+            .difference(&self.announced_hosts)
+            .cloned()
             .collect();
-        let reconciled = self.store.reconcile(fetched);
+        let reconciled =
+            self.store
+                .reconcile_hosts(fetched.reviews, &fetched.successful_hosts, &watched);
         // Saving the snoozes also saves the pending list.
         if reconciled.snoozes_changed {
             self.snoozes_changed(cx);
@@ -304,24 +325,31 @@ impl Octowatcher {
             self.save();
             self.sync_tray();
         }
-        if self.announced_launch {
-            self.notify(reconciled.fresh, cx);
-        } else {
-            self.announced_launch = true;
-            self.announce_waiting(cx);
-        }
+        let fresh = reconciled
+            .fresh
+            .into_iter()
+            .filter(|pr| self.announced_hosts.contains(&pr.host))
+            .collect();
+        self.notify(fresh, cx);
+        self.announce_waiting(&first_hosts, cx);
+        self.announced_hosts.extend(fetched.successful_hosts);
     }
 
     /// Notifies about every review waiting and not snoozed, as a count.
-    fn announce_waiting(&mut self, cx: &mut Context<Self>) {
-        let awake = self.store.awake();
+    fn announce_waiting(&mut self, hosts: &BTreeSet<String>, cx: &mut Context<Self>) {
+        let awake: Vec<_> = self
+            .store
+            .awake()
+            .into_iter()
+            .filter(|pr| hosts.contains(&pr.host))
+            .collect();
         let summary = match awake.len() {
             0 => return,
             1 => "You have 1 pending review".to_string(),
             n => format!("You have {n} pending reviews"),
         };
         let body = match awake.as_slice() {
-            [pr] => format!("{}#{}: {}", pr.repo, pr.number, pr.title),
+            [pr] => format!("{}#{}: {}", pr.repo_label(), pr.number, pr.title),
             many => pr_list(many),
         };
         self.show_notification(summary, body, None, cx, |_, _, _| {});
@@ -387,25 +415,23 @@ impl Octowatcher {
         });
     }
 
-    fn watched_slugs(&self) -> HashSet<String> {
+    fn watched_repositories(&self) -> HashSet<RepositoryId> {
         self.repos
             .iter()
             .flatten()
-            .filter(|repo| self.store.is_enabled(&repo.slug))
-            .map(|repo| repo.slug.to_lowercase())
+            .filter(|repo| self.store.is_enabled(&repo.id))
+            .map(|repo| repo.id.clone())
             .collect()
     }
 
-    fn toggle_repo(&mut self, slug: &str, cx: &mut Context<Self>) {
-        let key = slug.to_lowercase();
+    fn toggle_repo(&mut self, repository: &RepositoryId, cx: &mut Context<Self>) {
+        let key = repository.clone();
         if self.store.disabled.remove(&key) {
             self.save();
             self.refresh(cx);
         } else {
             self.store.disabled.insert(key.clone());
-            self.store
-                .pending
-                .retain(|pr| pr.repo.to_lowercase() != key);
+            self.store.pending.retain(|pr| pr.repository() != key);
             self.save();
             self.sync_tray();
         }
@@ -578,14 +604,18 @@ impl Octowatcher {
         };
         let summary = format!("Octowatcher {} is available", release.version);
         let url = release.url.clone();
-        self.show_notification(summary, body.into(), Some(action), cx, move |this, response, cx| {
-            match response {
+        self.show_notification(
+            summary,
+            body.into(),
+            Some(action),
+            cx,
+            move |this, response, cx| match response {
                 Response::Action(id) if id == "update" => this.install_update(cx),
                 Response::Action(id) if id == "download" => cx.open_url(&url),
                 Response::Clicked => show_window(cx),
                 _ => {}
-            }
-        });
+            },
+        );
     }
 
     /// Swaps in the available update, then offers to restart into it.
@@ -669,6 +699,7 @@ impl Octowatcher {
     /// The header has room for one error, so the first set one wins.
     fn displayed_error(&self) -> Option<&str> {
         [
+            &self.scan_error,
             &self.fetch_error,
             &self.save_error,
             &self.tray_error,
@@ -687,7 +718,7 @@ fn notification_text(prs: &[PendingReview]) -> (String, String) {
                 pr.author,
                 if pr.rereview { "re-review" } else { "review" }
             ),
-            format!("{}#{}: {}", pr.repo, pr.number, pr.title),
+            format!("{}#{}: {}", pr.repo_label(), pr.number, pr.title),
         ),
         many => (
             format!("{} pull requests need your review", many.len()),
@@ -698,7 +729,7 @@ fn notification_text(prs: &[PendingReview]) -> (String, String) {
 
 fn pr_list(prs: &[PendingReview]) -> String {
     prs.iter()
-        .map(|pr| format!("{}#{}", pr.repo, pr.number))
+        .map(|pr| format!("{}#{}", pr.repo_label(), pr.number))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -768,20 +799,15 @@ impl Octowatcher {
                             .items_center()
                             .gap_3()
                             .child(div().text_xs().text_color(rgb(theme::MUTED)).child(status))
-                            .child(button("refresh", "Refresh").on_click(cx.listener(
-                                |this, _: &ClickEvent, _, cx| this.refresh(cx),
-                            ))),
+                            .child(button("refresh", "Refresh").on_click(
+                                cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx)),
+                            )),
                     ),
             )
             .children(
                 self.displayed_error()
                     .map(str::to_owned)
-                    .map(|err| {
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::RED))
-                            .child(err)
-                    }),
+                    .map(|err| div().text_xs().text_color(rgb(theme::RED)).child(err)),
             )
             .children(self.render_update(cx))
             .child(
@@ -803,32 +829,32 @@ impl Octowatcher {
     }
 
     fn render_update(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let (message, action) = match self.update.as_ref()? {
-            Update::Available(release) => (
-                format!("Octowatcher {} is available.", release.version),
-                Some(button("install-update", "Update").on_click(
-                    cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx)),
-                )),
-            ),
-            Update::Installing(version) => (format!("Installing Octowatcher {version}…"), None),
-            Update::Ready(version) => (
-                format!("Octowatcher {version} is installed."),
-                Some(
-                    button("restart", "Restart")
-                        .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
-                ),
-            ),
-            Update::Manual(release) => {
-                let url = release.url.clone();
-                (
+        let (message, action) =
+            match self.update.as_ref()? {
+                Update::Available(release) => (
                     format!("Octowatcher {} is available.", release.version),
+                    Some(button("install-update", "Update").on_click(
+                        cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx)),
+                    )),
+                ),
+                Update::Installing(version) => (format!("Installing Octowatcher {version}…"), None),
+                Update::Ready(version) => (
+                    format!("Octowatcher {version} is installed."),
                     Some(
-                        button("download-update", "Download")
-                            .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url))),
+                        button("restart", "Restart")
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
                     ),
-                )
-            }
-        };
+                ),
+                Update::Manual(release) => {
+                    let url = release.url.clone();
+                    (
+                        format!("Octowatcher {} is available.", release.version),
+                        Some(button("download-update", "Download").on_click(
+                            cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)),
+                        )),
+                    )
+                }
+            };
         Some(
             div()
                 .flex()
@@ -857,7 +883,9 @@ impl Octowatcher {
             .py_1()
             .rounded_md()
             .cursor_pointer()
-            .when(active, |s| s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT)))
+            .when(active, |s| {
+                s.bg(rgb(theme::SURFACE)).text_color(rgb(theme::TEXT))
+            })
             .when(!active, |s| {
                 s.text_color(rgb(theme::SUBTEXT))
                     .hover(|s| s.bg(rgb(theme::SURFACE)))
@@ -935,7 +963,7 @@ impl Octowatcher {
                                     .gap_2()
                                     .text_xs()
                                     .text_color(rgb(theme::SUBTEXT))
-                                    .child(format!("{}#{}", pr.repo, pr.number))
+                                    .child(format!("{}#{}", pr.repo_label(), pr.number))
                                     .children(badge.map(|(label, color)| pill(label, color)))
                                     .when(pr.is_draft, |s| s.child(pill("draft", theme::MUTED))),
                             )
@@ -947,15 +975,12 @@ impl Octowatcher {
                             .truncate()
                             .child(pr.title.clone()),
                     )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme::MUTED))
-                            .child(match &snoozed_until {
-                                Some(at) => format!("by {} · snoozed until {at}", pr.author),
-                                None => format!("by {}", pr.author),
-                            }),
-                    )
+                    .child(div().text_xs().text_color(rgb(theme::MUTED)).child(
+                        match &snoozed_until {
+                            Some(at) => format!("by {} · snoozed until {at}", pr.author),
+                            None => format!("by {}", pr.author),
+                        },
+                    ))
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)))
             }))
     }
@@ -985,12 +1010,14 @@ impl Octowatcher {
                 div()
                     .flex()
                     .gap_2()
-                    .child(button("add-root", "Add folder…").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.add_root(cx),
-                    )))
-                    .child(button("rescan", "Rescan").on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| this.rescan(cx),
-                    ))),
+                    .child(
+                        button("add-root", "Add folder…")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_root(cx))),
+                    )
+                    .child(
+                        button("rescan", "Rescan")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rescan(cx))),
+                    ),
             );
 
         let repos = self.repos.as_deref().unwrap_or_default();
@@ -1007,8 +1034,8 @@ impl Octowatcher {
                 )
             })
             .children(repos.iter().enumerate().map(|(ix, repo)| {
-                let enabled = self.store.is_enabled(&repo.slug);
-                let slug = repo.slug.clone();
+                let enabled = self.store.is_enabled(&repo.id);
+                let id = repo.id.clone();
                 let paths = repo
                     .paths
                     .iter()
@@ -1033,7 +1060,7 @@ impl Octowatcher {
                             .flex_col()
                             .min_w_0()
                             .when(!enabled, |s| s.text_color(rgb(theme::MUTED)))
-                            .child(repo.slug.clone())
+                            .child(repo.id.to_string())
                             .child(
                                 div()
                                     .text_xs()
@@ -1047,9 +1074,9 @@ impl Octowatcher {
                     } else {
                         pill("off", theme::MUTED)
                     })
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.toggle_repo(&slug, cx)
-                    }))
+                    .on_click(
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&id, cx)),
+                    )
             }));
 
         div().flex().flex_col().gap_6().child(roots).child(list)
@@ -1082,15 +1109,13 @@ impl Octowatcher {
                     .flex_col()
                     .gap_2()
                     .child(section_title("Notifications"))
-                    .child(
-                        div().flex().child(
-                            button("test-notification", "Send test notification").on_click(
-                                cx.listener(|this, _: &ClickEvent, _, cx| {
-                                    this.send_test_notification(cx)
-                                }),
-                            ),
+                    .child(div().flex().child(
+                        button("test-notification", "Send test notification").on_click(
+                            cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.send_test_notification(cx)
+                            }),
                         ),
-                    ),
+                    )),
             )
     }
 
@@ -1128,7 +1153,9 @@ impl Octowatcher {
                             .rounded_md()
                             .text_xs()
                             .cursor_pointer()
-                            .when(active, |s| s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE)))
+                            .when(active, |s| {
+                                s.bg(rgb(theme::ACCENT)).text_color(rgb(theme::BASE))
+                            })
                             .when(!active, |s| {
                                 s.bg(rgb(theme::SURFACE))
                                     .text_color(rgb(theme::SUBTEXT))

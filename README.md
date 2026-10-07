@@ -11,16 +11,17 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Includes team requests.** It counts requests made to a team you belong to. The request clears once you review, even if the rest of the team hasn't.
 - **Snoozes a review for later.** Snooze a pull request from its notification or from the window. It leaves the tray until the snooze runs out, then notifies you again. A new review request on it ends the snooze early.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
+- **Supports Enterprise hosts.** Watch clones from github.com, GitHub Enterprise Server, and Enterprise Cloud with data residency (`*.ghe.com`) together. Repositories and reviews with the same name on different hosts stay separate.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
 ## Requirements
 
 - macOS, or Linux with a desktop that shows tray icons (AppIndicator).
-- The [GitHub CLI](https://cli.github.com/) (`gh`), logged in:
+- The [GitHub CLI](https://cli.github.com/) (`gh`) **2.81 or newer**, logged in:
 
   ```sh
-  gh auth login
+  gh auth login --hostname github.com
   ```
 
 Octowatcher looks for `gh` in `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and then on your `PATH`.
@@ -76,7 +77,28 @@ The scan goes up to five levels deep. It skips hidden folders and `node_modules`
 
 **GitHub repositories found** lists every repository that has at least one clone in those folders, with the paths of its clones. Click a repository to switch between **watching** and **off**. Reviews from repositories that are off don't show up and don't notify you.
 
-Octowatcher reads the remotes from each clone's `.git/config` and understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them.
+Octowatcher reads the remotes from each clone's `.git/config` and understands scp-like SSH (`git@HOST:owner/repo.git`), `ssh://`, and HTTPS remotes. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them. Repository labels include the host, for example `github.com/owner/repo` and `github.example.com/owner/repo`.
+
+It also reads straightforward literal `Host` / `HostName` aliases from `~/.ssh/config`. For example, `git@github-work:owner/repo.git` maps to the host named by `HostName` in the `Host github-work` block. Aliases work for SSH remotes only, and each alias stays scoped to its destination host. Octowatcher does not evaluate `Include`, `Match`, wildcard or negated SSH host rules; use a direct host remote or a literal alias for those configurations.
+
+### Enterprise hosts
+
+Log in to each host through GitHub CLI, then choose **Rescan** in Repositories (or restart Octowatcher):
+
+```sh
+gh auth login --hostname github.example.com
+gh auth login --hostname acme.ghe.com
+```
+
+Octowatcher recognizes the hosts configured in `gh`, plus github.com. You can watch several hosts at once; only hosts with enabled local repositories are polled for reviews. An expired login remains discoverable, so re-authenticating can recover its reviews. There is no separate host or token list in Octowatcher. It uses gh's active account on each host, including gh's normal environment-token precedence. SSH keys and aliases select a remote destination; they do not select the account used by the API. Multiple accounts on one host are not independently monitored.
+
+API requests explicitly target the repository's web host. GitHub CLI chooses the endpoint: `api.github.com` for github.com, `HOST/api/v3` and `HOST/api/graphql` for Enterprise Server, and `api.TENANT.ghe.com` for Enterprise Cloud with data residency. Hosts must provide standard HTTPS APIs. Custom API ports, HTTP-only APIs, reverse-proxy path prefixes, and IPv6 host literals are not supported. SSH remote URLs may use a custom SSH port; HTTPS remotes may use the standard port 443.
+
+Each host must support the GraphQL fields used for review requests, review history, and re-review detection. Octowatcher reports incompatible schemas as a host-specific error; it does not provide fallback APIs for older Enterprise Server versions. Authentication, permission, network, and API failures on one host leave its last known reviews and snoozes in place while healthy hosts keep refreshing. Discovery and review CLI calls time out after 60 seconds so a stalled request can report an error. If discovery itself fails, Octowatcher keeps the previous scan in memory; retry **Rescan** after resolving the error. Cached reviews may be out of date until that host recovers. Repositories switched off or removed from the watched folders still leave the list.
+
+Self-updates always use `github.com/mattsverse/octowatch`, independently of monitored hosts and `GH_HOST`. Keep your github.com login available to check and download app updates.
+
+Host routing and failure handling are covered by local fixtures and command-routing tests. Enterprise Server and data-residency service behavior has not been exercised against a live Enterprise instance.
 
 ### Settings
 
@@ -97,14 +119,17 @@ Octowatcher saves your settings (folders, switched-off repositories, check inter
 | macOS | `~/Library/Application Support/octowatcher/state.json` |
 | Linux | `~/.config/octowatcher/state.json` |
 
+State from v0.4.3 and earlier loads automatically: repositories, reviews, and snoozes without a host belong to github.com. Settings and existing snooze deadlines are retained. New state records host-qualified identities; repository switches and snoozes affect only that host.
+
 Delete this file to reset Octowatcher. Everything it sends to GitHub goes through `gh`.
 
 ## Troubleshooting
 
 - **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then restart the app.
 - **"could not run `gh`; is the GitHub CLI installed?"**: install the GitHub CLI, or put it in one of the folders listed under [Requirements](#requirements).
-- **"gh api failed: …"**: run `gh auth status` in a terminal, and `gh auth login` if you're logged out.
-- **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. Then click **Rescan**.
+- **A host reports an API or authentication error**: run `gh auth status --hostname HOST` in a terminal, and `gh auth login --hostname HOST` if you're logged out. Permission or schema errors may require your Enterprise administrator. Other hosts continue updating while this host's cached reviews remain visible.
+- **"install gh 2.81 or newer"**: update GitHub CLI, then choose **Rescan**. Host discovery uses [JSON authentication status added in gh 2.81](https://github.com/cli/cli/releases/tag/v2.81.0).
+- **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. For Enterprise clones, authenticate to their destination host using `gh auth login --hostname HOST`. Then click **Rescan**.
 - **No tray icon on Linux**: GNOME needs an AppIndicator extension, such as *AppIndicator and KStatusNotifierItem Support*, before it shows tray icons.
 
 ## Building from source

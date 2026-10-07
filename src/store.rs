@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::PathBuf,
 };
@@ -7,14 +7,16 @@ use std::{
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::repository::{RepositoryId, default_host};
+
 /// Everything that survives a restart, saved as JSON in the platform config dir.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Store {
     /// Folders scanned for local git clones.
     pub roots: Vec<PathBuf>,
-    /// `owner/name` slugs (lowercase) the user switched off.
-    pub disabled: BTreeSet<String>,
+    /// Host-qualified repository identities the user switched off.
+    pub disabled: BTreeSet<RepositoryId>,
     /// Pull requests currently waiting on the user's review.
     pub pending: Vec<PendingReview>,
     /// Minutes between checks of GitHub for review requests.
@@ -40,6 +42,8 @@ impl Default for Store {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingReview {
+    #[serde(default = "default_host")]
+    pub host: String,
     /// `owner/name` as GitHub spells it.
     pub repo: String,
     pub number: u64,
@@ -54,14 +58,24 @@ pub struct PendingReview {
 }
 
 impl PendingReview {
-    pub fn key(&self) -> (String, u64) {
-        (self.repo.to_lowercase(), self.number)
+    pub fn repository(&self) -> RepositoryId {
+        RepositoryId::new(&self.host, &self.repo)
+    }
+
+    pub fn key(&self) -> (RepositoryId, u64) {
+        (self.repository(), self.number)
+    }
+
+    pub fn repo_label(&self) -> String {
+        format!("{}/{}", self.host, self.repo)
     }
 }
 
 /// A pending review hidden from the list and the tray until `until`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snooze {
+    #[serde(default = "default_host")]
+    pub host: String,
     /// `owner/name`, lowercase.
     pub repo: String,
     pub number: u64,
@@ -72,8 +86,8 @@ pub struct Snooze {
 }
 
 impl Snooze {
-    pub fn key(&self) -> (String, u64) {
-        (self.repo.clone(), self.number)
+    pub fn key(&self) -> (RepositoryId, u64) {
+        (RepositoryId::new(&self.host, &self.repo), self.number)
     }
 }
 
@@ -116,8 +130,8 @@ impl Store {
         Ok(())
     }
 
-    pub fn is_enabled(&self, slug: &str) -> bool {
-        !self.disabled.contains(&slug.to_lowercase())
+    pub fn is_enabled(&self, repository: &RepositoryId) -> bool {
+        !self.disabled.contains(repository)
     }
 
     pub fn snooze_for(&self, pr: &PendingReview) -> Option<&Snooze> {
@@ -132,6 +146,25 @@ impl Store {
             .filter(|pr| self.snooze_for(pr).is_none())
             .cloned()
             .collect()
+    }
+
+    /// Successful hosts replace their cached reviews. Failed hosts keep theirs;
+    /// disabled or no-longer-local repositories still leave the list.
+    pub fn reconcile_hosts(
+        &mut self,
+        mut fetched: Vec<PendingReview>,
+        successful_hosts: &BTreeSet<String>,
+        watched: &HashSet<RepositoryId>,
+    ) -> Reconciled {
+        fetched.retain(|pr| successful_hosts.contains(&pr.host.to_ascii_lowercase()));
+        fetched.extend(
+            self.pending
+                .iter()
+                .filter(|pr| !successful_hosts.contains(&pr.host.to_ascii_lowercase()))
+                .cloned(),
+        );
+        fetched.retain(|pr| watched.contains(&pr.repository()));
+        self.reconcile(fetched)
     }
 
     /// Replaces the pending list with what GitHub reports now, newest first.
@@ -200,9 +233,11 @@ fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PendingReview, Snooze, Store};
+    use crate::repository::{RepositoryId, default_host};
 
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
         PendingReview {
+            host: default_host(),
             repo: repo.to_string(),
             number,
             title: format!("PR {number}"),
@@ -216,6 +251,7 @@ mod tests {
 
     fn snooze(repo: &str, number: u64, requested_at: Option<&str>) -> Snooze {
         Snooze {
+            host: default_host(),
             repo: repo.to_string(),
             number,
             until: 100,
@@ -364,7 +400,7 @@ mod tests {
     fn key_lowercases_repo() {
         assert_eq!(
             pr("Owner/Repo", 7, None).key(),
-            ("owner/repo".to_string(), 7)
+            (RepositoryId::new("github.com", "owner/repo"), 7)
         );
     }
 
@@ -393,5 +429,121 @@ mod tests {
         assert_eq!(woken, vec![1]);
         assert_eq!(store.snoozed.len(), 1);
         assert_eq!(store.snoozed[0].number, 2);
+    }
+
+    #[test]
+    fn migrates_v043_state_without_losing_settings_or_snoozes() {
+        let legacy = r#"{
+            "roots":["/tmp/projects"], "disabled":["Owner/Repo"],
+            "poll_minutes":15, "snooze_minutes":30,
+            "pending":[{"repo":"other/repo","number":7,"title":"Review","url":"https://github.com/other/repo/pull/7","author":"someone","is_draft":false,"rereview":true,"requested_at":"2026-01-01T00:00:00Z"}],
+            "snoozed":[{"repo":"other/repo","number":7,"until":123456789,"requested_at":"2026-01-01T00:00:00Z"}]
+        }"#;
+        let store: Store = serde_json::from_str(legacy).unwrap();
+        assert_eq!(store.roots, vec![std::path::PathBuf::from("/tmp/projects")]);
+        assert_eq!((store.poll_minutes, store.snooze_minutes), (15, 30));
+        assert!(!store.is_enabled(&RepositoryId::new("github.com", "owner/repo")));
+        assert!(store.is_enabled(&RepositoryId::new("github.example.com", "owner/repo")));
+        assert_eq!(store.pending[0].host, "github.com");
+        assert_eq!(
+            store.snooze_for(&store.pending[0]).unwrap().until,
+            123456789
+        );
+        let saved = serde_json::to_string(&store).unwrap();
+        let reloaded: Store = serde_json::from_str(&saved).unwrap();
+        assert_eq!(store.disabled, reloaded.disabled);
+        assert_eq!(store.pending, reloaded.pending);
+        assert_eq!(store.snoozed, reloaded.snoozed);
+        assert_eq!(reloaded.awake().len(), 0);
+    }
+
+    #[test]
+    fn same_slug_and_pr_number_on_different_hosts_stay_independent() {
+        let public = pr("Owner/Repo", 7, Some(T1));
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store::default();
+        let changes = store.reconcile(vec![public.clone(), enterprise.clone()]);
+        assert_eq!(changes.fresh.len(), 2);
+        store.snoozed.push(Snooze {
+            host: enterprise.host.clone(),
+            ..snooze("owner/repo", 7, Some(T1))
+        });
+        assert_eq!(store.awake(), vec![public.clone()]);
+        store.disabled.insert(public.repository());
+        assert!(!store.is_enabled(&public.repository()));
+        assert!(store.is_enabled(&enterprise.repository()));
+        let next_public = PendingReview {
+            requested_at: Some(T2.into()),
+            ..public
+        };
+        let changes = store.reconcile(vec![next_public, enterprise.clone()]);
+        assert_eq!(changes.fresh.len(), 1);
+        assert_eq!(store.snoozed.len(), 1);
+        assert_eq!(store.take_expired(100), vec![enterprise]);
+    }
+
+    #[test]
+    fn failed_hosts_keep_cache_and_snoozes_while_healthy_hosts_reconcile() {
+        let public = pr("owner/repo", 7, Some(T1));
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let cloud = PendingReview {
+            host: "acme.ghe.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store {
+            pending: vec![public.clone(), server.clone(), cloud.clone()],
+            snoozed: vec![Snooze {
+                host: server.host.clone(),
+                ..snooze("owner/repo", 7, Some(T1))
+            }],
+            ..Store::default()
+        };
+        let watched = [public.repository(), server.repository(), cloud.repository()]
+            .into_iter()
+            .collect();
+        let healthy = [public.host.clone(), cloud.host.clone()]
+            .into_iter()
+            .collect();
+        let new_cloud = PendingReview {
+            requested_at: Some(T2.into()),
+            ..cloud
+        };
+        let changes = store.reconcile_hosts(vec![new_cloud.clone()], &healthy, &watched);
+        assert_eq!(changes.fresh, vec![new_cloud]);
+        assert!(store.pending.contains(&server));
+        assert!(!store.pending.contains(&public));
+        assert_eq!(store.snoozed.len(), 1);
+        assert!(!changes.snoozes_changed);
+        // Recovery reporting no reviews clears the server and its snooze.
+        let changes = store.reconcile_hosts(
+            vec![],
+            &[server.host.clone()].into_iter().collect(),
+            &watched,
+        );
+        assert!(!store.pending.contains(&server));
+        assert!(store.snoozed.is_empty());
+        assert!(changes.snoozes_changed);
+    }
+
+    #[test]
+    fn failed_host_caches_do_not_restore_disabled_or_removed_repositories() {
+        let public = pr("owner/repo", 7, Some(T1));
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let mut store = Store {
+            pending: vec![public.clone(), server],
+            ..Store::default()
+        };
+        let watched = [public.repository()].into_iter().collect();
+        store.reconcile_hosts(vec![], &Default::default(), &watched);
+        assert_eq!(store.pending, vec![public]);
     }
 }
