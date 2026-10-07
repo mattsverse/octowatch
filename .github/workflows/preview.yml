@@ -1,0 +1,112 @@
+name: Preview
+
+# Adding the `preview` label to a pull request builds unsigned bundles once,
+# comments their download links, then removes the label: pushes never rebuild,
+# since the macOS runner is the expensive part of CI. Label again to rebuild.
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    # Branches of this repository only, so no fork's code runs on our runners.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.label.name == 'preview'
+    runs-on: blacksmith-6vcpu-macos-15
+    outputs:
+      artifact-url: ${{ steps.upload.outputs.artifact-url }}
+    steps:
+      # The PR head rather than the default merge commit: the SHA the comment reports.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      # Apple Silicon only and no notarization: a preview needs neither.
+      - id: build
+        uses: ./.github/actions/build-macos
+      # Ad-hoc signed, so Gatekeeper still quarantines the download.
+      - env:
+          BUNDLE_DIR: ${{ steps.build.outputs.bundle-dir }}
+        run: |
+          codesign --force --sign - "$BUNDLE_DIR/osx/Octowatcher.app"
+          COPYFILE_DISABLE=1 tar -C "$BUNDLE_DIR/osx" -czf octowatcher-macos-preview.tar.gz Octowatcher.app
+      - id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: macos-preview
+          path: octowatcher-macos-preview.tar.gz
+          retention-days: 7
+
+  linux:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.label.name == 'preview'
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    outputs:
+      artifact-url: ${{ steps.upload.outputs.artifact-url }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - uses: ./.github/actions/build-linux
+      - id: upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-preview
+          path: |
+            target/release/bundle/deb/*.deb
+            target/release/bundle/appimage/*.AppImage
+          retention-days: 7
+
+  finish:
+    needs: [macos, linux]
+    # Also after a failed build, so the label comes off either way. Not after a
+    # cancelled one: the run that cancelled it removes the label itself.
+    if: ${{ !cancelled() && needs.macos.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      # One comment per PR, found by its marker and edited on every build.
+      - if: needs.macos.result == 'success' && needs.linux.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MACOS_URL: ${{ needs.macos.outputs.artifact-url }}
+          LINUX_URL: ${{ needs.linux.outputs.artifact-url }}
+        run: |
+          marker='<!-- octowatcher-preview -->'
+          body="$marker
+          ### Preview bundles
+
+          Built from ${SHA:0:7} in [this run]($RUN_URL). Links expire on $(date -u -d '+7 days' +%Y-%m-%d). Add the \`preview\` label again to rebuild.
+
+          - **macOS** (Apple Silicon): [macos-preview.zip]($MACOS_URL). Unsigned, so clear the quarantine before opening: \`xattr -dr com.apple.quarantine Octowatcher.app\`
+          - **Linux** (.deb and AppImage): [linux-preview.zip]($LINUX_URL)"
+          id=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$marker\"))) | .id" | head -n1)
+          if [[ -n "$id" ]]; then
+            gh api -X PATCH "repos/$REPO/issues/comments/$id" -f body="$body" > /dev/null
+          else
+            gh api "repos/$REPO/issues/$PR/comments" -f body="$body" > /dev/null
+          fi
+      # Runs even if commenting failed; tolerates a label already taken off by hand.
+      - if: ${{ !cancelled() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh api -X DELETE "repos/$REPO/issues/$PR/labels/preview" > /dev/null || true

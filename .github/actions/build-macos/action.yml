@@ -1,0 +1,36 @@
+name: Build macOS bundle
+description: Builds the Octowatcher .app with cargo-bundle. Signing is left to the caller.
+
+inputs:
+  targets:
+    description: Comma-separated Rust targets. More than one is combined with lipo into a universal app.
+    default: aarch64-apple-darwin
+
+outputs:
+  bundle-dir:
+    description: Directory holding the bundle formats, e.g. `osx/Octowatcher.app`.
+    value: ${{ steps.bundle.outputs.bundle-dir }}
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.targets }}
+    - uses: Swatinem/rust-cache@v2
+    - shell: bash
+      run: cargo install cargo-bundle --version 0.12.0 --locked
+    - id: bundle
+      shell: bash
+      env:
+        TARGETS: ${{ inputs.targets }}
+      run: |
+        IFS=, read -ra targets <<< "$TARGETS"
+        args=()
+        for target in "${targets[@]}"; do args+=(-t "$target"); done
+        cargo bundle --release --format osx "${args[@]}"
+        if (( ${#targets[@]} > 1 )); then
+          echo "bundle-dir=target/universal/release/bundle" >> "$GITHUB_OUTPUT"
+        else
+          echo "bundle-dir=target/${targets[0]}/release/bundle" >> "$GITHUB_OUTPUT"
+        fi
