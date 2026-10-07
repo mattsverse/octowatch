@@ -13,6 +13,7 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
 - **Monitors multiple accounts together.** Enable your work and personal accounts independently. Each review shows its receiving account, and requests for the same PR under different accounts have separate snoozes.
 - **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), using its saved github.com accounts without switching your active CLI account.
+- **Follows your desktop appearance.** Use System, Light or Dark in Settings. System is the default, and your choice survives restarts.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
 ## Requirements
@@ -91,6 +92,10 @@ Octowatcher reads the remotes from each clone's `.git/config` and understands SS
 
 If an account is signed out, its authentication expires, or its check fails, its reviews are hidden from the window and tray and it sends no new review notifications. Settings shows an account-specific error. Its cache and snoozes are retained separately; other accounts continue checking. After a successful check, its current reviews return and snoozes that expired while unavailable can notify again. Cached reviews also stay hidden after app restart until the first successful check.
 
+**Appearance** offers **System**, **Light** and **Dark**. System follows the desktop's appearance and updates an open window when it changes. Light and Dark override it immediately, and the choice is saved across restarts. Missing, unrecognized or invalid appearance values default to System while preserving the rest of your saved settings and reviews. The dark palette keeps Octowatcher's existing identity, with clearer muted text and hover states; the light palette uses matching shades. Snoozed reviews use dimmer text while their buttons and status labels stay readable.
+
+On Linux, System uses the desktop's XDG settings portal. If the portal is unavailable or reports no preference, GPUI uses light appearance; choose Light or Dark explicitly if your desktop doesn't report changes. The macOS tray glyph follows the menu bar's appearance automatically. Linux uses a black glyph with a white outline for visibility on light and dark panels, independently of the window's appearance. Native title bars, tray menus and macOS dialogs follow the desktop's theme. GPUI's built-in Linux dialogs use their own styling.
+
 This tab sets how often Octowatcher checks GitHub: every 1, 2, 5, 10, 15, 30 or 60 minutes. The default is 2 minutes.
 
 It also sets the default snooze length: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default is 5 minutes. Changing it affects future snoozes, including notification actions, and leaves existing snooze deadlines unchanged.
@@ -101,7 +106,7 @@ Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To
 
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval and snooze length), your account-specific snoozes, and cached review lists to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval, snooze length and appearance), your account-specific snoozes, and cached review lists to one JSON file:
 
 | Platform | Path |
 | --- | --- |

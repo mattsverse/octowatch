@@ -1125,6 +1125,53 @@ mod tests {
     }
 
     #[test]
+    fn auth_failure_invalidates_only_that_accounts_cached_access() {
+        let script = Script::default();
+        let now = Instant::now();
+        let store = Store::from_json(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.successful("bob", 2);
+        let first = poll_with(
+            &script,
+            &[REPO.into()],
+            store.clone(),
+            AccessCache::default(),
+            now,
+        )
+        .unwrap();
+        script.status(include_str!("../tests/fixtures/expired-account.json"));
+        script.identity("bob", 2);
+        script.search("bob", REVIEWS);
+        let failed = poll_with(
+            &script,
+            &[REPO.into()],
+            store.clone(),
+            first.access_cache,
+            now + Duration::from_secs(120),
+        )
+        .unwrap();
+        assert!(failed.checks[0].reviews.is_err());
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.identity("bob", 2);
+        script.search("bob", REVIEWS);
+        let recovered = poll_with(
+            &script,
+            &[REPO.into()],
+            store,
+            failed.access_cache,
+            now + Duration::from_secs(240),
+        )
+        .unwrap();
+        assert!(recovered.checks.iter().all(|check| check.reviews.is_ok()));
+        script.finished();
+    }
+
+    #[test]
     fn partial_graphql_result_is_not_applied_as_a_complete_account_snapshot() {
         let mut response: serde_json::Value = serde_json::from_str(REVIEWS).unwrap();
         response["errors"] = serde_json::json!([{"message": "rate limit"}]);
