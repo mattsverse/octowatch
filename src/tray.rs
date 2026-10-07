@@ -86,7 +86,10 @@ pub fn listen(cx: &mut App) {
                 cx.update(crate::install_update)
             } else if id == QUIT_ID {
                 cx.update(|cx| cx.quit())
-            } else if let Some(url) = id.strip_prefix(OPEN_PREFIX) {
+            } else if let Some((_, url)) = id
+                .strip_prefix(OPEN_PREFIX)
+                .and_then(|id| id.split_once(':'))
+            {
                 cx.update(|cx| cx.open_url(url))
             } else {
                 Ok(())
@@ -102,10 +105,20 @@ pub fn listen(cx: &mut App) {
 fn build_menu(pending: &[PendingReview], update: UpdateItem) -> Result<Menu> {
     let menu = Menu::new();
     if pending.is_empty() {
-        menu.append(&MenuItem::new("Nothing waiting on your review.", false, None))?;
+        menu.append(&MenuItem::new(
+            "Nothing waiting on your review.",
+            false,
+            None,
+        ))?;
     }
     for pr in pending {
-        let mut label = format!("{}#{}: {}", pr.repo, pr.number, truncate(&pr.title));
+        let mut label = format!(
+            "@{} · {}#{}: {}",
+            pr.account,
+            pr.repo,
+            pr.number,
+            truncate(&pr.title)
+        );
         if pr.rereview {
             label.push_str("  (re-review)");
         }
@@ -113,7 +126,7 @@ fn build_menu(pending: &[PendingReview], update: UpdateItem) -> Result<Menu> {
             label.push_str("  (draft)");
         }
         menu.append(&MenuItem::with_id(
-            format!("{OPEN_PREFIX}{}", pr.url),
+            format!("{OPEN_PREFIX}{}:{}", pr.account, pr.url),
             label,
             true,
             None,
@@ -158,10 +171,23 @@ fn tray_icon() -> Icon {
     const PNG: &[u8] = include_bytes!("../assets/tray.png");
     let mut decoder = png::Decoder::new(std::io::Cursor::new(PNG));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = decoder.read_info().expect("bundled tray icon is a valid PNG");
-    let mut rgba = vec![0; reader.output_buffer_size().expect("tray icon fits in memory")];
-    let info = reader.next_frame(&mut rgba).expect("bundled tray icon decodes");
-    assert_eq!(info.color_type, png::ColorType::Rgba, "tray icon must be RGBA");
+    let mut reader = decoder
+        .read_info()
+        .expect("bundled tray icon is a valid PNG");
+    let mut rgba = vec![
+        0;
+        reader
+            .output_buffer_size()
+            .expect("tray icon fits in memory")
+    ];
+    let info = reader
+        .next_frame(&mut rgba)
+        .expect("bundled tray icon decodes");
+    assert_eq!(
+        info.color_type,
+        png::ColorType::Rgba,
+        "tray icon must be RGBA"
+    );
     rgba.truncate(info.buffer_size());
     Icon::from_rgba(rgba, info.width, info.height).expect("icon buffer matches its size")
 }

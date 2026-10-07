@@ -11,16 +11,17 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Includes team requests.** It counts requests made to a team you belong to. The request clears once you review, even if the rest of the team hasn't.
 - **Snoozes a review for later.** Snooze a pull request from its notification or from the window. It leaves the tray until the snooze runs out, then notifies you again. A new review request on it ends the snooze early.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
-- **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
+- **Monitors multiple accounts together.** Enable your work and personal accounts independently. Each review shows its receiving account, and requests for the same PR under different accounts have separate snoozes.
+- **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), using its saved github.com accounts without switching your active CLI account.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
 ## Requirements
 
 - macOS, or Linux with a desktop that shows tray icons (AppIndicator).
-- The [GitHub CLI](https://cli.github.com/) (`gh`), logged in:
+- A recent [GitHub CLI](https://cli.github.com/) (`gh`) supporting `gh auth status --json hosts` and `gh auth token --user`, with at least one saved github.com login:
 
   ```sh
-  gh auth login
+  gh auth login --hostname github.com
   ```
 
 Octowatcher looks for `gh` in `/opt/homebrew/bin`, `/usr/local/bin` and `/usr/bin`, and then on your `PATH`.
@@ -64,7 +65,9 @@ The window has three tabs.
 
 ### Reviews
 
-This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
+This tab lists the pull requests waiting on you, most recent request first. Each card, tray entry, and review notification includes the receiving `@login`. Click one to open it on GitHub. The tray menu shows the same list. If the same PR needs a review from two accounts, it appears twice and counts twice toward the tray total; snoozing one account's request does not snooze the other.
+
+Opening a PR uses your browser's current GitHub session. Octowatcher does not switch your browser login; choose the matching account in GitHub before reviewing.
 
 **Snooze** hides a pull request from the tray for the snooze length set in Settings. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new notification about a single pull request also has a **Snooze** button. One that covers several pull requests doesn't. Snoozes survive a restart.
 
@@ -76,9 +79,15 @@ The scan goes up to five levels deep. It skips hidden folders and `node_modules`
 
 **GitHub repositories found** lists every repository that has at least one clone in those folders, with the paths of its clones. Click a repository to switch between **watching** and **off**. Reviews from repositories that are off don't show up and don't notify you.
 
-Octowatcher reads the remotes from each clone's `.git/config` and understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them.
+Each repository defaults to **All enabled accounts**. Under **Monitor with**, click account names to restrict it to selected accounts, or choose **All enabled accounts** to restore the default, including accounts added later. Selecting no accounts pauses that repository. Account selections still respect the account's global enable/disable setting. Repository-access errors name the account and repository; check permissions and organization SSO authorization if a private repository is inaccessible. Other accessible repositories continue normally.
+
+Octowatcher reads the remotes from each clone's `.git/config` and understands SSH, `ssh://` and HTTPS remotes. If you use host aliases in `~/.ssh/config`, such as `git@github-work:owner/repo.git`, it picks up any alias whose `HostName` is `github.com`. SSH aliases identify repositories; they do not assign a GitHub API account. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them. GitHub Enterprise hosts are not supported by this account feature.
 
 ### Settings
+
+**GitHub accounts** lists saved github.com accounts discovered through `gh`. New accounts are enabled automatically. Use **Disable** or **Enable** to control monitoring without signing an account out of `gh`. To add an account, run `gh auth login --hostname github.com` in a terminal, sign in as that account, then click **Refresh**. Account additions, removals, and external `gh auth switch` changes are picked up on the next check; changing the CLI's active account does not change which enabled accounts Octowatcher monitors.
+
+If an account is signed out, its authentication expires, or its check fails, its reviews are hidden from the window and tray and it sends no new review notifications. Settings shows an account-specific error. Its cache and snoozes are retained separately; other accounts continue checking. After a successful check, its current reviews return and snoozes that expired while unavailable can notify again. Cached reviews also stay hidden after app restart until the first successful check.
 
 This tab sets how often Octowatcher checks GitHub: every 1, 2, 5, 10, 15, 30 or 60 minutes. The default is 2 minutes.
 
@@ -90,7 +99,7 @@ Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To
 
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories, check interval and snooze length), your snoozes, and the current review list for the repositories you watch to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval and snooze length), your account-specific snoozes, and cached review lists to one JSON file:
 
 | Platform | Path |
 | --- | --- |
@@ -99,11 +108,15 @@ Octowatcher saves your settings (folders, switched-off repositories, check inter
 
 Delete this file to reset Octowatcher. Everything it sends to GitHub goes through `gh`.
 
+Review and snooze identity uses GitHub's stable user ID, repository, and PR number. Credentials are retrieved by account from `gh`, used temporarily in memory and the child process environment, and never saved to the state file or passed in command arguments. Octowatcher uses saved CLI credentials and ignores inherited `GH_TOKEN`/`GITHUB_TOKEN` overrides for both monitoring and updates. Update checks and downloads can use a healthy saved github.com account even if it is disabled for monitoring.
+
+When upgrading from a state file without account identity, folders, disabled repositories, check interval, and snooze duration are preserved. Old cached reviews and snoozes are discarded because their receiving account is unknown; current requests are fetched again and may notify again.
+
 ## Troubleshooting
 
 - **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then restart the app.
 - **"could not run `gh`; is the GitHub CLI installed?"**: install the GitHub CLI, or put it in one of the folders listed under [Requirements](#requirements).
-- **"gh api failed: …"**: run `gh auth status` in a terminal, and `gh auth login` if you're logged out.
+- **An account is unavailable**: run `gh auth status --hostname github.com` in a terminal, sign back into the affected account with `gh auth login --hostname github.com`, then click **Refresh**. Upgrade `gh` if account discovery reports unsupported JSON flags. An environment token alone is not a saved account.
 - **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. Then click **Rescan**.
 - **No tray icon on Linux**: GNOME needs an AppIndicator extension, such as *AppIndicator and KStatusNotifierItem Support*, before it shows tray icons.
 

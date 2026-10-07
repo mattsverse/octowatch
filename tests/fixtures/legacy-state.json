@@ -1,0 +1,30 @@
+{
+  "roots": [
+    "/fixtures/dev"
+  ],
+  "disabled": [
+    "owner/off"
+  ],
+  "pending": [
+    {
+      "repo": "Owner/Repo",
+      "number": 7,
+      "title": "Review the shared change",
+      "url": "https://github.com/Owner/Repo/pull/7",
+      "author": "author",
+      "is_draft": false,
+      "rereview": false,
+      "requested_at": "2026-10-07T10:00:00Z"
+    }
+  ],
+  "poll_minutes": 15,
+  "snooze_minutes": 30,
+  "snoozed": [
+    {
+      "repo": "owner/repo",
+      "number": 7,
+      "until": 2000000000,
+      "requested_at": "2026-10-07T10:00:00Z"
+    }
+  ]
+}
