@@ -61,7 +61,22 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+      # The self-updater looks for these names (src/updater.rs).
+      - name: Check self-update downloads
+        working-directory: dist
+        run: |
+          status=0
+          for name in 'octowatcher-macos.tar.gz' 'octowatcher_*_x86_64.AppImage'; do
+            if [ -z "$(find . -type f -name "$name")" ]; then
+              echo "::error::dist/ has no $name"
+              status=1
+            fi
+          done
+          exit "$status"
       - uses: softprops/action-gh-release@v3
         with:
-          # release-please already wrote the notes; this only attaches assets.
+          # release-please created this tag's release as a draft and wrote its
+          # notes. This attaches the downloads, then publishes the draft.
           files: dist/**/*
+          fail_on_unmatched_files: true
+          draft: false

@@ -132,8 +132,16 @@ cargo bundle --release
 
 ## Releasing
 
-The Release workflow builds on `v*` tags. It can also be run manually to build
-and verify artifacts without publishing a release.
+Merging the release-please pull request creates the `v*` tag and a draft
+GitHub release with its notes. The tag starts the Release workflow. It builds
+both platforms, checks that the self-update downloads (`octowatcher-macos.tar.gz`
+and the x86_64 AppImage) are present, attaches every download to the draft, and
+only then publishes it. Until then the release stays a draft, so the updater
+never sees a release without downloads. If a build fails, the draft and tag
+remain: re-run the failed jobs, or delete both before releasing again.
+
+The workflow can also be run manually to build and verify artifacts without
+publishing a release.
 
 The macOS job requires these repository secrets under **Settings → Secrets and
 variables → Actions**:
@@ -149,7 +157,7 @@ variables → Actions**:
 `packaging/macos/release.sh` signs the universal app with Hardened Runtime,
 submits it to Apple, and staples the notarization ticket before creating the
 self-update archive and DMG. It also signs, notarizes, and staples the DMG.
-Publication requires successful notarization and verification of both downloads.
+The release is published only after notarization and verification of both downloads succeed.
 The temporary signing keychain and credentials are removed when the script exits.
 
 If Apple rejects a submission, the job prints its notarization log. Each submission
