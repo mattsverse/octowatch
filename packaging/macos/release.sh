@@ -96,14 +96,25 @@ xcrun stapler validate "$work_dir/extracted/Octowatcher.app"
 mkdir -p "$(dirname "$dmg")" "$work_dir/dmg"
 ditto "$app" "$work_dir/dmg/Octowatcher.app"
 ln -s /Applications "$work_dir/dmg/Applications"
+# TEMP: diagnose notarytool rejecting the DMG
+inspect() {
+    echo "=== $1: $2"
+    ls -l "$2" || true
+    hdiutil imageinfo "$2" 2>&1 | head -5 || true
+    tail -c 512 "$2" | xxd | head -2 || true
+}
+sw_vers; xcode-select -p; xcrun notarytool --version; hdiutil version || true
+df -h . "$work_dir" || true
 hdiutil create -ov -volname Octowatcher -fs HFS+ -format UDZO \
     -srcfolder "$work_dir/dmg" "$dmg"
+inspect "after create" "$dmg"
+hdiutil create -ov -volname Octowatcher -fs HFS+ -format UDZO \
+    -srcfolder "$work_dir/dmg" "$work_dir/temp-copy.dmg"
+inspect "temp-dir copy after create" "$work_dir/temp-copy.dmg"
 codesign --force --sign "$identity" --keychain "$keychain" --timestamp "$dmg"
-# TEMP: diagnose notarytool rejecting the DMG
-sw_vers; xcode-select -p; xcrun notarytool --version
-ls -l "$dmg"; file "$dmg"
-hdiutil imageinfo "$dmg" | head -20
-tail -c 512 "$dmg" | xxd | head -4   # UDIF trailer should start with "koly"
+inspect "after codesign" "$dmg"
+codesign --force --sign "$identity" --keychain "$keychain" --timestamp "$work_dir/temp-copy.dmg"
+inspect "temp-dir copy after codesign" "$work_dir/temp-copy.dmg"
 notarize "$dmg"
 xcrun stapler staple "$dmg"
 xcrun stapler validate "$dmg"
