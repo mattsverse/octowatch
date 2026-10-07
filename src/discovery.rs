@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::repository::{RepositoryId, normalize_host};
+use crate::repository::{PUBLIC_HOST, RepositoryId, normalize_host};
 
 const MAX_DEPTH: usize = 5;
 const SKIPPED_DIRS: &[&str] = &[
@@ -194,6 +194,13 @@ fn parse_github_url(
     } else {
         &host
     };
+    // GitHub's SSH-over-443 endpoint serves github.com repositories. It is a
+    // transport destination, not a separate host for API calls or saved state.
+    let host = if ssh && host == "ssh.github.com" {
+        PUBLIC_HOST
+    } else {
+        host.as_str()
+    };
     if !hosts.iter().any(|known| known.eq_ignore_ascii_case(host)) {
         return None;
     }
@@ -275,6 +282,46 @@ mod tests {
         assert!(!aliases.contains_key("neg"));
         assert_eq!(
             parse_github_url("git@other:owner/repo", &hosts(), &aliases),
+            None
+        );
+    }
+
+    #[test]
+    fn ssh_over_https_clones_keep_the_public_repository_identity() {
+        // GitHub's documented Host github.com / HostName ssh.github.com override.
+        let aliases = ssh_aliases(
+            "Host github.com github-443\n HostName ssh.github.com\n Port 443\n User git\n",
+        );
+        let root = std::env::temp_dir().join(format!(
+            "octowatcher-discovery-ssh443-{}",
+            std::process::id()
+        ));
+        for (clone, remote) in [
+            ("direct", "ssh://git@ssh.github.com:443/Owner/Repo.git"),
+            ("override", "git@github.com:owner/repo.git"),
+            ("alias", "git@github-443:Owner/Repo.git"),
+            ("https", "https://github.com/owner/repo.git"),
+        ] {
+            let dir = root.join(clone).join(".git");
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("config"),
+                format!("[remote \"origin\"]\n url = {remote}\n"),
+            )
+            .unwrap();
+        }
+        let found = discover_with_aliases(std::slice::from_ref(&root), &hosts(), &aliases);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, RepositoryId::new("github.com", "owner/repo"));
+        assert_eq!(found[0].paths.len(), 4);
+        // The SSH transport endpoint must not become an HTTPS or API-host alias.
+        assert_eq!(
+            parse_github_url("https://ssh.github.com/owner/repo.git", &hosts(), &aliases),
+            None
+        );
+        assert_eq!(
+            parse_github_url("https://github-443/owner/repo.git", &hosts(), &aliases),
             None
         );
     }

@@ -47,6 +47,9 @@ pub struct Store {
     /// Failed repository checks keep their cache hidden in this session.
     #[serde(skip)]
     pub unavailable_repos: BTreeSet<(u64, String)>,
+    /// Requests individually confirmed during a partial github.com check.
+    #[serde(skip)]
+    pub confirmed_requests: BTreeMap<ReviewKey, Option<String>>,
     /// Enterprise hosts validated in this session, gating cached alerts.
     #[serde(skip)]
     pub available_hosts: BTreeSet<String>,
@@ -81,6 +84,7 @@ impl Default for Store {
             local_repos: BTreeSet::new(),
             unavailable_repos: BTreeSet::new(),
             available_hosts: BTreeSet::new(),
+            confirmed_requests: BTreeMap::new(),
             notifications_muted: false,
             notify_drafts: true,
             notification_queue: Vec::new(),
@@ -423,8 +427,16 @@ impl Store {
         self.local_repos.contains(&key)
             && self.is_enabled(&key)
             && (pr.host != PUBLIC_HOST
-                || (!self.unavailable_repos.contains(&(pr.account_id, key))
+                || ((!self.unavailable_repos.contains(&(pr.account_id, key))
+                    || self
+                        .confirmed_requests
+                        .get(&pr.key())
+                        .is_some_and(|at| at == &pr.requested_at))
                     && self.available_accounts.contains(&pr.account.to_lowercase())
+                    && self
+                        .account_ids
+                        .get(&pr.account.to_lowercase())
+                        .is_none_or(|id| *id == pr.account_id)
                     && self.monitors(&pr.account, &pr.repo)))
     }
 
@@ -527,6 +539,7 @@ impl Store {
     }
 
     /// Seed the first successful poll after launch, including suppressed drafts.
+    #[cfg(test)]
     pub fn queue_startup_notifications(&mut self, accounts: &BTreeSet<u64>) {
         let reviews = self
             .awake()
@@ -536,6 +549,7 @@ impl Store {
         self.queue_notifications(&reviews);
     }
 
+    #[cfg(test)]
     pub fn queue_startup_host_notifications(&mut self, hosts: &BTreeSet<String>) {
         let reviews = self
             .awake()
@@ -601,35 +615,77 @@ impl Store {
         checked_accounts: &BTreeMap<String, u64>,
     ) -> Reconciled {
         self.reconcile_scopes(
-            fetched,
+            fetched.clone(),
             checked_accounts,
             &BTreeSet::new(),
-            &self.local_repos.clone(),
+            &self
+                .local_repos
+                .iter()
+                .cloned()
+                .chain(
+                    self.pending
+                        .iter()
+                        .chain(fetched.iter())
+                        .filter(|pr| pr.host == PUBLIC_HOST)
+                        .map(|pr| pr.repository().store_key()),
+                )
+                .collect(),
         )
     }
 
+    #[cfg(test)]
     pub fn reconcile_scopes(
         &mut self,
-        mut fetched: Vec<PendingReview>,
+        fetched: Vec<PendingReview>,
         checked_accounts: &BTreeMap<String, u64>,
         successful_hosts: &BTreeSet<String>,
         watched: &BTreeSet<String>,
     ) -> Reconciled {
-        fetched
-            .retain(|pr| pr.host == PUBLIC_HOST || watched.contains(&pr.repository().store_key()));
-        // Failed, disabled, or signed-out accounts retain their own cache.
+        let completed = self
+            .pending
+            .iter()
+            .chain(fetched.iter())
+            .filter(|pr| {
+                if pr.host == PUBLIC_HOST {
+                    checked_accounts.values().any(|id| *id == pr.account_id)
+                        && !self
+                            .unavailable_repos
+                            .contains(&(pr.account_id, pr.repo.to_lowercase()))
+                } else {
+                    successful_hosts.contains(&pr.host)
+                }
+            })
+            .map(|pr| (pr.account_id, pr.repository().store_key()))
+            .collect();
+        self.reconcile_partitions(fetched, &completed, watched)
+    }
+
+    /// Only complete account/repository snapshots authorize removals. Confirmed
+    /// requests from incomplete snapshots can advance, never regress, timestamps.
+    pub fn reconcile_partitions(
+        &mut self,
+        mut fetched: Vec<PendingReview>,
+        completed: &BTreeSet<(u64, String)>,
+        watched: &BTreeSet<String>,
+    ) -> Reconciled {
+        fetched.retain(|pr| watched.contains(&pr.repository().store_key()));
+        let previous: HashMap<_, _> = self.pending.iter().map(|pr| (pr.key(), pr)).collect();
+        for pr in &mut fetched {
+            if !completed.contains(&(pr.account_id, pr.repository().store_key()))
+                && let Some(saved) = previous.get(&pr.key())
+                && saved.requested_at > pr.requested_at
+            {
+                *pr = (*saved).clone();
+            }
+        }
+        let confirmed: BTreeSet<_> = fetched.iter().map(PendingReview::key).collect();
         fetched.extend(
             self.pending
                 .iter()
                 .filter(|pr| {
-                    if pr.host != PUBLIC_HOST {
-                        return watched.contains(&pr.repository().store_key())
-                            && !successful_hosts.contains(&pr.host);
-                    }
-                    self.unavailable_repos
-                        .contains(&(pr.account_id, pr.repo.to_lowercase()))
-                        || (!checked_accounts.contains_key(&pr.account.to_lowercase())
-                            && !checked_accounts.values().any(|id| *id == pr.account_id))
+                    !confirmed.contains(&pr.key())
+                        && !completed.contains(&(pr.account_id, pr.repository().store_key()))
+                        && watched.contains(&pr.repository().store_key())
                 })
                 .cloned(),
         );
@@ -642,7 +698,7 @@ impl Store {
             .iter()
             .map(|pr| (pr.key(), pr.requested_at.clone()))
             .collect();
-        // GitHub returns only a bounded timeline of request events. A missing
+        // A missing
         // timestamp on a still-pending PR is not evidence of a new request;
         // keep its known identity, undelivered notice, and snooze deadline.
         for pr in &mut fetched {
@@ -656,21 +712,9 @@ impl Store {
         // again after the request already on file.
         let fresh: Vec<PendingReview> = fetched
             .iter()
-            .filter(|pr| match known.get(&pr.key()) {
-                None => {
-                    if pr.host == PUBLIC_HOST {
-                        checked_accounts.contains_key(&pr.account.to_lowercase())
-                    } else {
-                        successful_hosts.contains(&pr.host)
-                    }
-                }
-                Some(previous) => {
-                    (if pr.host == PUBLIC_HOST {
-                        checked_accounts.contains_key(&pr.account.to_lowercase())
-                    } else {
-                        successful_hosts.contains(&pr.host)
-                    }) && pr.requested_at > *previous
-                }
+            .filter(|pr| {
+                confirmed.contains(&pr.key())
+                    && known.get(&pr.key()).is_none_or(|at| pr.requested_at > *at)
             })
             .cloned()
             .collect();
@@ -705,6 +749,27 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
+    pub fn reconcile_repositories(
+        &mut self,
+        fetched: Vec<PendingReview>,
+        completed: &std::collections::HashSet<RepositoryId>,
+        watched: &std::collections::HashSet<RepositoryId>,
+    ) -> Reconciled {
+        let partitions = self
+            .pending
+            .iter()
+            .chain(fetched.iter())
+            .filter(|pr| completed.contains(&pr.repository()))
+            .map(|pr| (pr.account_id, pr.repository().store_key()))
+            .collect();
+        self.reconcile_partitions(
+            fetched,
+            &partitions,
+            &watched.iter().map(RepositoryId::store_key).collect(),
+        )
+    }
+
     /// Ends every snooze that ran out by `now`, and returns the pending
     /// reviews they hid.
     pub fn take_expired(&mut self, now: i64) -> Vec<PendingReview> {
@@ -712,11 +777,11 @@ impl Store {
             .into_iter()
             .partition(|s| {
                 s.until <= now
-                    && (s.host != PUBLIC_HOST
-                        || self.available_accounts.contains(&s.account.to_lowercase()))
-                    && !self
-                        .unavailable_repos
-                        .contains(&(s.account_id, s.repo.to_lowercase()))
+                    && (self
+                        .pending
+                        .iter()
+                        .any(|pr| pr.key() == s.key() && self.visible(pr))
+                        || !self.pending.iter().any(|pr| pr.key() == s.key()))
             });
         self.snoozed = remaining;
         let woken: Vec<_> = self
@@ -741,8 +806,10 @@ fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PendingReview, Snooze, Store};
+    use crate::repository::RepositoryId;
     use crate::repository::default_host;
     use crate::theme::Appearance;
+    use std::collections::HashSet;
 
     #[test]
     fn legacy_settings_default_to_system_without_losing_state() {
@@ -1259,6 +1326,189 @@ mod tests {
         );
     }
 
+    fn verified_queue_store() -> Store {
+        Store {
+            available_accounts: ["alice".into()].into(),
+            local_repos: [
+                "o/failed".into(),
+                "o/good".into(),
+                "o/off".into(),
+                "o/r".into(),
+            ]
+            .into(),
+            ..Store::default()
+        }
+    }
+
+    #[test]
+    fn failed_repos_keep_requests_and_snoozes_while_complete_repos_update() {
+        let mut store = Store {
+            pending: vec![pr("o/failed", 1, Some(T1)), pr("o/good", 2, Some(T1))],
+            snoozed: vec![
+                snooze("o/failed", 1, Some(T1)),
+                snooze("o/good", 2, Some(T1)),
+            ],
+            ..verified_queue_store()
+        };
+        let watched = HashSet::from([
+            RepositoryId::new("github.com", "o/failed"),
+            RepositoryId::new("github.com", "o/good"),
+        ]);
+        // A confirmed request with the same timestamp keeps its saved snooze.
+        let result = store.reconcile_repositories(
+            vec![pr("o/failed", 1, Some(T1)), pr("o/good", 3, Some(T2))],
+            &HashSet::from([RepositoryId::new("github.com", "o/good")]),
+            &watched,
+        );
+        assert_eq!(
+            store.pending,
+            vec![pr("o/good", 3, Some(T2)), pr("o/failed", 1, Some(T1))]
+        );
+        assert_eq!(result.fresh, vec![pr("o/good", 3, Some(T2))]);
+        assert_eq!(store.snoozed, vec![snooze("o/failed", 1, Some(T1))]);
+
+        // Once the failed repo succeeds, a later request ends its snooze.
+        let result = store.reconcile_repositories(
+            vec![pr("o/failed", 1, Some(T2)), pr("o/good", 3, Some(T2))],
+            &watched,
+            &watched,
+        );
+        assert_eq!(result.fresh, vec![pr("o/failed", 1, Some(T2))]);
+        assert!(store.snoozed.is_empty());
+        // A complete empty response clears requests after review, withdrawal
+        // or closure, and won't preserve old state as though it were an error.
+        store.reconcile_repositories(vec![], &watched, &watched);
+        assert!(store.pending.is_empty());
+    }
+
+    #[test]
+    fn partial_snapshots_preserve_undelivered_alerts_until_requests_are_confirmed_gone() {
+        let saved = pr("o/failed", 1, Some(T1));
+        let snoozed = pr("o/failed", 2, Some(T1));
+        let incoming = pr("o/failed", 3, Some(T2));
+        let resolved = pr("o/good", 4, Some(T1));
+        let mut store = Store {
+            notifications_muted: true,
+            ..verified_queue_store()
+        };
+        store.reconcile(
+            vec![saved.clone(), snoozed.clone(), resolved],
+            &[("alice".into(), 1)].into(),
+        );
+        store.snooze(&snoozed.key(), 60, 1_000);
+        let saved_notice = store.notification_queue[0].clone();
+        let watched = HashSet::from([
+            RepositoryId::new("github.com", "o/failed"),
+            RepositoryId::new("github.com", "o/good"),
+        ]);
+        store.reconcile_repositories(
+            vec![incoming.clone()],
+            &HashSet::from([RepositoryId::new("github.com", "o/good")]),
+            &watched,
+        );
+        assert_eq!(store.notification_queue.len(), 2);
+        assert!(store.notification_queue.contains(&saved_notice));
+        assert!(store.snooze_for(&snoozed).is_some());
+        assert!(store.notifications_due().is_empty());
+
+        let mut restarted: Store =
+            serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        restarted.notifications_muted = false;
+        restarted.available_accounts = store.available_accounts.clone();
+        restarted.local_repos = store.local_repos.clone();
+        assert_eq!(
+            restarted
+                .notifications_due()
+                .into_iter()
+                .map(|(_, pr)| pr)
+                .collect::<Vec<_>>(),
+            vec![incoming.clone(), saved]
+        );
+        restarted.reconcile_repositories(vec![incoming], &watched, &watched);
+        assert_eq!(restarted.notification_queue.len(), 1);
+        assert!(restarted.snoozed.is_empty());
+        restarted.reconcile_repositories(vec![], &watched, &watched);
+        assert!(restarted.notification_queue.is_empty());
+    }
+
+    #[test]
+    fn incomplete_check_adds_confirmed_requests_without_regressing_saved_timestamps() {
+        let mut store = Store {
+            pending: vec![pr("o/r", 1, Some(T2)), pr("o/r", 2, Some(T1))],
+            snoozed: vec![snooze("o/r", 1, Some(T2)), snooze("o/r", 2, Some(T1))],
+            ..verified_queue_store()
+        };
+        let result = store.reconcile_repositories(
+            vec![
+                pr("o/r", 1, Some(T1)),
+                pr("o/r", 2, Some(T2)),
+                pr("o/r", 3, Some(T1)),
+            ],
+            &HashSet::new(),
+            &HashSet::from([RepositoryId::new("github.com", "o/r")]),
+        );
+        assert_eq!(
+            store.pending,
+            vec![
+                pr("o/r", 1, Some(T2)),
+                pr("o/r", 2, Some(T2)),
+                pr("o/r", 3, Some(T1))
+            ]
+        );
+        assert_eq!(
+            result.fresh,
+            vec![pr("o/r", 2, Some(T2)), pr("o/r", 3, Some(T1))]
+        );
+        assert_eq!(store.snoozed, vec![snooze("o/r", 1, Some(T2))]);
+        assert!(result.snoozes_changed);
+    }
+
+    #[test]
+    fn failed_check_keeps_watched_state_but_removed_repos_leave_queue() {
+        let mut store = Store {
+            pending: vec![pr("o/failed", 1, Some(T1)), pr("o/off", 2, Some(T1))],
+            snoozed: vec![
+                snooze("o/failed", 1, Some(T1)),
+                snooze("o/off", 2, Some(T1)),
+            ],
+            ..verified_queue_store()
+        };
+        let result = store.reconcile_repositories(
+            vec![],
+            &HashSet::new(),
+            &HashSet::from([RepositoryId::new("github.com", "o/failed")]),
+        );
+        assert!(result.fresh.is_empty());
+        assert_eq!(store.pending, vec![pr("o/failed", 1, Some(T1))]);
+        assert_eq!(store.snoozed, vec![snooze("o/failed", 1, Some(T1))]);
+        let result = store.reconcile_repositories(
+            vec![],
+            &HashSet::new(),
+            &HashSet::from([RepositoryId::new("github.com", "o/failed")]),
+        );
+        assert!(!result.pending_changed);
+        assert!(!result.snoozes_changed);
+        assert!(result.fresh.is_empty());
+    }
+
+    #[test]
+    fn existing_state_format_remains_compatible() {
+        let old = serde_json::json!({
+            "pending": [pr("o/r", 1, Some(T1))],
+            "snoozed": [snooze("o/r", 1, Some(T1))]
+        });
+        let mut store: Store = serde_json::from_value(old).unwrap();
+        assert_eq!(store.poll_minutes, 2);
+        let result = store.reconcile_repositories(
+            vec![],
+            &HashSet::new(),
+            &HashSet::from([RepositoryId::new("github.com", "o/r")]),
+        );
+        assert!(!result.pending_changed);
+        assert!(!result.snoozes_changed);
+        assert_eq!(store.pending[0].requested_at.as_deref(), Some(T1));
+    }
+
     #[test]
     fn take_expired_wakes_snoozes_that_ran_out() {
         let mut store = Store {
@@ -1317,6 +1567,7 @@ mod tests {
         assert!(store.disabled_account_ids.contains(&1));
         assert!(store.disabled_accounts.is_empty());
         store.record_account("alice-renamed", 1);
+        store.local_repos.insert("owner/repo".into());
         store.record_account("alice", 99);
         assert!(!store.account_enabled("alice-renamed"));
         assert!(store.account_enabled("alice"));
@@ -1477,22 +1728,31 @@ mod tests {
     #[test]
     fn reused_login_cannot_inherit_another_users_snooze() {
         let mut store = fixture_store();
+        store.local_repos.insert("owner/repo".into());
         let mut new_user = store.pending[0].clone();
         new_user.account_id = 99;
+        store.record_account("alice", 99);
+        store.available_accounts.insert("alice".into());
         let changes = store.reconcile(
             vec![new_user],
             &std::collections::BTreeMap::from([("alice".into(), 99)]),
         );
         assert_eq!(changes.fresh.len(), 1);
-        assert!(store.snoozed.is_empty());
         assert_eq!(
-            store
+            store.snoozed.len(),
+            1,
+            "signed-out identity retains its own snooze"
+        );
+        let new_user = store.pending.iter().find(|pr| pr.account_id == 99).unwrap();
+        assert!(store.snooze_for(new_user).is_none());
+        assert!(store.visible(new_user));
+        assert!(
+            !store
                 .pending
                 .iter()
-                .filter(|pr| pr.account == "alice")
-                .count(),
-            1
+                .any(|pr| pr.account_id == 1 && store.visible(pr))
         );
+        assert!(store.take_expired(i64::MAX).is_empty());
     }
 
     #[test]

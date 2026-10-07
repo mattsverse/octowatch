@@ -1,13 +1,16 @@
 //! Review delivery and action routing, independent of the desktop UI.
 
+use std::collections::HashSet;
+
 use crate::{
     notifications::Response,
-    store::{PendingReview, ReviewNotice, Store},
+    store::{PendingReview, ReviewKey, ReviewNotice, Store},
 };
 
 #[derive(Default)]
 pub struct Delivery {
     in_flight: bool,
+    unchecked: HashSet<ReviewKey>,
 }
 
 pub struct Batch {
@@ -16,13 +19,52 @@ pub struct Batch {
 }
 
 impl Delivery {
+    pub fn for_launch(store: &Store) -> Self {
+        Self {
+            unchecked: store.pending.iter().map(PendingReview::key).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Seed launch alerts only for saved requests confirmed by this check.
+    /// Keep unchecked requests and failed deliveries persisted, but held.
+    pub fn confirm(&mut self, store: &mut Store, confirmed: &[PendingReview]) {
+        self.unchecked
+            .retain(|key| store.pending.iter().any(|pr| pr.key() == *key));
+        let newly_checked: Vec<_> = confirmed
+            .iter()
+            .filter_map(|fetched| {
+                let current = store.pending.iter().find(|pr| pr.key() == fetched.key())?;
+                // An older partial result cannot validate a newer saved request.
+                if fetched.requested_at.is_some() && fetched.requested_at != current.requested_at {
+                    return None;
+                }
+                if !self.unchecked.remove(&current.key())
+                    || store.snooze_for(current).is_some()
+                    || store
+                        .notification_queue
+                        .iter()
+                        .any(|notice| notice.matches(current))
+                {
+                    return None;
+                }
+                Some(current.clone())
+            })
+            .collect();
+        store.queue_notifications(&newly_checked);
+    }
+
     /// Only one send can consume the persisted queue at a time. Responses
     /// don't keep this gate locked: delivery and interaction are separate.
     pub fn begin(&mut self, store: &Store) -> Option<Batch> {
         if self.in_flight {
             return None;
         }
-        let due = store.notifications_due();
+        let due: Vec<_> = store
+            .notifications_due()
+            .into_iter()
+            .filter(|(_, pr)| !self.unchecked.contains(&pr.key()))
+            .collect();
         if due.is_empty() {
             return None;
         }
@@ -752,6 +794,119 @@ mod tests {
     }
 
     #[test]
+    fn partial_launch_delivers_only_confirmed_reviews_and_defers_saved_retries() {
+        use std::collections::HashSet;
+
+        for confirmed_in_same_repo in [false, true] {
+            let cached = pr(1, false);
+            let mut confirmed = pr(2, false);
+            if !confirmed_in_same_repo {
+                confirmed.repo = "Other/Repo".into();
+            }
+            let mut store = verified_store();
+            store.reconcile(vec![cached.clone()], &[("alice".into(), 1)].into());
+            // A failed delivery from the previous run must also wait for validation.
+            store = round_trip(&store);
+            store.local_repos.insert("other/repo".into());
+            let mut delivery = Delivery::for_launch(&store);
+            let watched = HashSet::from([cached.repository(), confirmed.repository()]);
+            store.reconcile_repositories(vec![confirmed.clone()], &HashSet::new(), &watched);
+            delivery.confirm(&mut store, std::slice::from_ref(&confirmed));
+            let batch = delivery.begin(&store).unwrap();
+            assert_eq!(batch.reviews, vec![confirmed.clone()]);
+            // A successful send must not drain the unchecked saved alert.
+            assert!(delivery.complete(&mut store, &batch, true).is_none());
+            assert_eq!(store.notification_queue.len(), 1);
+            // Resume and expired snoozes cannot bypass the validation gate.
+            store.notifications_muted = true;
+            store.snooze(&cached.key(), 5, 0);
+            store.take_expired(300);
+            store.notifications_muted = false;
+            assert!(delivery.begin(&store).is_none());
+            // A later complete snapshot proves the cached review has gone.
+            store.reconcile_repositories(vec![confirmed], &watched, &watched);
+            assert!(delivery.begin(&store).is_none());
+            assert!(store.notification_queue.is_empty());
+        }
+    }
+
+    #[test]
+    fn saved_launch_reviews_notify_once_when_later_confirmed() {
+        use std::collections::HashSet;
+
+        for failed_retry in [false, true] {
+            let cached = pr(1, false);
+            let confirmed = pr(2, false);
+            let mut store = Store {
+                pending: vec![cached.clone()],
+                notify_drafts: false,
+                ..verified_store()
+            };
+            if failed_retry {
+                store.queue_notifications(std::slice::from_ref(&cached));
+            }
+            let original_notices = store.notification_queue.clone();
+            store.local_repos.insert("other/repo".into());
+            let mut delivery = Delivery::for_launch(&store);
+            let watched = HashSet::from([cached.repository()]);
+            store.reconcile_repositories(vec![confirmed.clone()], &HashSet::new(), &watched);
+            delivery.confirm(&mut store, std::slice::from_ref(&confirmed));
+            let first = delivery.begin(&store).unwrap();
+            assert_eq!(first.reviews, vec![confirmed.clone()]);
+            assert!(delivery.complete(&mut store, &first, true).is_none());
+
+            // Validation while suppressed still seeds an alert for later release.
+            let draft = PendingReview {
+                is_draft: true,
+                ..cached.clone()
+            };
+            store.reconcile_repositories(vec![draft.clone()], &HashSet::new(), &watched);
+            delivery.confirm(&mut store, std::slice::from_ref(&draft));
+            assert!(delivery.begin(&store).is_none());
+            if failed_retry {
+                assert_eq!(store.notification_queue, original_notices);
+            }
+            store.reconcile_repositories(
+                vec![cached.clone(), confirmed.clone()],
+                &watched,
+                &watched,
+            );
+            delivery.confirm(&mut store, &[cached.clone(), confirmed.clone()]);
+            let retry = delivery.begin(&store).unwrap();
+            assert_eq!(retry.reviews, vec![cached.clone()]);
+            assert!(delivery.complete(&mut store, &retry, false).is_none());
+            let retry = delivery.begin(&store).unwrap();
+            assert!(delivery.complete(&mut store, &retry, true).is_none());
+            delivery.confirm(&mut store, &[cached, confirmed]);
+            assert!(delivery.begin(&store).is_none());
+        }
+    }
+
+    #[test]
+    fn older_partial_request_cannot_release_a_newer_saved_launch_alert() {
+        use std::collections::HashSet;
+
+        let older = pr(1, false);
+        let newer = PendingReview {
+            requested_at: Some(T2.into()),
+            ..older.clone()
+        };
+        let mut store = verified_store();
+        store.reconcile(vec![newer.clone()], &[("alice".into(), 1)].into());
+        let mut delivery = Delivery::for_launch(&store);
+        store.reconcile_repositories(
+            vec![older.clone()],
+            &HashSet::new(),
+            &HashSet::from([older.repository()]),
+        );
+        delivery.confirm(&mut store, &[older]);
+        assert!(delivery.begin(&store).is_none());
+        assert_eq!(store.pending, vec![newer.clone()]);
+        delivery.confirm(&mut store, std::slice::from_ref(&newer));
+        assert_eq!(delivery.begin(&store).unwrap().reviews, vec![newer]);
+    }
+
+    #[test]
     fn identical_reviews_on_different_hosts_keep_notices_and_actions_separate() {
         let public = pr(1, false);
         let server = PendingReview {
@@ -849,12 +1004,21 @@ mod tests {
         // A different user who takes the login cannot consume its queued alert.
         let mut replacement = due[1].1.clone();
         replacement.account_id = 99;
+        store.record_account("bob", 99);
+        store.available_accounts.insert("bob".into());
         store.reconcile(vec![replacement], &[("bob".into(), 99)].into());
         assert!(
             store
                 .notification_queue
                 .iter()
-                .all(|notice| notice.account_id != 2)
+                .any(|notice| notice.account_id == 2),
+            "signed-out account retains its own queued alert"
+        );
+        assert!(
+            store
+                .notifications_due()
+                .iter()
+                .all(|(_, pr)| pr.account_id != 2)
         );
     }
 

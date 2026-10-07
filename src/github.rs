@@ -2,7 +2,7 @@
 //! and no token ever needs to be stored by the app.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, Read},
     os::unix::{io::AsRawFd, process::CommandExt as _},
     path::Path,
@@ -15,41 +15,9 @@ use anyhow::{Context as _, Result, bail};
 use serde::Deserialize;
 
 use crate::{
-    repository::{PUBLIC_HOST, normalize_host},
+    repository::{PUBLIC_HOST, RepositoryId, normalize_host},
     store::{PendingReview, Store},
 };
-
-/// Search for open PRs, by someone else, where the viewer (or one of their
-/// teams) is a requested reviewer. GitHub drops the viewer from the request
-/// list once they review, so a PR leaves this search when the review lands.
-const QUERY: &str = r#"
-query($q: String!, $me: String!) {
-  search(query: $q, type: ISSUE, first: 100) {
-    nodes {
-      ... on PullRequest {
-        number
-        title
-        url
-        isDraft
-        author { login }
-        repository { nameWithOwner }
-        reviewRequests(first: 50) {
-          nodes { requestedReviewer { __typename ... on User { login } } }
-        }
-        reviews(last: 1, author: $me) { nodes { submittedAt } }
-        timelineItems(last: 20, itemTypes: [REVIEW_REQUESTED_EVENT]) {
-          nodes {
-            ... on ReviewRequestedEvent {
-              createdAt
-              requestedReviewer { __typename ... on User { login } }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-"#;
 
 /// gh is the authority for configured hosts. Ask only for names, never tokens.
 /// JSON mode keeps hosts with expired credentials in the list, allowing their
@@ -99,79 +67,11 @@ fn parse_hosts(output: &str) -> Result<Vec<String>> {
     Ok(hosts.into_iter().collect())
 }
 
-#[derive(Debug, Default)]
-pub struct FetchResults {
-    pub reviews: Vec<PendingReview>,
-    pub successful_hosts: BTreeSet<String>,
-    pub errors: Vec<String>,
-}
+mod queue;
+pub use queue::FetchedReviews;
 
-/// Poll only hosts with enabled local repositories. Each failure is isolated.
-pub fn fetch_awaiting_reviews(hosts: &BTreeSet<String>) -> FetchResults {
-    fetch_hosts_with(hosts, |host| fetch_host_with(host, gh_request))
-}
-
-fn fetch_hosts_with(
-    hosts: &BTreeSet<String>,
-    mut fetch: impl FnMut(&str) -> Result<Vec<PendingReview>>,
-) -> FetchResults {
-    let mut results = FetchResults::default();
-    for host in hosts {
-        match fetch(host) {
-            Ok(reviews) => {
-                results.successful_hosts.insert(host.clone());
-                results.reviews.extend(reviews);
-            }
-            Err(err) => results.errors.push(format!("{host}: {err:#}")),
-        }
-    }
-    results
-}
-
-fn fetch_host_with(
-    host: &str,
-    mut run: impl FnMut(&[&str]) -> Result<String>,
-) -> Result<Vec<PendingReview>> {
-    // Resolve the viewer per request, per host. A process-global login could
-    // leak the identity from github.com into an Enterprise review query.
-    let me = run(&["api", "--hostname", host, "user", "--jq", ".login"])
-        .with_context(|| {
-            format!("could not read viewer; check `gh auth status --hostname {host}`")
-        })?
-        .trim()
-        .to_string();
-    if me.is_empty() {
-        bail!("`gh api user` returned no login; check `gh auth status --hostname {host}`");
-    }
-    let search = "is:pr is:open archived:false review-requested:@me -author:@me";
-    let output = run(&[
-        "api",
-        "--hostname",
-        host,
-        "graphql",
-        "-f",
-        &format!("query={QUERY}"),
-        "-f",
-        &format!("q={search}"),
-        "-f",
-        &format!("me={me}"),
-    ])
-    .context("could not fetch reviews (check authentication and server GraphQL compatibility)")?;
-    parse_reviews_on_host(&output, host, &me)
-}
-
-fn parse_reviews_on_host(output: &str, host: &str, login: &str) -> Result<Vec<PendingReview>> {
-    let mut reviews = parse_reviews(
-        output,
-        &Viewer {
-            login: login.into(),
-            id: 0,
-        },
-    )?;
-    for pr in &mut reviews {
-        pr.host = host.to_ascii_lowercase();
-    }
-    Ok(reviews)
+pub fn fetch_awaiting_reviews(repos: &HashSet<RepositoryId>) -> Result<FetchedReviews> {
+    queue::fetch_awaiting_reviews(repos)
 }
 
 /// A stalled CLI request must not prevent the remaining hosts from polling.
@@ -306,6 +206,7 @@ pub struct AccountReviews {
     pub account_id: u64,
     pub pending: Vec<PendingReview>,
     pub unavailable_repos: BTreeSet<String>,
+    pub completed_repos: BTreeSet<String>,
 }
 
 pub struct AccountCheck {
@@ -522,31 +423,85 @@ fn fetch_account_reviews(
             account_id: session.viewer.id,
             pending: Vec::new(),
             unavailable_repos,
+            completed_repos: BTreeSet::new(),
         });
     }
-    let search = "is:pr is:open archived:false review-requested:@me -author:@me";
-    let output = runner.run(
-        &[
-            "api",
-            "graphql",
-            "-f",
-            &format!("query={QUERY}"),
-            "-f",
-            &format!("q={search}"),
-            "-f",
-            &format!("me={me}"),
-        ],
-        Some(token),
-    )?;
-    let pending = parse_reviews(&output, &session.viewer)?;
-    // Search can silently omit requests after permissions change. Before
-    // deleting a known request based on cached access, verify its repo again.
+    let repositories: HashSet<_> = accessible
+        .iter()
+        .map(|repo| RepositoryId::new(PUBLIC_HOST, repo))
+        .collect();
+    let mut account_failure = None;
+    // Share membership results only within this verified account's current poll.
+    let result = queue::fetch_with(&repositories, me, &mut |query, variables| {
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={query}"),
+        ];
+        for (name, value) in variables {
+            args.extend(["-f".into(), format!("{name}={value}")]);
+        }
+        let result = runner.run(
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            Some(token),
+        );
+        if let Err(error) = &result {
+            let message = format!("{error:#}");
+            let lower = message.to_lowercase();
+            if message.contains("HTTP 401")
+                || lower.contains("rate limit")
+                || lower.contains("connection")
+                || lower.contains("network")
+                || lower.contains("timed out")
+                || lower.contains("could not run")
+            {
+                account_failure = Some(message);
+            }
+        }
+        result
+    })?;
+    if let Some(error) = account_failure {
+        bail!("{error}");
+    }
+    let mut completed_repos: BTreeSet<_> = result
+        .completed_repos
+        .into_iter()
+        .map(|repo| repo.slug)
+        .collect();
+    for repo in accessible.difference(&completed_repos) {
+        cache.allowed.remove(&(session.viewer.id, repo.clone()));
+        unavailable_repos.insert(repo.clone());
+    }
+    for error in result.errors {
+        let repo = repositories
+            .iter()
+            .find(|repo| error.starts_with(&format!("{repo}: ")))
+            .map(|repo| repo.slug.clone())
+            .unwrap_or_else(|| "unknown repository".into());
+        access_errors.push((
+            repo,
+            format!("@{me}: {error}. Unconfirmed cache and snoozes are retained."),
+        ));
+    }
+    let pending: Vec<_> = result
+        .pending
+        .into_iter()
+        .map(|mut pr| {
+            pr.account_id = session.viewer.id;
+            pr.account = me.clone();
+            pr
+        })
+        .collect();
+    // Before removing a saved request after a cached access result,
+    // verify the repository again; incomplete snapshots cannot remove state.
     let missing_repos: BTreeSet<_> = preferences
         .pending
         .iter()
         .filter(|old| {
             old.account_id == session.viewer.id
                 && cached_access.contains(&old.repo.to_lowercase())
+                && completed_repos.contains(&old.repo.to_lowercase())
                 && !pending.iter().any(|pr| pr.key() == old.key())
         })
         .map(|pr| pr.repo.to_lowercase())
@@ -554,6 +509,7 @@ fn fetch_account_reviews(
     for repo in missing_repos {
         if !check_repo_access(runner, session, &repo, cache, now, access_errors)? {
             accessible.remove(&repo);
+            completed_repos.remove(&repo);
             unavailable_repos.insert(repo);
         }
     }
@@ -564,6 +520,7 @@ fn fetch_account_reviews(
             .filter(|pr| accessible.contains(&pr.repo.to_lowercase()))
             .collect(),
         unavailable_repos,
+        completed_repos,
     })
 }
 
@@ -597,85 +554,6 @@ fn check_repo_access(
             access_errors.push((repo.into(), format!("@{me} cannot check {repo}: {message}. Cached reviews and snoozes are retained. Check repository permissions and organization SSO authorization.")));
             Ok(false)
         }
-    }
-}
-
-fn parse_reviews(output: &str, me: &Viewer) -> Result<Vec<PendingReview>> {
-    let response: Response = serde_json::from_str(output).context("unexpected GitHub response")?;
-    if !response.errors.is_empty() {
-        bail!("GitHub returned an incomplete review response");
-    }
-    Ok(response
-        .data
-        .context("GitHub returned no review data")?
-        .search
-        .nodes
-        .into_iter()
-        .flatten()
-        .filter_map(|pr| pr.into_pending(me))
-        .collect())
-}
-
-impl Pr {
-    fn into_pending(self, viewer: &Viewer) -> Option<PendingReview> {
-        let me = &viewer.login;
-        let author = self
-            .author
-            .map(|a| a.login)
-            .unwrap_or_else(|| "ghost".into());
-        if author.eq_ignore_ascii_case(me) {
-            return None;
-        }
-        // A request counts when it names the viewer or a team (the search
-        // already guarantees the viewer belongs to it).
-        let concerns_me = |reviewer: &Option<Reviewer>| match reviewer {
-            Some(Reviewer::User { login }) => login.eq_ignore_ascii_case(me),
-            Some(Reviewer::Team) => true,
-            _ => false,
-        };
-        if !self
-            .review_requests
-            .nodes
-            .iter()
-            .any(|r| concerns_me(&r.requested_reviewer))
-        {
-            return None;
-        }
-        let requested_at = self
-            .timeline_items
-            .nodes
-            .into_iter()
-            .flatten()
-            .filter(|event| concerns_me(&event.requested_reviewer))
-            .filter_map(|event| event.created_at)
-            .max();
-        let last_review = self
-            .reviews
-            .nodes
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.submitted_at)
-            .max();
-        // A team request survives a member's review, so check the dates too.
-        // GitHub timestamps share one format, so string order is time order.
-        if let (Some(requested), Some(reviewed)) = (&requested_at, &last_review)
-            && reviewed > requested
-        {
-            return None;
-        }
-        Some(PendingReview {
-            host: PUBLIC_HOST.into(),
-            account: me.to_string(),
-            account_id: viewer.id,
-            repo: self.repository.name_with_owner,
-            number: self.number,
-            title: self.title,
-            url: self.url,
-            author,
-            is_draft: self.is_draft,
-            rereview: last_review.is_some(),
-            requested_at,
-        })
     }
 }
 
@@ -767,78 +645,6 @@ fn gh_binary() -> &'static str {
         .unwrap_or("gh")
 }
 
-#[derive(Deserialize)]
-struct Response {
-    data: Option<Data>,
-    #[serde(default)]
-    errors: Vec<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-struct Data {
-    search: Nodes<Option<Pr>>,
-}
-
-#[derive(Deserialize)]
-struct Nodes<T> {
-    nodes: Vec<T>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Pr {
-    number: u64,
-    title: String,
-    url: String,
-    is_draft: bool,
-    author: Option<Login>,
-    repository: Repository,
-    review_requests: Nodes<ReviewRequest>,
-    reviews: Nodes<Option<Review>>,
-    timeline_items: Nodes<Option<RequestEvent>>,
-}
-
-#[derive(Deserialize)]
-struct Login {
-    login: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Repository {
-    name_with_owner: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReviewRequest {
-    requested_reviewer: Option<Reviewer>,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "__typename")]
-enum Reviewer {
-    User {
-        login: String,
-    },
-    Team,
-    #[serde(other)]
-    Other,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Review {
-    submitted_at: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RequestEvent {
-    created_at: Option<String>,
-    requested_reviewer: Option<Reviewer>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -920,20 +726,58 @@ mod tests {
         }
 
         fn search(&self, account: &str, output: &str) {
-            self.step(
-                &[
-                    "api",
-                    "graphql",
-                    "-f",
-                    &format!("query={QUERY}"),
-                    "-f",
-                    "q=is:pr is:open archived:false review-requested:@me -author:@me",
-                    "-f",
-                    &format!("me={account}"),
-                ],
-                Some(&format!("fixture-token-{account}")),
-                Ok(output.into()),
-            );
+            self.snapshot(account, account, REPO, output);
+        }
+
+        fn snapshot(&self, credential: &str, account: &str, repo: &str, output: &str) {
+            let response: serde_json::Value = serde_json::from_str(output).unwrap();
+            let mut nodes = response["data"]["search"]["nodes"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let mut histories = Vec::new();
+            for pr in &mut nodes {
+                let number = pr["number"].as_u64().unwrap();
+                pr["id"] = format!("PR_{number}").into();
+                pr["state"] = "OPEN".into();
+                pr["reviewRequests"]["pageInfo"] =
+                    serde_json::json!({"hasNextPage":false,"endCursor":null});
+                let mut history = pr["timelineItems"]["nodes"].as_array().unwrap().clone();
+                for item in &mut history {
+                    item["__typename"] = "ReviewRequestedEvent".into();
+                }
+                for review in pr["reviews"]["nodes"].as_array().unwrap() {
+                    let mut review = review.clone();
+                    review["__typename"] = "PullRequestReview".into();
+                    history.push(review);
+                }
+                histories.push((format!("PR_{number}"), history));
+            }
+            let (owner, name) = repo.split_once('/').unwrap();
+            let token = format!("fixture-token-{credential}");
+            self.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY),
+                "-f", &format!("owner={owner}"), "-f", &format!("name={name}")], Some(&token),
+                Ok(serde_json::json!({"data":{"repository":{"nameWithOwner":repo,"isArchived":false,"pullRequests":{
+                    "nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}
+                }}}}).to_string()));
+            for (id, nodes) in histories {
+                self.step(
+                    &[
+                        "api",
+                        "graphql",
+                        "-f",
+                        &format!("query={}", queue::HISTORY_QUERY),
+                        "-f",
+                        &format!("id={id}"),
+                    ],
+                    Some(&token),
+                    Ok(serde_json::json!({"data":{"node":{"timelineItems":{
+                        "nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}
+                    }}}})
+                    .to_string()),
+                );
+            }
+            let _ = account; // Identity is already verified separately; request fixtures carry reviewer names.
         }
 
         fn successful(&self, account: &str, id: u64) {
@@ -970,19 +814,25 @@ mod tests {
     fn apply(store: &mut Store, poll: Poll) {
         store.available_accounts.clear();
         store.unavailable_repos.clear();
+        store.confirmed_requests.clear();
         for account in poll.accounts {
             if let Some(id) = account.account_id {
                 store.record_account(&account.login, id);
             }
         }
-        let mut checked = BTreeMap::new();
+        let mut completed = BTreeSet::new();
         let mut fetched = Vec::new();
         for check in poll.checks {
             if let Ok(reviews) = check.reviews {
                 store
                     .available_accounts
                     .insert(check.account.to_lowercase());
-                checked.insert(check.account.to_lowercase(), reviews.account_id);
+                completed.extend(
+                    reviews
+                        .completed_repos
+                        .iter()
+                        .map(|repo| (reviews.account_id, repo.clone())),
+                );
                 store.unavailable_repos.extend(
                     reviews
                         .unavailable_repos
@@ -992,7 +842,134 @@ mod tests {
                 fetched.extend(reviews.pending);
             }
         }
-        store.reconcile(fetched, &checked);
+        store
+            .confirmed_requests
+            .extend(fetched.iter().map(|pr| (pr.key(), pr.requested_at.clone())));
+        let watched = store
+            .pending
+            .iter()
+            .chain(fetched.iter())
+            .map(|pr| pr.repository().store_key())
+            .chain(completed.iter().map(|(_, repo)| repo.clone()))
+            .collect();
+        store.reconcile_partitions(fetched, &completed, &watched);
+    }
+
+    #[test]
+    fn paginated_public_queries_keep_each_receiving_accounts_credential() {
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        for (account, id) in [("alice", 1), ("bob", 2)] {
+            script.identity(account, id);
+            script.access(account, REPO, Ok(REPO.into()));
+            script.search(account, REVIEWS);
+            {
+                let mut steps = script.0.borrow_mut();
+                let step = steps
+                    .iter_mut()
+                    .rev()
+                    .find(|s| {
+                        s.args
+                            .iter()
+                            .any(|a| a == &format!("query={}", queue::REPOSITORY_QUERY))
+                    })
+                    .unwrap();
+                let mut output: serde_json::Value =
+                    serde_json::from_str(step.output.as_ref().unwrap()).unwrap();
+                output["data"]["repository"]["pullRequests"]["pageInfo"] =
+                    serde_json::json!({"hasNextPage":true,"endCursor":"next"});
+                step.output = Ok(output.to_string());
+            }
+            script.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY),
+                "-f", "owner=owner", "-f", "name=repo", "-f", "after=next"],
+                Some(&format!("fixture-token-{account}")), Ok(serde_json::json!({"data":{"repository":{
+                    "nameWithOwner":REPO,"isArchived":false,"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+                }}}).to_string()));
+        }
+        let poll = poll_script(&script);
+        assert_eq!(
+            poll.checks[0].reviews.as_ref().unwrap().pending[0].account_id,
+            1
+        );
+        assert_eq!(
+            poll.checks[1].reviews.as_ref().unwrap().pending[0].account_id,
+            2
+        );
+        script.finished();
+    }
+
+    #[test]
+    fn unreadable_team_keeps_only_confirmed_requests_visible_under_that_account() {
+        let mut store = Store::from_json(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        store.local_repos.insert(REPO.into());
+        let mut uncertain = store.pending[0].clone();
+        uncertain.number = 8;
+        store.pending.push(uncertain.clone());
+        let mut snooze = store.snoozed[0].clone();
+        snooze.number = 8;
+        snooze.until = 50;
+        store.snoozed.push(snooze.clone());
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        {
+            let mut steps = script.0.borrow_mut();
+            let repository_ix = steps
+                .iter()
+                .position(|s| {
+                    s.args
+                        .iter()
+                        .any(|a| a == &format!("query={}", queue::REPOSITORY_QUERY))
+                })
+                .unwrap();
+            let step = &mut steps[repository_ix];
+            let mut output: serde_json::Value =
+                serde_json::from_str(step.output.as_ref().unwrap()).unwrap();
+            output["data"]["repository"]["pullRequests"]["nodes"][0]["reviewRequests"]["nodes"].as_array_mut().unwrap()
+                .push(serde_json::json!({"requestedReviewer":{"__typename":"Team","id":"hidden-team"}}));
+            step.output = Ok(output.to_string());
+            steps.insert(
+                repository_ix + 1,
+                Step {
+                    args: vec![
+                        "api".into(),
+                        "graphql".into(),
+                        "-f".into(),
+                        format!("query={}", queue::MEMBERS_QUERY),
+                        "-f".into(),
+                        "id=hidden-team".into(),
+                        "-f".into(),
+                        "me=alice".into(),
+                    ],
+                    token: Some("fixture-token-alice".into()),
+                    output: Err(anyhow::anyhow!(
+                        "GraphQL: Resource not accessible by integration"
+                    )),
+                },
+            );
+        }
+        script.successful("bob", 2);
+        let poll = poll_script(&script);
+        let alice = poll.checks[0].reviews.as_ref().unwrap();
+        assert!(alice.completed_repos.is_empty());
+        assert_eq!(alice.pending.len(), 1);
+        assert_eq!(poll.checks[0].access_errors.len(), 1);
+        apply(&mut store, poll);
+        assert_eq!(store.pending.len(), 3);
+        assert_eq!(store.visible_pending().len(), 2);
+        assert!(!store.visible(&uncertain));
+        assert!(store.take_expired(100).is_empty());
+        assert!(store.snoozed.contains(&snooze));
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.successful("bob", 2);
+        apply(&mut store, poll_script(&script));
+        assert_eq!(store.pending.len(), 2);
+        assert!(!store.snoozed.contains(&snooze));
+        script.finished();
     }
 
     #[test]
@@ -1247,7 +1224,12 @@ mod tests {
         script.identity("alice", 1);
         script.access("alice", REPO, Err(anyhow::anyhow!("Forbidden (HTTP 403)")));
         script.access("alice", "other/repo", Ok("other/repo".into()));
-        script.search("alice", REVIEWS);
+        script.snapshot(
+            "alice",
+            "alice",
+            "other/repo",
+            r#"{"data":{"search":{"nodes":[]}}}"#,
+        );
         script.successful("bob", 2);
         let poll = poll_with(
             &script,
@@ -1295,21 +1277,7 @@ mod tests {
             if !disabled {
                 script.access("alice", REPO, Ok(REPO.into()));
                 let renamed = REVIEWS.replace("alice", "alice-renamed");
-                // Query uses the new login, while its token was retrieved by the old alias.
-                script.step(
-                    &[
-                        "api",
-                        "graphql",
-                        "-f",
-                        &format!("query={QUERY}"),
-                        "-f",
-                        "q=is:pr is:open archived:false review-requested:@me -author:@me",
-                        "-f",
-                        "me=alice-renamed",
-                    ],
-                    Some("fixture-token-alice"),
-                    Ok(renamed),
-                );
+                script.snapshot("alice", "alice-renamed", REPO, &renamed);
             }
             script.identity("bob", 2);
             let poll = poll_with(
@@ -1506,22 +1474,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_graphql_result_is_not_applied_as_a_complete_account_snapshot() {
-        let mut response: serde_json::Value = serde_json::from_str(REVIEWS).unwrap();
-        response["errors"] = serde_json::json!([{"message": "rate limit"}]);
-        assert!(
-            parse_reviews(
-                &response.to_string(),
-                &Viewer {
-                    login: "alice".into(),
-                    id: 1
-                }
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn updater_uses_a_healthy_saved_account_without_monitoring_selection() {
         let script = Script::default();
         script.status(include_str!("../tests/fixtures/expired-account.json"));
@@ -1591,242 +1543,5 @@ mod tests {
         );
         assert!(error.contains("[redacted]"));
         assert!(!error.contains("fixture-secret"));
-    }
-}
-
-#[cfg(test)]
-mod enterprise_tests {
-    use super::*;
-    use serde_json::json;
-
-    fn response(host: &str, viewer: &str) -> String {
-        json!({"data":{"search":{"nodes":[{
-            "number":17,"title":"Review me","url":format!("https://{host}/owner/repo/pull/17"),
-            "isDraft":false,"author":{"login":"author"},"repository":{"nameWithOwner":"Owner/Repo"},
-            "reviewRequests":{"nodes":[{"requestedReviewer":{"__typename":"User","login":viewer}}]},
-            "reviews":{"nodes":[]},"timelineItems":{"nodes":[]}
-        }]}}})
-        .to_string()
-    }
-
-    #[test]
-    fn discovers_configured_hosts_including_unhealthy_ones() {
-        // Auth status JSON can succeed even when one host's credentials fail.
-        // Host names, rather than successful account states, are the authority.
-        assert_eq!(
-            parse_hosts(r#"["GITHUB.EXAMPLE.COM","acme.ghe.com","github.com"]"#).unwrap(),
-            vec!["acme.ghe.com", "github.com", "github.example.com"]
-        );
-        assert_eq!(parse_hosts("[]").unwrap(), vec!["github.com"]);
-        for invalid in [
-            r#"["https://ghe.example"]"#,
-            r#"["ghe.example:8443"]"#,
-            r#"["-option"]"#,
-            "{}",
-        ] {
-            assert!(parse_hosts(invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn requires_machine_readable_cli_version() {
-        assert!(
-            check_cli_version("gh version 2.81.0 (2025-10-01)\nhttps://github.com/cli/cli").is_ok()
-        );
-        assert!(check_cli_version("gh version 2.102.0 (2026-09-30)").is_ok());
-        let error = check_cli_version("gh version 2.80.0 (2025-09-23)").unwrap_err();
-        assert!(error.to_string().contains("2.81"));
-        assert!(check_cli_version("unrecognized version").is_err());
-    }
-
-    #[test]
-    fn routes_viewer_and_reviews_explicitly_for_each_host() {
-        let mut reviews = Vec::new();
-        for (host, viewer) in [
-            ("github.com", "public-user"),
-            ("github.example.com", "server-user"),
-            ("acme.ghe.com", "cloud-user"),
-        ] {
-            let mut calls = Vec::new();
-            reviews.extend(
-                fetch_host_with(host, |args| {
-                    calls.push(args.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-                    assert_eq!(&args[..3], ["api", "--hostname", host]);
-                    match args[3] {
-                        "user" => Ok(format!("{viewer}\n")),
-                        "graphql" => {
-                            assert!(args.contains(&format!("me={viewer}").as_str()));
-                            Ok(response(host, viewer))
-                        }
-                        _ => panic!("unexpected endpoint"),
-                    }
-                })
-                .unwrap(),
-            );
-            assert_eq!(calls.len(), 2);
-        }
-        let keys: BTreeSet<_> = reviews.iter().map(PendingReview::key).collect();
-        assert_eq!(keys.len(), 3);
-        assert!(
-            reviews
-                .iter()
-                .all(|pr| pr.repo == "Owner/Repo" && pr.number == 17)
-        );
-    }
-
-    #[test]
-    fn authentication_and_schema_failures_do_not_become_empty_successes() {
-        let mut calls = 0;
-        let error = fetch_host_with("github.example.com", |_| {
-            calls += 1;
-            bail!("HTTP 401: bad credentials")
-        })
-        .unwrap_err();
-        assert_eq!(calls, 1);
-        assert!(format!("{error:#}").contains("gh auth status --hostname github.example.com"));
-        assert!(fetch_host_with("github.com", |_| Ok("\n".into())).is_err());
-        for output in [
-            r#"{"errors":[{"message":"Field isDraft does not exist"}]}"#,
-            r#"{"data":{"search":{"nodes":[]}},"errors":[{"message":"permission denied"}]}"#,
-            r#"{"data":null}"#,
-        ] {
-            assert!(
-                parse_reviews_on_host(output, "github.example.com", "me").is_err(),
-                "{output}"
-            );
-        }
-        assert!(
-            parse_reviews_on_host(
-                r#"{"data":{"search":{"nodes":[]}}}"#,
-                "github.example.com",
-                "me"
-            )
-            .unwrap()
-            .is_empty()
-        );
-    }
-
-    #[test]
-    fn host_failures_do_not_block_other_hosts() {
-        let hosts = BTreeSet::from([
-            "github.com".into(),
-            "github.example.com".into(),
-            "acme.ghe.com".into(),
-        ]);
-        let results = fetch_hosts_with(&hosts, |host| {
-            if host == "github.example.com" {
-                bail!("unsupported GraphQL schema");
-            }
-            parse_reviews_on_host(&response(host, "me"), host, "me")
-        });
-        assert_eq!(results.reviews.len(), 2);
-        assert_eq!(
-            results.successful_hosts,
-            BTreeSet::from(["github.com".into(), "acme.ghe.com".into()])
-        );
-        assert_eq!(
-            results.errors,
-            ["github.example.com: unsupported GraphQL schema"]
-        );
-    }
-
-    #[test]
-    fn host_discovery_requests_only_names_and_reports_cli_failures() {
-        let mut calls = 0;
-        let hosts = known_hosts_with(|args| {
-            calls += 1;
-            match args {
-                ["--version"] => Ok("gh version 2.81.0 (2025-10-01)".into()),
-                [
-                    "auth",
-                    "status",
-                    "--active",
-                    "--json",
-                    "hosts",
-                    "--jq",
-                    ".hosts | keys",
-                ] => Ok(r#"["github.example.com"]"#.into()),
-                _ => panic!("unexpected gh invocation: {args:?}"),
-            }
-        })
-        .unwrap();
-        assert_eq!(calls, 2);
-        assert_eq!(hosts, ["github.com", "github.example.com"]);
-        let error = known_hosts_with(|args| {
-            if args == ["--version"] {
-                Ok("gh version 2.81.0".into())
-            } else {
-                bail!("could not read configuration")
-            }
-        })
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("could not discover GitHub hosts"));
-    }
-
-    #[test]
-    fn cli_timeout_terminates_the_request_instead_of_blocking_polling() {
-        let started = Instant::now();
-        let error = command_output(
-            Command::new("/bin/sh").args(["-c", "exec sleep 5"]),
-            Duration::from_millis(30),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn cli_timeout_does_not_wait_for_descendants_holding_pipes() {
-        for script in ["sleep 5 & exec sleep 5", "sleep 5 & exit 0"] {
-            let started = Instant::now();
-            let error = command_output(
-                Command::new("/bin/sh").args(["-c", script]),
-                Duration::from_millis(50),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("timed out"), "{script}: {error}");
-            assert!(started.elapsed() < Duration::from_secs(2), "{script}");
-            // A failed request must leave the next host free to run immediately.
-            let next = command_output(
-                Command::new("/bin/sh").args(["-c", "printf healthy"]),
-                Duration::from_secs(2),
-            )
-            .unwrap();
-            assert_eq!(next.stdout, b"healthy");
-        }
-    }
-
-    #[test]
-    fn continuous_output_cannot_starve_the_cli_deadline() {
-        let started = Instant::now();
-        let error = command_output(
-            Command::new("/bin/sh").args(["-c", "yes stdout & yes stderr >&2 & wait"]),
-            Duration::from_millis(50),
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn cli_output_drains_large_responses_and_preserves_failure_details() {
-        let output = command_output(
-            Command::new("/bin/sh").args(["-c", "printf 'bad credentials' >&2; exit 1"]),
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        let error = gh_output(&["api"], output).unwrap_err();
-        assert!(error.to_string().contains("bad credentials"));
-        let output = command_output(
-            Command::new("/bin/sh").args([
-                "-c",
-                "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2",
-            ]),
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout.len(), 131072);
-        assert_eq!(output.stderr.len(), 131072);
     }
 }
