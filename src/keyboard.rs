@@ -7,7 +7,10 @@ use gpui::{
     px, rgb,
 };
 
-use crate::{Tab, theme};
+use crate::{
+    Tab,
+    theme::{Appearance, Palette},
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Control {
@@ -22,6 +25,7 @@ pub(crate) enum Control {
     AddRoot,
     Rescan,
     Repository(String),
+    Appearance(Appearance),
     Poll(u64),
     SnoozeMinutes(u64),
     TestNotification,
@@ -38,6 +42,7 @@ pub(crate) struct Keyboard {
     order: Vec<Control>,
     targets: HashMap<Control, FocusTarget>,
     reveal_pending: Cell<bool>,
+    palette: Palette,
 }
 
 impl Keyboard {
@@ -48,7 +53,12 @@ impl Keyboard {
             order: Vec::new(),
             targets: HashMap::new(),
             reveal_pending: Cell::new(false),
+            palette: Palette::LIGHT,
         }
+    }
+
+    pub fn set_palette(&mut self, palette: Palette) {
+        self.palette = palette;
     }
 
     /// Retain focus across reordering; move to a nearby control if it disappears.
@@ -125,6 +135,7 @@ impl Keyboard {
 
     pub fn control(&self, key: Control) -> Stateful<Div> {
         let target = &self.targets[&key];
+        let theme = self.palette;
         let bounds = target.bounds.clone();
         div()
             .id(gpui::SharedString::from(format!("{key:?}")))
@@ -135,9 +146,9 @@ impl Keyboard {
             .border_color(gpui::transparent_black())
             .focus(|style| {
                 style
-                    .border_color(rgb(theme::ACCENT))
-                    .bg(rgb(theme::SURFACE_HOVER))
-                    .text_color(rgb(theme::TEXT))
+                    .border_color(rgb(theme.focus))
+                    .bg(rgb(theme.surface_hover))
+                    .text_color(rgb(theme.text))
                     .opacity(1.)
             })
             .child(

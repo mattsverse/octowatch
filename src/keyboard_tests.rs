@@ -49,6 +49,7 @@ fn fixture(window: &mut Window, cx: &mut Context<Octowatcher>) -> Octowatcher {
         wake_task: None,
         update_check: None,
         _startup_and_updates: Task::ready(()),
+        appearance_subscription: None,
     }
 }
 
@@ -175,7 +176,7 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
     press(cx, "enter");
     cx.update(|_, cx| assert!(view.read(cx).store.is_enabled("owner/repo")));
     focus(&view, Control::Tab(Tab::Settings), cx);
-    press(cx, "space tab");
+    press(cx, "space tab tab tab tab");
     cx.simulate_resize(size(px(560.), px(300.)));
     cx.run_until_parked();
     assert_eq!(focused(&view, cx), Some(Control::Poll(1)));
@@ -200,6 +201,44 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
         assert!(bounds.top() >= keyboard.scroll.bounds().top());
         assert!(bounds.bottom() <= keyboard.scroll.bounds().bottom());
     });
+}
+
+#[gpui::test]
+fn appearance_choices_preserve_focus_and_review_activation(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(fixture);
+    focus(&view, Control::Tab(Tab::Settings), cx);
+    press(cx, "enter tab");
+    assert_eq!(
+        focused(&view, cx),
+        Some(Control::Appearance(Appearance::System))
+    );
+    for (appearance, activation) in [(Appearance::Light, "space"), (Appearance::Dark, "enter")] {
+        press(cx, "tab");
+        assert_eq!(focused(&view, cx), Some(Control::Appearance(appearance)));
+        press(cx, activation);
+        cx.update(|_, cx| assert_eq!(view.read(cx).store.appearance, appearance));
+        assert_eq!(focused(&view, cx), Some(Control::Appearance(appearance)));
+
+        // The same nested controls still work after each palette change.
+        focus(&view, Control::Tab(Tab::Reviews), cx);
+        press(cx, "enter");
+        focus(&view, Control::Snooze(key(1)), cx);
+        press(cx, "enter tab space");
+        assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
+        cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_some()));
+        assert_eq!(cx.opened_url(), None);
+        press(cx, "enter");
+        cx.update(|_, cx| assert!(view.read(cx).store.snoozed.is_empty()));
+        focus(&view, Control::Tab(Tab::Settings), cx);
+        press(cx, "enter");
+        focus(&view, Control::Appearance(appearance), cx);
+    }
+    press(cx, "shift-tab shift-tab space");
+    assert_eq!(
+        focused(&view, cx),
+        Some(Control::Appearance(Appearance::System))
+    );
+    cx.update(|_, cx| assert_eq!(view.read(cx).store.appearance, Appearance::System));
 }
 
 #[gpui::test]
