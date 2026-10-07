@@ -152,11 +152,13 @@ impl Octowatcher {
             }
         });
         let (store, load_warning) = Store::load();
-        // Saved reviews are unverified for the active account at launch.
-        let (tray, tray_error) = match Tray::new(&[], ReviewsStatus::Loading.tray_message()) {
-            Ok(tray) => (Some(tray), None),
-            Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
-        };
+        // Retain cached links/counts while the status makes their freshness
+        // explicit. A confirmed account change clears them in `apply`.
+        let (tray, tray_error) =
+            match Tray::new(&store.awake(), ReviewsStatus::Loading.tray_message()) {
+                Ok(tray) => (Some(tray), None),
+                Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
+            };
         let health_clock = cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -271,17 +273,27 @@ impl Octowatcher {
             cx.background_executor()
                 .timer(Duration::from_secs(wait))
                 .await;
-            this.update(cx, |this, cx| this.wake(cx)).ok();
+            this.update(cx, |this, cx| {
+                let woken = this.wake(cx);
+                this.notify(woken, cx);
+            })
+            .ok();
         }));
     }
 
-    /// Brings back every review whose snooze ran out, and notifies again.
-    fn wake(&mut self, cx: &mut Context<Self>) {
+    /// Brings back expired reviews and returns the reminders to deliver.
+    fn wake(&mut self, cx: &mut Context<Self>) -> Vec<PendingReview> {
+        if !self.notifications_ready {
+            // Startup schedules the next wake after the permission wait. Keep
+            // the deadlines intact so no reminder is consumed in the meantime.
+            self.wake_task = None;
+            return Vec::new();
+        }
         let woken = self.store.take_expired(Local::now().timestamp());
         self.snoozes_changed(cx);
-        if self.health.verified && self.notifications_ready {
-            self.notify(woken, cx);
-        }
+        // Scanning or failing to refresh changes freshness, not the user's
+        // saved deadline. A confirmed account change already cleared snoozes.
+        woken
     }
 
     /// Rediscovers local clones, then checks GitHub again.
@@ -756,11 +768,7 @@ impl Octowatcher {
             Some(Update::Ready(version)) => UpdateItem::Ready(version),
             Some(Update::Manual(_)) | None => UpdateItem::Check,
         };
-        let awake = if self.health.verified {
-            self.store.awake()
-        } else {
-            Vec::new()
-        };
+        let awake = self.tray_reviews();
         self.tray_error = tray
             .update(&awake, item, self.review_status().tray_message())
             .err()
@@ -773,6 +781,10 @@ impl Octowatcher {
             .save()
             .err()
             .map(|err| format!("could not save state: {err:#}"));
+    }
+
+    fn tray_reviews(&self) -> Vec<PendingReview> {
+        self.store.awake()
     }
 
     fn errors(&self) -> Vec<&str> {
@@ -1741,6 +1753,70 @@ mod snooze_tests {
         assert!(view.read_with(cx, |v, _| v.tab == Tab::Settings
             && v.snooze_picker.is_none()));
         assert_eq!(cx.opened_url(), None);
+    }
+
+    #[test]
+    fn stale_cache_regressions_keep_tray_reviews_after_failed_startup_and_rescan() {
+        let mut app = app_for_picker_test();
+        // A restarted cache has not been verified in this process.
+        app.health = SyncHealth::default();
+        app.health.apply(
+            github::Check {
+                readiness: github::Readiness::Offline,
+                reviews: Err(anyhow::anyhow!("network is unreachable")),
+            },
+            &mut app.store,
+            100,
+        );
+        assert_eq!(app.review_status(), ReviewsStatus::Offline);
+        assert_eq!(app.tray_reviews(), app.store.pending);
+        // Beginning a rescan invalidates freshness, not cached visibility.
+        app.health.verified = false;
+        assert_eq!(app.tray_reviews().len(), 2);
+        // A confirmed different account still clears the old cache.
+        app.health.apply(
+            github::Check {
+                readiness: github::Readiness::Ready("another-viewer".into()),
+                reviews: Err(anyhow::anyhow!("review query failed")),
+            },
+            &mut app.store,
+            200,
+        );
+        assert!(app.tray_reviews().is_empty());
+    }
+
+    #[gpui::test]
+    fn stale_cache_regressions_snooze_expiry_during_rescan_produces_one_alert(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|_, _| app_for_picker_test());
+        view.update(cx, |app, cx| {
+            // Keep the production wake path's saving isolated from user state.
+            app.store.recovery_blocked = Some("test state must not be written".into());
+            app.store
+                .snooze(&review(1).key(), 5, Local::now().timestamp() - 301);
+            app.health.verified = false;
+            assert_eq!(app.wake(cx), vec![review(1)]);
+            assert!(app.store.snoozed.is_empty());
+            assert_eq!(app.tray_reviews().len(), 2);
+            assert!(app.wake(cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn stale_cache_regressions_permission_wait_preserves_expired_snooze(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, _| app_for_picker_test());
+        view.update(cx, |app, cx| {
+            app.store.recovery_blocked = Some("test state must not be written".into());
+            app.store
+                .snooze(&review(1).key(), 5, Local::now().timestamp() - 301);
+            app.notifications_ready = false;
+            assert!(app.wake(cx).is_empty());
+            assert_eq!(app.store.snoozed.len(), 1);
+            app.notifications_ready = true;
+            assert_eq!(app.wake(cx), vec![review(1)]);
+            assert!(app.wake(cx).is_empty());
+        });
     }
 
     #[gpui::test]

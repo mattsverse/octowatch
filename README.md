@@ -69,7 +69,9 @@ This tab lists the pull requests waiting on you, most recent request first. Clic
 
 While setup or a check needs attention, this tab shows **Setup & health** with guidance and recovery actions. The header keeps the sync status and **last successful sync** visible. An empty list says **Nothing waiting on your review** only after a successful check with enabled repositories and a complete folder scan. Before then it distinguishes loading, folder setup, and unverified results.
 
-If a check fails, the last known reviews stay visible with a stale warning. An empty cache cannot confirm that no reviews are waiting. The success time does not advance on failure and survives a restart; saved results remain unverified until this launch completes a sync. Results also become stale after two check intervals plus one minute without a successful sync. The tray menu shows setup or stale status too.
+If a check fails, the last known reviews stay visible with a stale warning, including the tray links and count after a restart or during a rescan. An empty cache cannot confirm that no reviews are waiting. The success time does not advance on failure and survives a restart; saved results remain unverified until this launch completes a sync. Results also become stale after two check intervals plus one minute without a successful sync. The tray menu shows setup or stale status too.
+
+Expired snoozes still send their reminder while results are stale or folders are being rescanned; if notification startup is still pending, the deadline is retained until startup finishes.
 
 Choose **Refresh** to retry immediately. Automatic checks continue at the interval in Settings, without rapid retries. Each GitHub CLI API subprocess is limited to 30 seconds, so a hung account lookup or review query cannot permanently stop checks (a full check can use two such subprocesses). Update downloads have a separate ten-minute limit.
 
