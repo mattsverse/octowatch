@@ -200,6 +200,8 @@ mod tests {
         };
         futures_lite::future::block_on(async {
             let review = PendingReview {
+                account: "alice".into(),
+                account_id: 1,
                 repo: "test/repo".into(),
                 number: 1,
                 title: "Test review".into(),
@@ -211,9 +213,14 @@ mod tests {
             };
             let single = Target::Single(review.clone());
             let summary = Target::Summary;
-            let mut store = Store::default();
+            let mut store = Store {
+                available_accounts: ["alice".into()].into(),
+                local_repos: ["test/repo".into()].into(),
+                ..Store::default()
+            };
+            let checked_accounts = [("alice".into(), 1)].into();
             let mut delivery = Delivery::default();
-            store.reconcile(vec![review.clone()]);
+            store.reconcile(vec![review.clone()], &checked_accounts);
             for failure in ["denied", "failure"] {
                 let batch = delivery.begin(&store).unwrap();
                 let shown = send(0, "Contract test", failure, Some(single.action())).await;
@@ -227,7 +234,7 @@ mod tests {
                 .unwrap();
             delivery.complete(&mut store, &batch, true);
             // A real D-Bus send has completed; no click was needed for acknowledgment.
-            store.reconcile(vec![review.clone()]);
+            store.reconcile(vec![review.clone()], &checked_accounts);
             assert!(delivery.begin(&store).is_none());
             let response = shown.response(|_| std::future::pending()).await;
             assert_eq!(
