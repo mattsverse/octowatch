@@ -782,6 +782,8 @@ mod tests {
             }],
             ..Store::default()
         };
+        store.queue_notifications(&store.pending.clone());
+        let saved_notices = store.notification_queue.clone();
         fs::rename(&metadata, f.path("offline")).unwrap();
         let mut scan = discover(std::slice::from_ref(&root));
         scan.retain_unavailable(&previous);
@@ -797,6 +799,7 @@ mod tests {
             "unavailable metadata must not discard a saved snooze"
         );
         assert_eq!(store.pending.len(), 1);
+        assert_eq!(store.notification_queue, saved_notices);
         assert_eq!(scan.repos, previous);
         assert_eq!(scan.issues[0].path, clone);
         fs::rename(f.path("offline"), &metadata).unwrap();
