@@ -2,7 +2,7 @@ use gpui::WindowAppearance;
 use serde::{Deserialize, Serialize};
 
 /// Saved intent, rather than the last appearance reported by the desktop.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Appearance {
     Light,
