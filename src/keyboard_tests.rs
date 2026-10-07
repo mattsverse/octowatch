@@ -451,6 +451,12 @@ fn review_navigation_scrolls_and_preserves_snooze_column(cx: &mut TestAppContext
         assert_eq!(actual.item_ix, offset.item_ix);
         assert_eq!(actual.offset_in_item, offset.offset_in_item);
     });
+    // The virtual list keeps the focused row's event handlers available even
+    // after a mouse scroll puts that row outside the viewport.
+    press(cx, "enter");
+    view.read_with(cx, |view, _| assert_eq!(view.snooze_picker, Some(key(1))));
+    assert_eq!(cx.opened_url(), None);
+    press(cx, "escape");
 }
 
 #[gpui::test]
