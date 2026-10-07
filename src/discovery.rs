@@ -389,12 +389,20 @@ fn github_slugs(config: &Path, hosts: &[String]) -> std::io::Result<Vec<String>>
         bytes.clear();
         let count = reader
             .by_ref()
-            .take(MAX_CONFIG_LINE_BYTES + 1)
+            .take(MAX_CONFIG_LINE_BYTES + 2)
             .read_until(b'\n', &mut bytes)?;
         if count == 0 {
             break;
         }
-        if count as u64 > MAX_CONFIG_LINE_BYTES {
+        // LF and CRLF terminate the line but don't count toward its content
+        // limit. The bounded read allows both bytes without unbounded growth.
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        if bytes.len() as u64 > MAX_CONFIG_LINE_BYTES {
             return Err(Error::new(
                 ErrorKind::InvalidData,
                 "Git config line exceeds 64 KiB",
@@ -850,6 +858,32 @@ mod tests {
         assert_eq!(scan.issues[0].path, clone);
         fs::rename(f.path("offline-pointer"), &pointer).unwrap();
         assert!(discover(&[root]).issues.is_empty());
+    }
+
+    #[test]
+    fn review_regression_config_line_content_limit_excludes_terminators() {
+        let f = Fixture::new();
+        let clone = f.checkout("clone", &[]);
+        let config = clone.join(".git/config");
+        let limit = super::MAX_CONFIG_LINE_BYTES as usize;
+        for content_length in [limit - 1, limit, limit + 1] {
+            for ending in ["\n", "\r\n", ""] {
+                let mut line = "url = https://github.com/o/boundary.git".to_string();
+                line.extend(std::iter::repeat_n(' ', content_length - line.len()));
+                fs::write(&config, format!("[remote \"origin\"]\n{line}{ending}")).unwrap();
+                let scan = discover(std::slice::from_ref(&f.0));
+                if content_length <= limit {
+                    assert!(
+                        scan.issues.is_empty(),
+                        "length {content_length}, ending {ending:?}"
+                    );
+                    assert_eq!(scan.repos[0].slug, "o/boundary");
+                } else {
+                    assert!(scan.repos.is_empty());
+                    assert_eq!(scan.issues.len(), 1, "ending {ending:?}");
+                }
+            }
+        }
     }
 
     #[test]
