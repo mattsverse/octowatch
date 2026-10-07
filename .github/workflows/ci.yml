@@ -14,7 +14,7 @@ jobs:
   # Linux only: behavioral tests plus an isolated native D-Bus contract test.
   # Live desktop rendering still requires a macOS/Linux desktop check.
   test:
-    runs-on: blacksmith-4vcpu-ubuntu-2204
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v7
         # cargo test runs dependency build scripts; keep the token out of reach.

@@ -85,7 +85,7 @@ Repository choices include the host, so matching owner/repository names on diffe
 
 The list shows **X of Y reviews**. The Reviews tab keeps the total count, including snoozed PRs. Search and filters only change this window's list: they do not change watched repositories, the tray's awake count/list, or notifications. Your view choices survive refreshes, tab changes, and closing/reopening the window, and reset when you restart the app.
 
-Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. In short windows, the filter area scrolls while leaving space for reviews; keyboard focus scrolls each control into view. When no PRs match, the window shows a no-results message and a reset button.
+Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. If a Snooze picker is open, Escape cancels it first and keeps your filters. In short windows, the filter area scrolls while leaving space for reviews; keyboard focus scrolls each control into view. When no PRs match, the window shows a no-results message and a reset button.
 
 Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front, reopening the window if you closed it; its **Open Reviews** button does the same. Your current search and filters stay active. At each launch, Octowatcher summarizes eligible reviews as GitHub confirms them. An incomplete check can announce confirmed requests, while unchecked saved reviews and their undelivered alerts wait for confirmation. Reviews confirmed later can notify then; they do not need a new request.
 
@@ -97,27 +97,29 @@ A snoozed pull request leaves the tray. With the default All filters, it stays l
 
 ### Repositories
 
-**Watched folders** are the folders Octowatcher scans for clones. The first time you launch it, it watches `~/Dev` if that folder exists, and your home folder otherwise. Use **Add folder…** and **Remove** to change the list, and **Rescan** after you clone something new.
+**Watched folders** are the folders Octowatcher scans for clones. The first time you launch it, it watches `~/Dev` if that folder exists, and your home folder otherwise. Use **Add folder…** and **Remove** to change the list. Octowatcher rescans in the background before every GitHub check (every 2 minutes by default). **Refresh** and **Rescan** both scan immediately and then check GitHub. New, moved or removed checkouts and changes to their remotes appear on the next scan. Requests received during an active scan or GitHub check trigger one follow-up, so a manual refresh is not lost behind work already running.
 
-The scan goes up to five levels deep. It skips hidden folders and `node_modules`, `target`, `vendor`, `build`, `dist` and `Library`.
+The scan goes up to five levels deep. It skips hidden folders and `node_modules`, `target`, `vendor`, `build`, `dist` and `Library`. It stops at each checkout rather than scanning inside it, and does not follow directory symlinks. A folder added explicitly is scanned even if its name is normally skipped.
 
 **GitHub repositories found** lists every repository that has at least one clone in those folders, with the paths of its clones. Click a repository to switch between **watching** and **off**. Reviews from repositories that are off don't show up and don't notify you.
 
 Each github.com repository defaults to **All enabled accounts**. Under **Monitor with**, click account names to restrict it to selected accounts, or choose **All enabled accounts** to restore the default, including accounts added later. Selecting no accounts pauses that repository. Account selections still respect the account's global enable/disable setting. Repository-access errors name the account and repository; check permissions and organization SSO authorization if a private repository is inaccessible. Other accessible repositories continue normally. A failed access check hides that repository’s requests for the affected account and retains its cached reviews and snoozes until access recovers. Successful repository metadata probes are cached in memory for 30 minutes. **Refresh** bypasses this cache. Every poll still verifies each account and fetches repository review pages; incomplete responses retain unconfirmed state.
 
-Enabling a repository checks it right away. Repeated refreshes during a running check coalesce into a follow-up check. Changing account or repository monitoring choices starts a check under the new scope immediately.
+Enabling a repository checks it right away. Repeated refreshes during a running check coalesce into a follow-up check. Changing account or repository monitoring choices requests a check under the new scope; a running check finishes before its replacement starts.
 
-Octowatcher reads the remotes from each clone's `.git/config` and understands scp-like SSH (`git@HOST:owner/repo.git`), `ssh://`, and HTTPS remotes. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them. Repository labels include the host, for example `github.com/owner/repo` and `github.example.com/owner/repo`.
+Octowatcher reads each checkout's Git config, resolving `.git` files and the shared metadata of linked worktrees even when the main clone is outside watched folders. A submodule is included when its folder is watched explicitly; scans do not descend into its parent checkout to find it. It understands scp-like SSH (`git@HOST:owner/repo.git`), `ssh://`, and HTTPS remotes. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them. Repository labels include the host, for example `github.com/owner/repo` and `github.example.com/owner/repo`.
 
 It also reads straightforward literal `Host` / `HostName` aliases from `~/.ssh/config`. For example, `git@github-work:owner/repo.git` maps to the host named by `HostName` in the `Host github-work` block. Aliases work for SSH remotes only, and each alias stays scoped to its destination host. Octowatcher does not evaluate `Include`, `Match`, wildcard or negated SSH host rules; use a direct host remote or a literal alias for those configurations.
 
 SSH aliases identify destinations and do not assign a github.com API account.
 
+If a watched folder is missing or unreadable, or a checkout’s Git metadata cannot be read, the window shows a warning with details in **Repositories**. Octowatcher retains previously discovered repositories in the affected folders, including across restarts, and retries on the next scan. Git configs are streamed without a total file-size limit; individual lines exceeding 64 KiB of content (excluding LF or CRLF terminators) produce the same warning and retention behavior. A successful scan updates the list; removing a watched folder removes its checkouts from the list.
+
 GitHub’s [SSH-over-443 configuration](https://docs.github.com/en/authentication/troubleshooting-ssh/using-ssh-over-the-https-port) is supported: `ssh://git@ssh.github.com:443/owner/repo.git`, a `Host github.com` override to `HostName ssh.github.com`, and literal aliases to that endpoint all keep the `github.com/owner/repo` identity. API calls continue to target github.com.
 
 ### Enterprise hosts
 
-Log in to each host through GitHub CLI, then choose **Rescan** in Repositories (or restart Octowatcher):
+Log in to each host through GitHub CLI, then wait for the next check or choose **Rescan** in Repositories:
 
 ```sh
 gh auth login --hostname github.example.com
@@ -128,7 +130,7 @@ Octowatcher recognizes the hosts configured in `gh`, plus github.com. You can wa
 
 API requests explicitly target the repository's web host. GitHub CLI chooses the endpoint: `api.github.com` for github.com, `HOST/api/v3` and `HOST/api/graphql` for Enterprise Server, and `api.TENANT.ghe.com` for Enterprise Cloud with data residency. Hosts must provide standard HTTPS APIs. Custom API ports, HTTP-only APIs, reverse-proxy path prefixes, and IPv6 host literals are not supported. SSH remote URLs may use a custom SSH port; HTTPS remotes may use the standard port 443.
 
-Each host must support the GraphQL fields used for review requests, review history, and re-review detection. Octowatcher reports incompatible schemas as a host-specific error; it does not provide fallback APIs for older Enterprise Server versions. Authentication, permission, network, and API failures on one host leave its last known reviews and snoozes in place while healthy hosts keep refreshing. Discovery and review CLI calls time out after 60 seconds, including command completion and output collection, so a stalled request can report an error and allow other hosts to refresh. If discovery itself fails, Octowatcher keeps the previous scan in memory; retry **Rescan** after resolving the error. Cached reviews may be out of date until that host recovers. Repositories switched off or removed from the watched folders still leave the list.
+Each host must support the GraphQL fields used for review requests, review history, and re-review detection. Octowatcher reports incompatible schemas as a host-specific error; it does not provide fallback APIs for older Enterprise Server versions. Authentication, permission, network, and API failures on one host leave its last known reviews and snoozes in place while healthy hosts keep refreshing. Discovery and review CLI calls time out after 60 seconds, including command completion and output collection, so a stalled request can report an error and allow other hosts to refresh. If host discovery itself fails, Octowatcher keeps its last checkout snapshot, including a saved snapshot from before a restart, while still honoring explicitly removed watched folders. GitHub checks continue for the cached watched hosts while discovery retries at each check; **Rescan** retries immediately. On a first launch without a saved checkout snapshot, checks wait for successful discovery. Cached reviews may be out of date until that host’s API or authentication recovers. Repositories switched off or removed from the watched folders still leave the list.
 
 Undelivered notifications are also scoped to their host. After a restart, cached alerts wait until their individual requests are confirmed on that host; healthy hosts can deliver while another host’s alerts remain queued. Snoozing a review or switching a repository off clears only its own host’s alerts.
 
@@ -158,13 +160,26 @@ Failed review deliveries remain queued, including across restarts, and retry aft
 
 Octowatcher observes at most 32 active notifications, with a one-hour action lifetime, to avoid accumulating tasks and connections. Extra review alerts stay queued until an observer frees capacity or a later successful check. Linux desktops vary in support for notification buttons and body clicks; the Reviews tab and tray remain available.
 
+### Keyboard access
+
+- **Tab / Shift+Tab** move forward or backward through the window's controls. A contrasting border shows focus in either theme, and content scrolls into view when you navigate to it. Settings starts with the System, Light and Dark appearance choices; changing appearance keeps focus on your choice.
+- **Enter / Space** activate the focused control: open a review, snooze or unsnooze it, switch a tab, toggle a repository, or pick a setting. Each review's Snooze button is a separate focus stop; activating it keeps you in Octowatcher.
+- To snooze with the keyboard, activate **Snooze…**, use **Tab / Shift+Tab** to choose a duration or **Cancel**, then press **Enter / Space**. **Escape** cancels the open picker without resetting your filters. With no picker open, it resets search and filters. Choosing or canceling returns focus to that review’s Snooze button, or a nearby remaining Snooze button if a filter hides that review. Snoozing a different review from a notification preserves your open picker and focus.
+- **Left / Right** switch tabs when a tab has focus, wrapping at either end.
+- **Up / Down** move between the reviews matching your search and filters. **Home / End** move to the first or last matching review. If a Snooze button has focus, these keys move between the Snooze buttons instead.
+- **Command+R / Command+Q** on macOS, or **Control+R / Control+Q** on Linux, refresh reviews or quit.
+
+Focus follows the same review or repository when a background check reorders the list. Matching repository names and PR numbers on different GitHub hosts or receiving accounts have separate focus stops and actions. Account toggles and per-repository account selections also support keyboard navigation. If a focused control disappears, focus moves to a nearby remaining control of the same type when possible, so review-card focus stays on a card and Snooze focus stays on Snooze. Empty and loading lists still allow navigation through the header and tabs.
+
+The current GPUI dependency (0.2.2) does not expose an accessibility tree or APIs for control roles, accessible names, selected states, or screen-reader announcements. Keyboard access is supported, but the custom window controls cannot currently be exposed to VoiceOver or Linux screen readers. Native menus and dialogs depend on platform support. Full assistive-technology support requires a framework change; this feature does not upgrade GPUI or change saved settings.
+
 ### Running in the background
 
 Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To get the window back, choose **Open Octowatcher** from the tray menu, or on macOS click the Dock icon. To stop the app, choose **Quit Octowatcher**.
 
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval, snooze length, appearance, review mute and draft preference), your account-specific snoozes, and cached review lists and undelivered account-specific alerts to one JSON file:
+Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval, snooze length, appearance, review mute and draft preference), the last discovered checkout paths, account-specific snoozes, cached review lists, and undelivered review alerts to one JSON file:
 
 | Platform | Path |
 | --- | --- |
@@ -185,7 +200,7 @@ When upgrading github.com state without account identity, folders, disabled repo
 - **A host reports an API or authentication error**: run `gh auth status --hostname HOST` in a terminal, and `gh auth login --hostname HOST` if you're logged out. Permission or schema errors may require your Enterprise administrator. Other hosts continue updating while this host's cached reviews remain visible.
 - **A team membership check fails**: make sure your GitHub CLI login can read the organization’s teams. For an OAuth CLI login, `gh auth refresh -h HOST -s read:org` can grant the required scope; organizations using SAML SSO may also require authorizing the login for that organization.
 - **"install gh 2.81 or newer"**: update GitHub CLI, then choose **Rescan**. Host discovery uses [JSON authentication status added in gh 2.81](https://github.com/cli/cli/releases/tag/v2.81.0).
-- **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. For Enterprise clones, authenticate to their destination host using `gh auth login --hostname HOST`. Then click **Rescan**.
+- **A repository is missing from the list**: make sure its folder is inside a watched folder, no more than five levels down, and not inside one of the skipped folders. For Enterprise clones, authenticate to their destination host using `gh auth login --hostname HOST`. Wait for the next check, or click **Rescan** to scan immediately. Check **Repositories** for folder or Git metadata warnings. For a nested submodule, add its folder explicitly.
 - **No tray icon on Linux**: GNOME needs an AppIndicator extension, such as *AppIndicator and KStatusNotifierItem Support*, before it shows tray icons.
 
 ## Building from source
