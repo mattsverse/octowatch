@@ -23,6 +23,14 @@ pub struct Store {
     pub snooze_minutes: u64,
     /// Reviews the user put aside for now.
     pub snoozed: Vec<Snooze>,
+    /// Review alerts are muted; polling and the queue stay active.
+    pub notifications_muted: bool,
+    /// Drafts stay in the queue regardless of this delivery preference.
+    pub notify_drafts: bool,
+    /// Review events not yet accepted by the desktop notification service.
+    pub notification_queue: Vec<ReviewNotice>,
+    /// Distinguishes a snooze reminder from an earlier delivery of the same request.
+    pub notification_sequence: u64,
 }
 
 impl Default for Store {
@@ -34,6 +42,10 @@ impl Default for Store {
             poll_minutes: 2,
             snooze_minutes: 5,
             snoozed: Vec::new(),
+            notifications_muted: false,
+            notify_drafts: true,
+            notification_queue: Vec::new(),
+            notification_sequence: 0,
         }
     }
 }
@@ -56,6 +68,23 @@ pub struct PendingReview {
 impl PendingReview {
     pub fn key(&self) -> (String, u64) {
         (self.repo.to_lowercase(), self.number)
+    }
+}
+
+/// A delivery event, independently persisted from the current review list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewNotice {
+    pub repo: String,
+    pub number: u64,
+    pub requested_at: Option<String>,
+    pub sequence: u64,
+}
+
+impl ReviewNotice {
+    pub fn matches(&self, pr: &PendingReview) -> bool {
+        self.repo == pr.repo.to_lowercase()
+            && self.number == pr.number
+            && self.requested_at == pr.requested_at
     }
 }
 
@@ -84,6 +113,7 @@ pub struct Reconciled {
     pub fresh: Vec<PendingReview>,
     pub pending_changed: bool,
     pub snoozes_changed: bool,
+    pub notifications_changed: bool,
 }
 
 impl Store {
@@ -134,6 +164,63 @@ impl Store {
             .collect()
     }
 
+    /// Retains at most one undelivered event per PR. Re-enqueuing a reminder
+    /// advances its generation so an older in-flight send cannot consume it.
+    pub fn queue_notifications(&mut self, prs: &[PendingReview]) {
+        for pr in prs {
+            self.discard_notification(&pr.key());
+            self.notification_sequence = self.notification_sequence.wrapping_add(1);
+            self.notification_queue.push(ReviewNotice {
+                repo: pr.repo.to_lowercase(),
+                number: pr.number,
+                requested_at: pr.requested_at.clone(),
+                sequence: self.notification_sequence,
+            });
+        }
+    }
+
+    /// Seed the first successful poll after launch, including suppressed drafts.
+    pub fn queue_startup_notifications(&mut self) {
+        self.queue_notifications(&self.awake());
+    }
+
+    pub fn discard_notification(&mut self, key: &(String, u64)) {
+        self.notification_queue
+            .retain(|notice| (&notice.repo, notice.number) != (&key.0, key.1));
+    }
+
+    /// Resolved/disabled requests also leave the delivery queue. Titles and
+    /// draft status are read from the current review list at each attempt.
+    pub fn prune_notifications(&mut self) {
+        self.notification_queue
+            .retain(|notice| self.pending.iter().any(|pr| notice.matches(pr)));
+    }
+
+    pub fn notifications_due(&self) -> Vec<(ReviewNotice, PendingReview)> {
+        if self.notifications_muted {
+            return Vec::new();
+        }
+        self.pending
+            .iter()
+            .filter_map(|pr| {
+                if self.snooze_for(pr).is_some() || (pr.is_draft && !self.notify_drafts) {
+                    return None;
+                }
+                let notice = self
+                    .notification_queue
+                    .iter()
+                    .find(|notice| notice.matches(pr))?;
+                Some((notice.clone(), pr.clone()))
+            })
+            .collect()
+    }
+
+    /// Delivery is acknowledged on OS acceptance, before any user interaction.
+    pub fn mark_delivered(&mut self, notices: &[ReviewNotice]) {
+        self.notification_queue
+            .retain(|notice| !notices.contains(notice));
+    }
+
     /// Replaces the pending list with what GitHub reports now, newest first.
     /// A PR that drops out (reviewed, request removed, closed) is gone, and
     /// so is its snooze.
@@ -167,10 +254,15 @@ impl Store {
 
         let pending_changed = fetched != self.pending;
         self.pending = fetched;
+        let notifications_before = self.notification_queue.clone();
+        self.prune_notifications();
+        self.queue_notifications(&fresh);
+        let notifications_changed = self.notification_queue != notifications_before;
         Reconciled {
             fresh,
             pending_changed,
             snoozes_changed,
+            notifications_changed,
         }
     }
 
@@ -181,11 +273,14 @@ impl Store {
             .into_iter()
             .partition(|s| s.until <= now);
         self.snoozed = remaining;
-        self.pending
+        let woken: Vec<_> = self
+            .pending
             .iter()
             .filter(|pr| expired.iter().any(|s| s.key() == pr.key()))
             .cloned()
-            .collect()
+            .collect();
+        self.queue_notifications(&woken);
+        woken
     }
 }
 
