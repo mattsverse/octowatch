@@ -1,6 +1,9 @@
 //! Session-only view state. Filtering never mutates the monitored Store.
 
-use std::collections::{BTreeMap, HashSet};
+use std::{
+    collections::{BTreeMap, HashSet},
+    rc::Rc,
+};
 
 use crate::store::{PendingReview, Store};
 
@@ -28,7 +31,7 @@ pub enum SnoozeFilter {
     Snoozed,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReviewFilters {
     pub query: String,
     /// An exact owner/repository selection, independent of watched repositories.
@@ -38,56 +41,141 @@ pub struct ReviewFilters {
     pub snooze: SnoozeFilter,
 }
 
-impl ReviewFilters {
-    /// Indices into pending, preserving its newest-request-first ordering.
-    pub fn visible_indices(&self, store: &Store) -> Vec<usize> {
-        let terms: Vec<_> = self
+/// Normalized search fields live for one version of the pending queue. Typing
+/// a query scans these values without allocating lowercase strings per PR.
+struct SearchableReview {
+    fields: [String; 4],
+    key: (String, u64),
+    draft: bool,
+    rereview: bool,
+}
+
+impl From<&PendingReview> for SearchableReview {
+    fn from(pr: &PendingReview) -> Self {
+        Self {
+            fields: [
+                pr.title.to_lowercase(),
+                pr.repo.to_lowercase(),
+                pr.author.to_lowercase(),
+                pr.number.to_string(),
+            ],
+            key: pr.key(),
+            draft: pr.is_draft,
+            rereview: pr.rereview,
+        }
+    }
+}
+
+/// Cache for the view only. Store mutations explicitly invalidate the affected
+/// inputs; filter comparisons are cheap and automatic. No monitoring uses it.
+pub struct ReviewFilterCache {
+    reviews: Vec<SearchableReview>,
+    repositories: BTreeMap<String, String>,
+    snoozed: HashSet<(String, u64)>,
+    filters: Option<ReviewFilters>,
+    visible: Rc<Vec<usize>>,
+    reviews_dirty: bool,
+    snoozes_dirty: bool,
+}
+
+impl Default for ReviewFilterCache {
+    fn default() -> Self {
+        Self {
+            reviews: Vec::new(),
+            repositories: BTreeMap::new(),
+            snoozed: HashSet::new(),
+            filters: None,
+            visible: Rc::default(),
+            reviews_dirty: true,
+            snoozes_dirty: true,
+        }
+    }
+}
+
+impl ReviewFilterCache {
+    pub fn invalidate_reviews(&mut self) {
+        self.reviews_dirty = true;
+    }
+    pub fn invalidate_snoozes(&mut self) {
+        self.snoozes_dirty = true;
+    }
+
+    /// Returns whether matching was recomputed, including changes in PR
+    /// metadata/order that happen to produce the same visible indices.
+    pub fn refresh(&mut self, store: &Store, filters: &ReviewFilters) -> bool {
+        if !self.reviews_dirty && !self.snoozes_dirty && self.filters.as_ref() == Some(filters) {
+            return false;
+        }
+        if self.reviews_dirty {
+            self.reviews = store.pending.iter().map(SearchableReview::from).collect();
+            self.repositories.clear();
+            for pr in &store.pending {
+                self.repositories
+                    .entry(pr.repo.to_lowercase())
+                    .or_insert_with(|| pr.repo.clone());
+            }
+        }
+        if self.snoozes_dirty {
+            self.snoozed = store.snoozed.iter().map(|s| s.key()).collect();
+        }
+        let terms: Vec<_> = filters
             .query
             .split_whitespace()
             .map(str::to_lowercase)
             .collect();
-        let snoozed: HashSet<_> = store.snoozed.iter().map(|s| s.key()).collect();
-        store
-            .pending
-            .iter()
-            .enumerate()
-            .filter_map(|(ix, pr)| {
-                let asleep = snoozed.contains(&pr.key());
-                let matches = self
-                    .repository
-                    .as_ref()
-                    .is_none_or(|repo| repo.eq_ignore_ascii_case(&pr.repo))
-                    && match self.draft {
-                        DraftFilter::All => true,
-                        DraftFilter::Ready => !pr.is_draft,
-                        DraftFilter::Draft => pr.is_draft,
-                    }
-                    && match self.review {
-                        ReviewFilter::All => true,
-                        ReviewFilter::First => !pr.rereview,
-                        ReviewFilter::Rereview => pr.rereview,
-                    }
-                    && match self.snooze {
-                        SnoozeFilter::All => true,
-                        SnoozeFilter::Awake => !asleep,
-                        SnoozeFilter::Snoozed => asleep,
-                    }
-                    && matches_terms(pr, &terms);
-                matches.then_some(ix)
-            })
-            .collect()
+        self.visible = Rc::new(
+            self.reviews
+                .iter()
+                .enumerate()
+                .filter_map(|(ix, pr)| {
+                    let asleep = self.snoozed.contains(&pr.key);
+                    let matches = filters
+                        .repository
+                        .as_ref()
+                        .is_none_or(|repo| repo.eq_ignore_ascii_case(&pr.fields[1]))
+                        && match filters.draft {
+                            DraftFilter::All => true,
+                            DraftFilter::Ready => !pr.draft,
+                            DraftFilter::Draft => pr.draft,
+                        }
+                        && match filters.review {
+                            ReviewFilter::All => true,
+                            ReviewFilter::First => !pr.rereview,
+                            ReviewFilter::Rereview => pr.rereview,
+                        }
+                        && match filters.snooze {
+                            SnoozeFilter::All => true,
+                            SnoozeFilter::Awake => !asleep,
+                            SnoozeFilter::Snoozed => asleep,
+                        }
+                        && terms.iter().all(|term| {
+                            if let Some(number) = term.strip_prefix('#') {
+                                !number.is_empty()
+                                    && number.bytes().all(|b| b.is_ascii_digit())
+                                    && number.parse::<u64>().ok() == Some(pr.key.1)
+                            } else {
+                                pr.fields.iter().any(|field| field.contains(term))
+                            }
+                        });
+                    matches.then_some(ix)
+                })
+                .collect(),
+        );
+        self.filters = Some(filters.clone());
+        self.reviews_dirty = false;
+        self.snoozes_dirty = false;
+        true
     }
 
-    /// Choices come from the whole queue, unaffected by other filters. Keep a
-    /// selected repository even if its last PR leaves during a refresh.
-    pub fn repositories(&self, store: &Store) -> Vec<String> {
-        let mut repos = BTreeMap::new();
-        for repo in store
-            .pending
-            .iter()
-            .map(|pr| &pr.repo)
-            .chain(self.repository.iter())
-        {
+    pub fn visible_indices(&self) -> Rc<Vec<usize>> {
+        self.visible.clone()
+    }
+
+    /// Choices use the whole queue, retaining a selected repo after its last
+    /// review leaves. This does not configure watched repositories.
+    pub fn repositories(&self, filters: &ReviewFilters) -> Vec<String> {
+        let mut repos = self.repositories.clone();
+        if let Some(repo) = &filters.repository {
             repos
                 .entry(repo.to_lowercase())
                 .or_insert_with(|| repo.clone());
@@ -96,25 +184,19 @@ impl ReviewFilters {
     }
 }
 
-fn matches_terms(pr: &PendingReview, terms: &[String]) -> bool {
-    if terms.is_empty() {
-        return true;
+#[cfg(test)]
+impl ReviewFilters {
+    pub fn visible_indices(&self, store: &Store) -> Vec<usize> {
+        let mut cache = ReviewFilterCache::default();
+        cache.refresh(store, self);
+        cache.visible_indices().as_ref().clone()
     }
-    let fields = [
-        pr.title.to_lowercase(),
-        pr.repo.to_lowercase(),
-        pr.author.to_lowercase(),
-        pr.number.to_string(),
-    ];
-    terms.iter().all(|term| {
-        if let Some(number) = term.strip_prefix('#') {
-            !number.is_empty()
-                && number.bytes().all(|b| b.is_ascii_digit())
-                && number.parse::<u64>().ok() == Some(pr.number)
-        } else {
-            fields.iter().any(|field| field.contains(term))
-        }
-    })
+
+    fn repositories(&self, store: &Store) -> Vec<String> {
+        let mut cache = ReviewFilterCache::default();
+        cache.refresh(store, self);
+        cache.repositories(self)
+    }
 }
 
 #[cfg(test)]
@@ -158,6 +240,89 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn cache_reuses_results_and_normalized_fields_between_queries() {
+        let store = queue();
+        let mut filters = ReviewFilters::default();
+        let mut cache = ReviewFilterCache::default();
+        assert!(cache.refresh(&store, &filters));
+        let original = cache.visible_indices();
+        let normalized_title = cache.reviews[0].fields[0].as_ptr();
+        assert!(!cache.refresh(&store, &filters));
+        assert!(Rc::ptr_eq(&original, &cache.visible_indices()));
+        filters.query = "acme ALICE #123".into();
+        assert!(cache.refresh(&store, &filters));
+        assert_eq!(*cache.visible_indices(), vec![0]);
+        assert_eq!(
+            normalized_title,
+            cache.reviews[0].fields[0].as_ptr(),
+            "typing should reuse normalized PR fields"
+        );
+        assert!(!cache.refresh(&store, &filters));
+    }
+
+    #[test]
+    fn cache_invalidates_review_metadata_order_and_repository_choices() {
+        let mut store = queue();
+        let filters = ReviewFilters {
+            query: "alice".into(),
+            ..Default::default()
+        };
+        let mut cache = ReviewFilterCache::default();
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![0, 2]);
+        store.pending[0].author = "Bob".into();
+        store.pending[1].author = "ALICE".into();
+        store.pending[1].repo = "New/Repo".into();
+        store.pending.reverse();
+        cache.invalidate_reviews();
+        assert!(cache.refresh(&store, &filters));
+        assert_eq!(*cache.visible_indices(), vec![1, 2]);
+        assert_eq!(
+            cache.repositories(&filters),
+            vec!["Acme/API", "New/Repo", "Other/Web"]
+        );
+        store.pending.retain(|pr| !pr.repo.starts_with("New/"));
+        cache.invalidate_reviews();
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![1]);
+        assert_eq!(cache.repositories(&filters), vec!["Acme/API", "Other/Web"]);
+    }
+
+    #[test]
+    fn cache_invalidates_snooze_actions_expiry_and_reconciliation() {
+        let mut store = queue();
+        let filters = ReviewFilters {
+            snooze: SnoozeFilter::Snoozed,
+            ..Default::default()
+        };
+        let mut cache = ReviewFilterCache::default();
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![1]);
+        let key = store.pending[0].key();
+        store.snooze(&key, 5, 0);
+        cache.invalidate_snoozes();
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![0, 1]);
+        store.unsnooze(&key);
+        cache.invalidate_snoozes();
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![1]);
+        store.take_expired(200);
+        cache.invalidate_snoozes();
+        cache.refresh(&store, &filters);
+        assert!(cache.visible_indices().is_empty());
+        store.snooze(&key, 5, 0);
+        let mut fetched = store.pending.clone();
+        fetched[0].requested_at = Some("2026-10-07T00:00:00Z".into());
+        let changes = store.reconcile(fetched);
+        assert!(changes.pending_changed && changes.snoozes_changed);
+        cache.invalidate_reviews();
+        cache.invalidate_snoozes();
+        cache.refresh(&store, &filters);
+        assert!(cache.visible_indices().is_empty());
     }
 
     #[test]

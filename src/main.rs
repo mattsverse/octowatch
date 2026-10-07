@@ -7,19 +7,24 @@ mod store;
 mod tray;
 mod updater;
 
-use std::{collections::HashSet, path::PathBuf, time::Duration};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    time::Duration,
+};
 
 use chrono::{DateTime, Local};
 use gpui::{
     App, Application, AsyncApp, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable,
     FontWeight, Global, KeyBinding, ListAlignment, ListOffset, ListState, PathPromptOptions,
-    PromptButton, PromptLevel, SharedString, Subscription, Task, Window, WindowBounds,
-    WindowOptions, actions, div, list, prelude::*, px, rgb, size,
+    PromptButton, PromptLevel, ScrollHandle, SharedString, Subscription, Task, Window,
+    WindowBounds, WindowOptions, actions, div, list, point, prelude::*, px, relative, rgb, size,
 };
 
 use discovery::LocalRepo;
 use notifications::Response;
-use review_filter::{DraftFilter, ReviewFilter, ReviewFilters, SnoozeFilter};
+use review_filter::{DraftFilter, ReviewFilter, ReviewFilterCache, ReviewFilters, SnoozeFilter};
 use search_input::SearchInput;
 use store::{PendingReview, Store};
 use tray::{Tray, UpdateItem};
@@ -80,6 +85,11 @@ struct Octowatcher {
     repos: Option<Vec<LocalRepo>>,
     tab: Tab,
     review_filters: ReviewFilters,
+    review_filter_cache: ReviewFilterCache,
+    review_filter_scroll: ScrollHandle,
+    review_no_results_scroll: ScrollHandle,
+    review_control_focus: RefCell<HashMap<gpui::ElementId, (FocusHandle, Option<usize>)>>,
+    rendered_snooze_picker: Option<(String, u64)>,
     review_search: Entity<SearchInput>,
     repository_picker_open: bool,
     review_scroll: ListState,
@@ -88,6 +98,8 @@ struct Octowatcher {
     snooze_picker: Option<(String, u64)>,
     focus_handle: FocusHandle,
     _search_subscription: Subscription,
+    #[cfg(test)]
+    review_filter_passes: usize,
     last_checked: Option<DateTime<Local>>,
     /// Each source keeps its own error, so a successful GitHub check doesn't
     /// hide a tray, save, permission or delivery error.
@@ -172,6 +184,11 @@ impl Octowatcher {
             repos: None,
             tab: Tab::Reviews,
             review_filters: ReviewFilters::default(),
+            review_filter_cache: ReviewFilterCache::default(),
+            review_filter_scroll: ScrollHandle::default(),
+            review_no_results_scroll: ScrollHandle::default(),
+            review_control_focus: RefCell::default(),
+            rendered_snooze_picker: None,
             review_search,
             repository_picker_open: false,
             review_scroll: ListState::new(0, ListAlignment::Top, px(0.)),
@@ -179,6 +196,8 @@ impl Octowatcher {
             snooze_picker: None,
             focus_handle: cx.focus_handle(),
             _search_subscription: search_subscription,
+            #[cfg(test)]
+            review_filter_passes: 0,
             last_checked: None,
             fetch_error: None,
             tray_error,
@@ -249,6 +268,7 @@ impl Octowatcher {
     }
 
     fn snoozes_changed(&mut self, cx: &mut Context<Self>) {
+        self.review_filter_cache.invalidate_snoozes();
         self.dismiss_stale_snooze_picker();
         self.save();
         self.sync_tray();
@@ -336,6 +356,9 @@ impl Octowatcher {
             .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
             .collect();
         let reconciled = self.store.reconcile(fetched);
+        if reconciled.pending_changed {
+            self.review_filter_cache.invalidate_reviews();
+        }
         self.dismiss_stale_snooze_picker();
         // Saving the snoozes also saves the pending list.
         if reconciled.snoozes_changed {
@@ -446,6 +469,7 @@ impl Octowatcher {
             self.store
                 .pending
                 .retain(|pr| pr.repo.to_lowercase() != key);
+            self.review_filter_cache.invalidate_reviews();
             self.save();
             self.sync_tray();
         }
@@ -769,8 +793,7 @@ impl Render for Octowatcher {
             .on_action(cx.listener(Self::focus_review_search))
             .on_action(cx.listener(|this, _: &ResetReviewFilters, window, cx| {
                 if this.tab == Tab::Reviews {
-                    this.reset_review_filters(cx);
-                    window.focus(&this.review_search.focus_handle(cx));
+                    this.reset_review_filters_and_focus(window, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
@@ -786,6 +809,7 @@ impl Render for Octowatcher {
                     } else {
                         window.focus_next();
                     }
+                    this.scroll_focused_review_control(window, cx);
                     cx.stop_propagation();
                 }
             }))
@@ -961,6 +985,7 @@ impl Octowatcher {
         cx: &mut Context<Self>,
     ) {
         self.tab = Tab::Reviews;
+        self.review_filter_scroll.set_offset(point(px(0.), px(0.)));
         window.focus(&self.review_search.focus_handle(cx));
         cx.notify();
     }
@@ -976,6 +1001,7 @@ impl Octowatcher {
     fn reset_review_filters(&mut self, cx: &mut Context<Self>) {
         self.review_filters = ReviewFilters::default();
         self.repository_picker_open = false;
+        self.review_filter_scroll.set_offset(point(px(0.), px(0.)));
         self.review_search.update(cx, |input, cx| input.reset(cx));
         self.review_filters_changed(cx);
     }
@@ -985,6 +1011,24 @@ impl Octowatcher {
         window.focus(&self.review_search.focus_handle(cx));
     }
 
+    fn scroll_focused_review_control(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.review_search.focus_handle(cx).is_focused(window) {
+            self.review_filter_scroll.set_offset(point(px(0.), px(0.)));
+        } else if let Some((_, row)) = self
+            .review_control_focus
+            .borrow()
+            .values()
+            .find(|(handle, _)| handle.is_focused(window))
+        {
+            if let Some(row) = row {
+                self.review_filter_scroll.scroll_to_item(*row);
+            } else {
+                self.review_no_results_scroll.scroll_to_item(1);
+            }
+        }
+        cx.notify();
+    }
+
     /// Filter controls alone join the focus order; this doesn't add app-wide
     /// keyboard navigation to the existing repository/settings controls.
     fn review_control(
@@ -992,13 +1036,26 @@ impl Octowatcher {
         id: impl Into<gpui::ElementId>,
         label: impl Into<SharedString>,
         active: bool,
+        scroll_row: Option<usize>,
         pick: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + Clone + 'static,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let click_pick = pick.clone();
+        let id = id.into();
+        let focus = {
+            let mut controls = self.review_control_focus.borrow_mut();
+            let entry = controls
+                .entry(id.clone())
+                .or_insert_with(|| (cx.focus_handle().tab_stop(true), scroll_row));
+            entry.1 = scroll_row;
+            entry.0.clone()
+        };
+        let label = label.into();
+        let selector = format!("review-filter-{label}");
         div()
             .id(id)
-            .focusable()
+            .debug_selector(move || selector)
+            .track_focus(&focus)
             .tab_stop(true)
             .px_2()
             .py_1()
@@ -1021,7 +1078,7 @@ impl Octowatcher {
             .text_color(rgb(if active { theme::BASE } else { theme::SUBTEXT }))
             .hover(|s| s.border_color(rgb(theme::ACCENT)))
             .focus(|s| s.border_color(rgb(theme::TEXT)))
-            .child(div().truncate().child(label.into()))
+            .child(div().truncate().child(label))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 let picker_open = this.repository_picker_open;
                 click_pick(this, window, cx);
@@ -1050,7 +1107,21 @@ impl Octowatcher {
             "Repository: {} ▾",
             self.review_filters.repository.as_deref().unwrap_or("All")
         );
+        let repositories = if self.repository_picker_open {
+            self.review_filter_cache.repositories(&self.review_filters)
+        } else {
+            Vec::new()
+        };
+        let draft_row = 2 + if self.repository_picker_open {
+            1 + repositories.len()
+        } else {
+            0
+        };
         div()
+            .id("review-filter-controls")
+            .max_h(relative(0.5))
+            .overflow_y_scroll()
+            .track_scroll(&self.review_filter_scroll)
             .flex()
             .flex_col()
             .gap_2()
@@ -1065,6 +1136,7 @@ impl Octowatcher {
                         "review-repository",
                         repo_label,
                         self.review_filters.repository.is_some(),
+                        Some(1),
                         |this, _, cx| {
                             this.repository_picker_open = !this.repository_picker_open;
                             cx.notify();
@@ -1075,57 +1147,45 @@ impl Octowatcher {
                         "reset-review-filters",
                         "Reset (Esc)",
                         false,
+                        Some(1),
                         Self::reset_review_filters_and_focus,
                         cx,
                     )),
             )
             .when(self.repository_picker_open, |s| {
-                s.child(
-                    div()
-                        .id("review-repository-choices")
-                        .max_h(px(120.))
-                        .overflow_y_scroll()
-                        .flex()
-                        .flex_wrap()
-                        .gap_2()
-                        .child(self.review_control(
-                            "review-repository-all",
-                            "All repositories",
-                            self.review_filters.repository.is_none(),
-                            |this, _, cx| {
-                                this.review_filters.repository = None;
-                                this.repository_picker_open = false;
-                                this.review_filters_changed(cx);
-                            },
-                            cx,
-                        ))
-                        .children(
-                            self.review_filters
-                                .repositories(&self.store)
-                                .into_iter()
-                                .map(|repo| {
-                                    let active = self
-                                        .review_filters
-                                        .repository
-                                        .as_ref()
-                                        .is_some_and(|r| r.eq_ignore_ascii_case(&repo));
-                                    self.review_control(
-                                        SharedString::from(format!(
-                                            "repo-filter:{}",
-                                            repo.to_lowercase()
-                                        )),
-                                        repo.clone(),
-                                        active,
-                                        move |this, _, cx| {
-                                            this.review_filters.repository = Some(repo.clone());
-                                            this.repository_picker_open = false;
-                                            this.review_filters_changed(cx);
-                                        },
-                                        cx,
-                                    )
-                                }),
-                        ),
-                )
+                s.child(self.review_control(
+                    "review-repository-all",
+                    "All repositories",
+                    self.review_filters.repository.is_none(),
+                    Some(2),
+                    |this, window, cx| {
+                        this.review_filters.repository = None;
+                        this.repository_picker_open = false;
+                        this.review_filters_changed(cx);
+                        this.focus_review_search(&FocusReviewSearch, window, cx);
+                    },
+                    cx,
+                ))
+                .children(repositories.into_iter().enumerate().map(|(ix, repo)| {
+                    let active = self
+                        .review_filters
+                        .repository
+                        .as_ref()
+                        .is_some_and(|r| r.eq_ignore_ascii_case(&repo));
+                    self.review_control(
+                        SharedString::from(format!("repo-filter:{}", repo.to_lowercase())),
+                        repo.clone(),
+                        active,
+                        Some(3 + ix),
+                        move |this, window, cx| {
+                            this.review_filters.repository = Some(repo.clone());
+                            this.repository_picker_open = false;
+                            this.review_filters_changed(cx);
+                            this.focus_review_search(&FocusReviewSearch, window, cx);
+                        },
+                        cx,
+                    )
+                }))
             })
             .child(
                 div()
@@ -1153,6 +1213,7 @@ impl Octowatcher {
                                 ("draft-filter", ix),
                                 label,
                                 self.review_filters.draft == value,
+                                Some(draft_row),
                                 move |this, _, cx| {
                                     this.review_filters.draft = value;
                                     this.review_filters_changed(cx);
@@ -1188,6 +1249,7 @@ impl Octowatcher {
                                 ("request-filter", ix),
                                 label,
                                 self.review_filters.review == value,
+                                Some(draft_row + 1),
                                 move |this, _, cx| {
                                     this.review_filters.review = value;
                                     this.review_filters_changed(cx);
@@ -1223,6 +1285,7 @@ impl Octowatcher {
                                 ("snooze-filter", ix),
                                 label,
                                 self.review_filters.snooze == value,
+                                Some(draft_row + 2),
                                 move |this, _, cx| {
                                     this.review_filters.snooze = value;
                                     this.review_filters_changed(cx);
@@ -1235,28 +1298,43 @@ impl Octowatcher {
     }
 
     fn render_reviews(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
-        let indices = self.review_filters.visible_indices(&self.store);
-        let items: Vec<_> = indices
-            .iter()
-            .map(|&ix| {
-                let key = self.store.pending[ix].key();
-                let picker_open = self.snooze_picker.as_ref() == Some(&key);
-                ReviewListItem { key, picker_open }
-            })
-            .collect();
-        if items != self.review_list_items {
-            let old_offset = self.review_scroll.logical_scroll_top();
-            let old_anchor = self.review_list_items.get(old_offset.item_ix);
-            let anchor =
-                old_anchor.and_then(|old| items.iter().position(|item| item.key == old.key));
-            self.review_scroll.reset(items.len());
-            if !items.is_empty() {
-                self.review_scroll.scroll_to(ListOffset {
-                    item_ix: anchor.unwrap_or(old_offset.item_ix).min(items.len() - 1),
-                    offset_in_item: old_offset.offset_in_item,
-                });
+        let recomputed = self
+            .review_filter_cache
+            .refresh(&self.store, &self.review_filters);
+        #[cfg(test)]
+        if recomputed {
+            self.review_filter_passes += 1;
+        }
+        let indices = self.review_filter_cache.visible_indices();
+        // Picker changes only require row remeasurement; unrelated repaints
+        // reuse both matching results and the stable PR/scroll anchors.
+        if recomputed
+            || self.rendered_snooze_picker != self.snooze_picker
+            || self.review_list_items.len() != indices.len()
+        {
+            let items: Vec<_> = indices
+                .iter()
+                .map(|&ix| {
+                    let key = self.store.pending[ix].key();
+                    let picker_open = self.snooze_picker.as_ref() == Some(&key);
+                    ReviewListItem { key, picker_open }
+                })
+                .collect();
+            if items != self.review_list_items {
+                let old_offset = self.review_scroll.logical_scroll_top();
+                let old_anchor = self.review_list_items.get(old_offset.item_ix);
+                let anchor =
+                    old_anchor.and_then(|old| items.iter().position(|item| item.key == old.key));
+                self.review_scroll.reset(items.len());
+                if !items.is_empty() {
+                    self.review_scroll.scroll_to(ListOffset {
+                        item_ix: anchor.unwrap_or(old_offset.item_ix).min(items.len() - 1),
+                        offset_in_item: old_offset.offset_in_item,
+                    });
+                }
+                self.review_list_items = items;
             }
-            self.review_list_items = items;
+            self.rendered_snooze_picker = self.snooze_picker.clone();
         }
         let count = indices.len();
         let view = cx.entity();
@@ -1269,6 +1347,7 @@ impl Octowatcher {
             .child(self.render_review_filters(cx))
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_xs()
                     .text_color(rgb(theme::SUBTEXT))
                     .child(format!(
@@ -1280,6 +1359,10 @@ impl Octowatcher {
                 s.child(
                     div()
                         .id("review-no-results")
+                        .track_scroll(&self.review_no_results_scroll)
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
                         .debug_selector(|| "review-no-results".into())
                         .flex()
                         .flex_col()
@@ -1297,6 +1380,7 @@ impl Octowatcher {
                                 "no-results-reset",
                                 "Reset search and filters",
                                 false,
+                                None,
                                 Self::reset_review_filters_and_focus,
                                 cx,
                             )
@@ -1881,6 +1965,11 @@ mod review_view_tests {
             repos: None,
             tab: Tab::Reviews,
             review_filters: ReviewFilters::default(),
+            review_filter_cache: ReviewFilterCache::default(),
+            review_filter_scroll: ScrollHandle::default(),
+            review_no_results_scroll: ScrollHandle::default(),
+            review_control_focus: RefCell::default(),
+            rendered_snooze_picker: None,
             review_search,
             repository_picker_open: false,
             review_scroll: ListState::new(0, ListAlignment::Top, px(0.)),
@@ -1888,6 +1977,7 @@ mod review_view_tests {
             snooze_picker: None,
             focus_handle: cx.focus_handle(),
             _search_subscription: subscription,
+            review_filter_passes: 0,
             last_checked: None,
             fetch_error: None,
             tray_error: None,
@@ -1903,6 +1993,164 @@ mod review_view_tests {
             update_check: None,
             _startup_and_updates: cx.spawn(async |_, _| {}),
         }
+    }
+
+    #[gpui::test]
+    fn short_window_can_reach_lower_filter_controls(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_review_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let view = fixture(cx, 2);
+            window.focus(&view.focus_handle);
+            view
+        });
+        cx.simulate_resize(size(px(400.), px(320.)));
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_keystrokes("tab enter");
+        // Reach the final filter control using the real focus order.
+        cx.simulate_keystrokes("tab tab tab tab tab tab tab tab tab tab tab tab");
+        cx.run_until_parked();
+        let snoozed = cx.debug_bounds("review-filter-Snoozed").unwrap();
+        view.read_with(cx, |view, _| {
+            let viewport = view.review_filter_scroll.bounds();
+            assert!(snoozed.top() >= viewport.top());
+            assert!(
+                snoozed.bottom() <= viewport.bottom(),
+                "Snoozed control is clipped: {snoozed:?}"
+            );
+            assert!(
+                viewport.bottom() < px(260.),
+                "filters must leave room for reviews"
+            );
+            assert_eq!(view.review_scroll.item_count(), 2);
+        });
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.review_filters.snooze, SnoozeFilter::Snoozed)
+        });
+    }
+
+    #[gpui::test]
+    fn repository_choices_scroll_with_keyboard_and_mouse_in_a_short_window(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_review_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut view = fixture(cx, 20);
+            for pr in &mut view.store.pending {
+                pr.repo = format!("Acme/repo{:02}", pr.number);
+            }
+            window.focus(&view.focus_handle);
+            view
+        });
+        cx.simulate_resize(size(px(400.), px(320.)));
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_keystrokes("tab enter tab tab"); // Repository -> Reset -> All repositories.
+        for _ in 0..20 {
+            cx.simulate_keystrokes("tab");
+        }
+        let last = cx.debug_bounds("review-filter-Acme/repo20").unwrap();
+        view.read_with(cx, |view, _| {
+            let viewport = view.review_filter_scroll.bounds();
+            assert!(
+                last.top() >= viewport.top() && last.bottom() <= viewport.bottom(),
+                "{last:?}, viewport {viewport:?}"
+            );
+        });
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.review_filters.repository.as_deref(),
+                Some("Acme/repo20")
+            );
+            assert_eq!(view.review_scroll.item_count(), 1);
+            assert_eq!(view.review_filter_scroll.offset().y, px(0.));
+        });
+        // Open again and scroll to the final repository using the mouse.
+        cx.simulate_keystrokes("tab enter");
+        let viewport = view.read_with(cx, |view, _| view.review_filter_scroll.bounds());
+        let last = cx.debug_bounds("review-filter-Acme/repo20").unwrap();
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: viewport.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), viewport.top() - last.top())),
+            ..Default::default()
+        });
+        let last = cx.debug_bounds("review-filter-Acme/repo20").unwrap();
+        view.read_with(cx, |view, _| {
+            let viewport = view.review_filter_scroll.bounds();
+            assert!(
+                last.top() >= viewport.top() && last.bottom() <= viewport.bottom(),
+                "{last:?}, viewport {viewport:?}"
+            );
+        });
+        cx.simulate_click(last.center(), gpui::Modifiers::none());
+        view.read_with(cx, |view, _| assert!(!view.repository_picker_open));
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_input("#20");
+        view.read_with(cx, |view, _| assert_eq!(view.review_scroll.item_count(), 1));
+    }
+
+    #[gpui::test]
+    fn short_no_results_can_scroll_to_keyboard_reset(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_review_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let view = fixture(cx, 2);
+            window.focus(&view.focus_handle);
+            view
+        });
+        cx.simulate_resize(size(px(400.), px(280.)));
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_input("no-match");
+        for _ in 0..12 {
+            cx.simulate_keystrokes("tab");
+        }
+        let reset = cx.debug_bounds("no-results-reset").unwrap();
+        assert!(reset.bottom() <= px(280.), "{reset:?}");
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.review_filters, ReviewFilters::default());
+            assert_eq!(view.review_scroll.item_count(), 2);
+            assert_eq!(view.review_filter_scroll.offset().y, px(0.));
+        });
+    }
+
+    #[gpui::test]
+    fn choosing_an_already_active_filter_keeps_cached_rows(cx: &mut gpui::TestAppContext) {
+        cx.update(bind_review_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let view = fixture(cx, 10);
+            window.focus(&view.focus_handle);
+            view
+        });
+        cx.simulate_resize(size(px(560.), px(680.)));
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_keystrokes("tab tab tab tab enter"); // Ready.
+        let passes = view.read_with(cx, |view, _| view.review_filter_passes);
+        cx.simulate_keystrokes("enter");
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.review_filters.draft, DraftFilter::Ready);
+            assert_eq!(view.review_scroll.item_count(), 5);
+            assert_eq!(view.review_filter_passes, passes);
+        });
+        assert!(cx.debug_bounds("review:acme/api#9").is_some());
+    }
+
+    #[gpui::test]
+    fn unchanged_queue_and_filters_do_not_repeat_filtering_on_repaint(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let view = fixture(cx, 10_000);
+            window.focus(&view.focus_handle);
+            view
+        });
+        let initial = view.read_with(cx, |view, _| view.review_filter_passes);
+        assert_eq!(initial, 1);
+        for _ in 0..5 {
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+        }
+        let after = view.read_with(cx, |view, _| view.review_filter_passes);
+        assert_eq!(after, initial, "unrelated repaints repeat filtering");
     }
 
     fn find_key() -> &'static str {
@@ -2016,6 +2264,8 @@ mod review_view_tests {
             let mut fetched = view.store.pending.clone();
             fetched[7].title = "Updated after refresh".into();
             view.store.reconcile(fetched);
+            view.review_filter_cache.invalidate_reviews();
+            view.review_filter_cache.invalidate_snoozes();
             view.tab = Tab::Repositories;
             cx.notify();
         });
@@ -2100,6 +2350,7 @@ mod review_view_tests {
             let mut new = view.store.pending[0].clone();
             new.number = 101;
             view.store.pending.insert(0, new);
+            view.review_filter_cache.invalidate_reviews();
             cx.notify();
         });
         cx.run_until_parked();
