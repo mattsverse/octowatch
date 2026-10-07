@@ -66,9 +66,11 @@ struct Octowatcher {
     repos: Option<Vec<LocalRepo>>,
     tab: Tab,
     last_checked: Option<DateTime<Local>>,
-    error: Option<String>,
-    /// Kept separately so a successful GitHub check doesn't hide permission
-    /// or delivery errors.
+    /// Each source keeps its own error, so a successful GitHub check doesn't
+    /// hide a tray, save, permission or delivery error.
+    fetch_error: Option<String>,
+    tray_error: Option<String>,
+    save_error: Option<String>,
     notification_error: Option<String>,
     /// Whether the reviews waiting at launch were announced yet.
     announced_launch: bool,
@@ -128,7 +130,7 @@ impl Octowatcher {
             }
         });
         let store = Store::load();
-        let (tray, error) = match Tray::new(&store.awake()) {
+        let (tray, tray_error) = match Tray::new(&store.awake()) {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
         };
@@ -137,7 +139,9 @@ impl Octowatcher {
             repos: None,
             tab: Tab::Reviews,
             last_checked: None,
-            error,
+            fetch_error: None,
+            tray_error,
+            save_error: None,
             notification_error: None,
             announced_launch: false,
             tray,
@@ -270,10 +274,10 @@ impl Octowatcher {
                 this.last_checked = Some(Local::now());
                 match result {
                     Ok(fetched) => {
-                        this.error = None;
+                        this.fetch_error = None;
                         this.reconcile(fetched, cx);
                     }
-                    Err(err) => this.error = Some(format!("{err:#}")),
+                    Err(err) => this.fetch_error = Some(format!("{err:#}")),
                 }
                 cx.notify();
             })
@@ -648,15 +652,30 @@ impl Octowatcher {
             Some(Update::Ready(version)) => UpdateItem::Ready(version),
             Some(Update::Manual(_)) | None => UpdateItem::Check,
         };
-        if let Err(err) = tray.update(&self.store.awake(), item) {
-            self.error = Some(format!("could not update tray menu: {err:#}"));
-        }
+        self.tray_error = tray
+            .update(&self.store.awake(), item)
+            .err()
+            .map(|err| format!("could not update tray menu: {err:#}"));
     }
 
     fn save(&mut self) {
-        if let Err(err) = self.store.save() {
-            self.error = Some(format!("could not save state: {err:#}"));
-        }
+        self.save_error = self
+            .store
+            .save()
+            .err()
+            .map(|err| format!("could not save state: {err:#}"));
+    }
+
+    /// The header has room for one error, so the first set one wins.
+    fn displayed_error(&self) -> Option<&str> {
+        [
+            &self.fetch_error,
+            &self.save_error,
+            &self.tray_error,
+            &self.notification_error,
+        ]
+        .into_iter()
+        .find_map(Option::as_deref)
     }
 }
 
@@ -755,9 +774,8 @@ impl Octowatcher {
                     ),
             )
             .children(
-                self.error
-                    .clone()
-                    .or_else(|| self.notification_error.clone())
+                self.displayed_error()
+                    .map(str::to_owned)
                     .map(|err| {
                         div()
                             .text_xs()
