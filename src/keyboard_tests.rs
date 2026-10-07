@@ -5,6 +5,7 @@ use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
 fn review(number: u64) -> PendingReview {
     PendingReview {
+        host: repository::default_host(),
         repo: "owner/repo".into(),
         number,
         title: format!("Review number {number}"),
@@ -29,17 +30,18 @@ fn fixture(window: &mut Window, cx: &mut Context<Octowatcher>) -> Octowatcher {
             ..Store::default()
         },
         repos: Some(vec![LocalRepo {
-            slug: "owner/repo".into(),
+            id: RepositoryId::new("github.com", "owner/repo"),
             paths: vec!["/test/repo".into()],
         }]),
         tab: Tab::Reviews,
         snooze_picker: None,
         last_checked: None,
         fetch_error: None,
+        scan_error: None,
         tray_error: None,
         save_error: None,
         notification_error: None,
-        announced_launch: true,
+        announced_hosts: [repository::default_host()].into_iter().collect(),
         launch_summary: false,
         review_delivery: Delivery::default(),
         notification_tasks: HashMap::new(),
@@ -78,8 +80,8 @@ fn press(cx: &mut VisualTestContext, keys: &str) {
     }
 }
 
-fn key(number: u64) -> (String, u64) {
-    ("owner/repo".into(), number)
+fn key(number: u64) -> (RepositoryId, u64) {
+    (RepositoryId::new("github.com", "owner/repo"), number)
 }
 
 #[gpui::test]
@@ -112,6 +114,104 @@ fn tab_traversal_and_tab_arrows(cx: &mut TestAppContext) {
     focus(&view, Control::Tab(Tab::Reviews), cx);
     press(cx, "space");
     cx.update(|_, cx| assert_eq!(view.read(cx).tab, Tab::Reviews));
+}
+
+#[gpui::test]
+fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(fixture);
+    let public = review(1);
+    let enterprise = PendingReview {
+        host: "github.example.com".into(),
+        url: "https://github.example.com/owner/repo/pull/1".into(),
+        ..public.clone()
+    };
+    let enterprise_key = enterprise.key();
+    view.update(cx, |view, cx| {
+        view.store.pending = vec![public.clone(), enterprise.clone()];
+        view.repos = Some(vec![
+            LocalRepo {
+                id: public.repository(),
+                paths: vec!["/test/public".into()],
+            },
+            LocalRepo {
+                id: enterprise.repository(),
+                paths: vec!["/test/enterprise".into()],
+            },
+        ]);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    focus(&view, Control::Review(public.key()), cx);
+    press(cx, "down");
+    assert_eq!(
+        focused(&view, cx),
+        Some(Control::Review(enterprise_key.clone()))
+    );
+    view.update(cx, |view, cx| {
+        view.store.pending.reverse();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        focused(&view, cx),
+        Some(Control::Review(enterprise_key.clone()))
+    );
+    press(cx, "tab enter tab space");
+    assert_eq!(
+        focused(&view, cx),
+        Some(Control::Snooze(enterprise_key.clone()))
+    );
+    cx.update(|_, cx| {
+        let store = &view.read(cx).store;
+        assert!(store.snooze_for(&enterprise).is_some());
+        assert!(store.snooze_for(&public).is_none());
+    });
+    assert_eq!(cx.opened_url(), None);
+    press(cx, "space");
+    focus(&view, Control::Snooze(public.key()), cx);
+    press(cx, "enter tab");
+    view.update(cx, |view, cx| view.snooze(enterprise_key.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(
+        focused(&view, cx),
+        Some(Control::SnoozeDuration(public.key(), 5))
+    );
+    cx.update(|_, cx| assert_eq!(view.read(cx).snooze_picker, Some(public.key())));
+    press(cx, "escape");
+    focus(&view, Control::Review(public.key()), cx);
+    press(cx, "enter");
+    assert_eq!(cx.opened_url(), Some(public.url.clone()));
+    focus(&view, Control::Review(enterprise_key.clone()), cx);
+    press(cx, "space");
+    assert_eq!(cx.opened_url(), Some(enterprise.url.clone()));
+
+    focus(&view, Control::Tab(Tab::Repositories), cx);
+    press(cx, "enter");
+    let enterprise_repository = Control::Repository(enterprise.repository());
+    focus(&view, enterprise_repository.clone(), cx);
+    view.update(cx, |view, cx| {
+        view.repos.as_mut().unwrap().reverse();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(focused(&view, cx), Some(enterprise_repository));
+    press(cx, "space");
+    cx.update(|_, cx| {
+        let store = &view.read(cx).store;
+        assert!(!store.is_enabled(&enterprise.repository()));
+        assert!(store.is_enabled(&public.repository()));
+        assert_eq!(store.pending, vec![public.clone()]);
+    });
+    press(cx, "enter");
+    focus(&view, Control::Repository(public.repository()), cx);
+    press(cx, "space");
+    cx.update(|_, cx| {
+        let store = &view.read(cx).store;
+        assert!(!store.is_enabled(&public.repository()));
+        assert!(store.is_enabled(&enterprise.repository()));
+    });
 }
 
 #[gpui::test]
@@ -170,14 +270,11 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
     press(cx, "tab");
     assert_eq!(focused(&view, cx), Some(Control::AddRoot));
     press(cx, "tab tab");
-    assert_eq!(
-        focused(&view, cx),
-        Some(Control::Repository("owner/repo".into()))
-    );
+    assert_eq!(focused(&view, cx), Some(Control::Repository(key(1).0)));
     press(cx, "space");
-    cx.update(|_, cx| assert!(!view.read(cx).store.is_enabled("owner/repo")));
+    cx.update(|_, cx| assert!(!view.read(cx).store.is_enabled(&key(1).0)));
     press(cx, "enter");
-    cx.update(|_, cx| assert!(view.read(cx).store.is_enabled("owner/repo")));
+    cx.update(|_, cx| assert!(view.read(cx).store.is_enabled(&key(1).0)));
     focus(&view, Control::Tab(Tab::Settings), cx);
     press(cx, "space tab tab tab tab");
     cx.simulate_resize(size(px(560.), px(300.)));

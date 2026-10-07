@@ -9,6 +9,7 @@ use gpui::{
 
 use crate::{
     Tab,
+    repository::RepositoryId,
     theme::{Appearance, Palette},
 };
 
@@ -17,14 +18,14 @@ pub(crate) enum Control {
     Refresh,
     Update,
     Tab(Tab),
-    Review((String, u64)),
-    Snooze((String, u64)),
-    SnoozeDuration((String, u64), u64),
-    CancelSnooze((String, u64)),
+    Review((RepositoryId, u64)),
+    Snooze((RepositoryId, u64)),
+    SnoozeDuration((RepositoryId, u64), u64),
+    CancelSnooze((RepositoryId, u64)),
     RemoveRoot(PathBuf),
     AddRoot,
     Rescan,
-    Repository(String),
+    Repository(RepositoryId),
     Appearance(Appearance),
     Poll(u64),
     SnoozeMinutes(u64),

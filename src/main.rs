@@ -4,6 +4,7 @@ mod keyboard;
 #[cfg(test)]
 mod keyboard_tests;
 mod notifications;
+mod repository;
 mod review_notifications;
 mod store;
 mod theme;
@@ -11,7 +12,7 @@ mod tray;
 mod updater;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
     time::Duration,
 };
@@ -27,6 +28,7 @@ use gpui::{
 use discovery::LocalRepo;
 use keyboard::{Control, Keyboard};
 use notifications::Response;
+use repository::RepositoryId;
 use review_notifications::{Batch, Delivery, ReviewAction, Target};
 use store::{PendingReview, Store};
 use theme::{Appearance, Palette};
@@ -69,16 +71,17 @@ struct Octowatcher {
     repos: Option<Vec<LocalRepo>>,
     tab: Tab,
     /// The one PR whose duration picker is open; never persisted as a default.
-    snooze_picker: Option<(String, u64)>,
+    snooze_picker: Option<(RepositoryId, u64)>,
     last_checked: Option<DateTime<Local>>,
     /// Each source keeps its own error, so a successful GitHub check doesn't
     /// hide a tray, save, permission or delivery error.
     fetch_error: Option<String>,
+    scan_error: Option<String>,
     tray_error: Option<String>,
     save_error: Option<String>,
     notification_error: Option<String>,
-    /// Whether the first successful poll has validated the cached review list.
-    announced_launch: bool,
+    /// Hosts whose cached reviews have been validated by a successful check.
+    announced_hosts: BTreeSet<String>,
     /// Retained until the launch batch is accepted, including after failures.
     launch_summary: bool,
     review_delivery: Delivery,
@@ -130,7 +133,7 @@ impl Octowatcher {
                     self.repos
                         .iter()
                         .flatten()
-                        .map(|repo| Control::Repository(repo.slug.to_lowercase())),
+                        .map(|repo| Control::Repository(repo.id.clone())),
                 );
             }
             Tab::Settings => {
@@ -250,10 +253,11 @@ impl Octowatcher {
             snooze_picker: None,
             last_checked: None,
             fetch_error: None,
+            scan_error: None,
             tray_error,
             save_error: None,
             notification_error: None,
-            announced_launch: false,
+            announced_hosts: BTreeSet::new(),
             launch_summary: true,
             review_delivery: Delivery::default(),
             notification_tasks: HashMap::new(),
@@ -329,11 +333,16 @@ impl Octowatcher {
     }
 
     /// Notification actions keep using the global default.
-    fn snooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+    fn snooze(&mut self, key: (RepositoryId, u64), cx: &mut Context<Self>) {
         self.snooze_for_minutes(key, self.store.snooze_minutes, cx);
     }
 
-    fn snooze_for_minutes(&mut self, key: (String, u64), minutes: u64, cx: &mut Context<Self>) {
+    fn snooze_for_minutes(
+        &mut self,
+        key: (RepositoryId, u64),
+        minutes: u64,
+        cx: &mut Context<Self>,
+    ) {
         if self.snooze_picker.as_ref() == Some(&key) {
             self.snooze_picker = None;
         }
@@ -344,7 +353,7 @@ impl Octowatcher {
         }
     }
 
-    fn unsnooze(&mut self, key: (String, u64), cx: &mut Context<Self>) {
+    fn unsnooze(&mut self, key: (RepositoryId, u64), cx: &mut Context<Self>) {
         self.store.unsnooze(&key);
         self.snoozes_changed(cx);
     }
@@ -385,14 +394,23 @@ impl Octowatcher {
         self.scan_task = Some(cx.spawn(async move |this, cx| {
             let repos = cx
                 .background_executor()
-                .spawn(async move { discovery::discover(&roots) })
+                .spawn(async move {
+                    github::known_hosts().map(|hosts| discovery::discover(&roots, &hosts))
+                })
                 .await;
             this.update(cx, |this, cx| {
-                this.repos = Some(repos);
                 this.scan_task = None;
-                // Results fetched against the old repo list are stale.
-                this.fetch_task = None;
-                this.refresh(cx);
+                match repos {
+                    Ok(repos) => {
+                        this.scan_error = None;
+                        this.repos = Some(repos);
+                        // Results fetched against the old repo list are stale.
+                        this.fetch_task = None;
+                        this.refresh(cx);
+                    }
+                    Err(err) => this.scan_error = Some(format!("{err:#}")),
+                }
+                cx.notify();
             })
             .ok();
         }));
@@ -404,21 +422,21 @@ impl Octowatcher {
         if self.repos.is_none() || self.fetch_task.is_some() {
             return;
         }
+        let hosts = self
+            .watched_repositories()
+            .into_iter()
+            .map(|id| id.host)
+            .collect();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async { github::fetch_awaiting_reviews() })
+                .spawn(async move { github::fetch_awaiting_reviews(&hosts) })
                 .await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
                 this.last_checked = Some(Local::now());
-                match result {
-                    Ok(fetched) => {
-                        this.fetch_error = None;
-                        this.reconcile(fetched, cx);
-                    }
-                    Err(err) => this.fetch_error = Some(format!("{err:#}")),
-                }
+                this.fetch_error = (!result.errors.is_empty()).then(|| result.errors.join("\n"));
+                this.reconcile(result, cx);
                 cx.notify();
             })
             .ok();
@@ -430,19 +448,21 @@ impl Octowatcher {
     /// enabled local repos. A PR that drops out (reviewed, request removed,
     /// closed) is gone; one seen for the first time raises a notification.
     /// The first check after launch announces everything waiting instead.
-    fn reconcile(&mut self, fetched: Vec<PendingReview>, cx: &mut Context<Self>) {
-        let watched = self.watched_slugs();
-        let fetched: Vec<PendingReview> = fetched
-            .into_iter()
-            .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
+    fn reconcile(&mut self, fetched: github::FetchResults, cx: &mut Context<Self>) {
+        let watched = self.watched_repositories();
+        let first_hosts: BTreeSet<String> = fetched
+            .successful_hosts
+            .difference(&self.announced_hosts)
+            .cloned()
             .collect();
-        let reconciled = self.store.reconcile(fetched);
+        let reconciled =
+            self.store
+                .reconcile_hosts(fetched.reviews, &fetched.successful_hosts, &watched);
         self.dismiss_stale_snooze_picker();
-        let first_check = !self.announced_launch;
+        let first_check = !first_hosts.is_empty();
         if first_check {
-            self.announced_launch = true;
             // Preserve launch summaries, but keep suppressed drafts queued.
-            self.store.queue_startup_notifications();
+            self.store.queue_startup_notifications(&first_hosts);
             if self.store.notification_queue.is_empty() {
                 self.launch_summary = false;
             }
@@ -453,17 +473,23 @@ impl Octowatcher {
             self.save();
             self.sync_tray();
         }
-        self.deliver_reviews(cx);
+        if !fetched.successful_hosts.is_empty() {
+            self.announced_hosts.extend(fetched.successful_hosts);
+            self.deliver_reviews(cx);
+        }
     }
 
     /// Sends eligible, undelivered review events in one batch. A failed send
     /// stays persisted and is attempted at the next successful GitHub poll.
     fn deliver_reviews(&mut self, cx: &mut Context<Self>) {
         // Validate cached requests against GitHub before any launch delivery.
-        if !self.announced_launch {
+        if self.announced_hosts.is_empty() {
             return;
         }
-        let Some(batch) = self.review_delivery.begin(&self.store) else {
+        let Some(batch) = self
+            .review_delivery
+            .begin(&self.store, &self.announced_hosts)
+        else {
             return;
         };
         self.send_review_batch(batch, cx);
@@ -483,9 +509,12 @@ impl Octowatcher {
             Some(action),
             cx,
             move |this, delivered, cx| {
-                let next = this
-                    .review_delivery
-                    .complete(&mut this.store, &batch, delivered);
+                let next = this.review_delivery.complete(
+                    &mut this.store,
+                    &batch,
+                    delivered,
+                    &this.announced_hosts,
+                );
                 if delivered {
                     this.launch_summary = false;
                     this.save();
@@ -603,25 +632,23 @@ impl Octowatcher {
         true
     }
 
-    fn watched_slugs(&self) -> HashSet<String> {
+    fn watched_repositories(&self) -> HashSet<RepositoryId> {
         self.repos
             .iter()
             .flatten()
-            .filter(|repo| self.store.is_enabled(&repo.slug))
-            .map(|repo| repo.slug.to_lowercase())
+            .filter(|repo| self.store.is_enabled(&repo.id))
+            .map(|repo| repo.id.clone())
             .collect()
     }
 
-    fn toggle_repo(&mut self, slug: &str, cx: &mut Context<Self>) {
-        let key = slug.to_lowercase();
+    fn toggle_repo(&mut self, repository: &RepositoryId, cx: &mut Context<Self>) {
+        let key = repository.clone();
         if self.store.disabled.remove(&key) {
             self.save();
             self.refresh(cx);
         } else {
             self.store.disabled.insert(key.clone());
-            self.store
-                .pending
-                .retain(|pr| pr.repo.to_lowercase() != key);
+            self.store.pending.retain(|pr| pr.repository() != key);
             self.store.prune_notifications();
             self.save();
             self.sync_tray();
@@ -906,6 +933,7 @@ impl Octowatcher {
     /// The header has room for one error, so the first set one wins.
     fn displayed_error(&self) -> Option<&str> {
         [
+            &self.scan_error,
             &self.fetch_error,
             &self.save_error,
             &self.tray_error,
@@ -922,7 +950,7 @@ fn waiting_text(prs: &[PendingReview]) -> (String, String) {
         n => format!("You have {n} pending reviews"),
     };
     let body = match prs {
-        [pr] => format!("{}#{}: {}", pr.repo, pr.number, pr.title),
+        [pr] => format!("{}#{}: {}", pr.repo_label(), pr.number, pr.title),
         many => pr_list(many),
     };
     (summary, body)
@@ -936,7 +964,7 @@ fn notification_text(prs: &[PendingReview]) -> (String, String) {
                 pr.author,
                 if pr.rereview { "re-review" } else { "review" }
             ),
-            format!("{}#{}: {}", pr.repo, pr.number, pr.title),
+            format!("{}#{}: {}", pr.repo_label(), pr.number, pr.title),
         ),
         many => (
             format!("{} pull requests need your review", many.len()),
@@ -947,7 +975,7 @@ fn notification_text(prs: &[PendingReview]) -> (String, String) {
 
 fn pr_list(prs: &[PendingReview]) -> String {
     prs.iter()
-        .map(|pr| format!("{}#{}", pr.repo, pr.number))
+        .map(|pr| format!("{}#{}", pr.repo_label(), pr.number))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -1205,7 +1233,7 @@ impl Octowatcher {
                                     .gap_2()
                                     .text_xs()
                                     .text_color(rgb(theme.secondary_text))
-                                    .child(format!("{}#{}", pr.repo, pr.number))
+                                    .child(format!("{}#{}", pr.repo_label(), pr.number))
                                     .children(badge.map(|(label, color)| pill(label, color)))
                                     .when(pr.is_draft, |s| {
                                         s.child(pill("draft", theme.muted_text))
@@ -1300,8 +1328,8 @@ impl Octowatcher {
                 )
             })
             .children(repos.iter().map(|repo| {
-                let enabled = self.store.is_enabled(&repo.slug);
-                let slug = repo.slug.clone();
+                let enabled = self.store.is_enabled(&repo.id);
+                let id = repo.id.clone();
                 let paths = repo
                     .paths
                     .iter()
@@ -1309,7 +1337,7 @@ impl Octowatcher {
                     .collect::<Vec<_>>()
                     .join(", ");
                 self.keyboard
-                    .control(Control::Repository(repo.slug.to_lowercase()))
+                    .control(Control::Repository(repo.id.clone()))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1326,7 +1354,7 @@ impl Octowatcher {
                             .flex_col()
                             .min_w_0()
                             .when(!enabled, |s| s.text_color(rgb(theme.muted_text)))
-                            .child(repo.slug.clone())
+                            .child(repo.id.to_string())
                             .child(
                                 div()
                                     .text_xs()
@@ -1341,7 +1369,7 @@ impl Octowatcher {
                         pill("off", theme.muted_text)
                     })
                     .on_click(
-                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&slug, cx)),
+                        cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_repo(&id, cx)),
                     )
             }));
 
@@ -1522,7 +1550,7 @@ fn snooze_picker<T: 'static>(
     ix: usize,
     default_minutes: u64,
     keyboard: &Keyboard,
-    key: (String, u64),
+    key: (RepositoryId, u64),
     theme: Palette,
     cx: &mut Context<T>,
     pick: impl Fn(&mut T, Option<u64>, &mut Context<T>) + Clone + 'static,
@@ -1823,6 +1851,7 @@ mod snooze_tests {
 
     fn review(number: u64) -> PendingReview {
         PendingReview {
+            host: repository::default_host(),
             repo: "owner/repo".into(),
             number,
             title: format!("Review {number}"),
@@ -1854,10 +1883,11 @@ mod snooze_tests {
             snooze_picker: None,
             last_checked: None,
             fetch_error: None,
+            scan_error: None,
             tray_error: None,
             save_error: None,
             notification_error: None,
-            announced_launch: true,
+            announced_hosts: [repository::default_host()].into_iter().collect(),
             launch_summary: false,
             review_delivery: Delivery::default(),
             notification_tasks: HashMap::new(),
@@ -1915,6 +1945,39 @@ mod snooze_tests {
         app.store.pending.retain(|pr| pr.number != 1);
         app.dismiss_stale_snooze_picker();
         assert_eq!(app.snooze_picker, None);
+    }
+
+    #[gpui::test]
+    fn picker_keeps_matching_pr_numbers_on_different_hosts_separate(cx: &mut TestAppContext) {
+        let public = review(1);
+        let enterprise = PendingReview {
+            host: "github.example.com".into(),
+            url: "https://github.example.com/owner/repo/pull/1".into(),
+            ..public.clone()
+        };
+        let enterprise_key = enterprise.key();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut app = app_for_picker_test(cx);
+            app.store.pending = vec![public.clone(), enterprise];
+            app
+        });
+        click(cx, "snooze-0");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.snooze_picker.clone()),
+            Some(public.key())
+        );
+        click(cx, "snooze-1");
+        assert_eq!(
+            view.read_with(cx, |v, _| v.snooze_picker.clone()),
+            Some(enterprise_key.clone())
+        );
+        // Snoozing the public counterpart must leave the Enterprise picker open.
+        view.update(cx, |v, _| {
+            v.store.snooze(&public.key(), 5, 1_000);
+            v.dismiss_stale_snooze_picker();
+            assert_eq!(v.snooze_picker, Some(enterprise_key));
+        });
+        assert_eq!(cx.opened_url(), None);
     }
 
     #[gpui::test]
