@@ -70,19 +70,27 @@ The window has three tabs.
 
 ### Reviews
 
-This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu shows the same list.
+This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu lists the awake reviews.
 
 If GitHub can't completely check a repository, Octowatcher shows the error and keeps unchecked saved reviews and snoozes until a complete check succeeds. Confirmed requests still enter the queue when some team memberships can't be checked, so an unreadable team doesn't hide a direct request. Other repositories continue updating. The saved list may be out of date while an error is shown. Large repositories or long review histories take more API requests to check; GitHub rate-limit errors also preserve the saved list.
 
 If a team request and your review have exactly the same timestamp, the request stays visible: Octowatcher can't prove which happened first.
 
-Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front; its **Open Reviews** button does the same. At each launch, Octowatcher summarizes eligible reviews as GitHub confirms them. An incomplete check can announce confirmed requests, while unchecked saved reviews and their undelivered alerts wait for confirmation. Reviews confirmed later can notify then; they do not need a new request.
+**Search and filters** help you find reviews in a busy queue. Search matches title, owner/repository, author, and PR number without regard to case. Every space-separated term must match, and terms can match different fields: `acme alice login` finds login PRs by Alice in an Acme repository. A plain number is a substring search; `#123` matches exactly PR number 123.
+
+Repository choices include the host, so matching owner/repository names on different hosts remain separate. You can also search by host as part of the repository label. Choose a repository, **Ready** (non-draft) or **Draft**, **First review** or **Re-review**, and **Awake** or **Snoozed**. These filters combine with search and each other. All four default to **All**, including snoozed reviews. Repository choices come from the full review list; a selected repository stays selected even if its last PR disappears during a refresh.
+
+The list shows **X of Y reviews**. The Reviews tab keeps the total count, including snoozed PRs. Search and filters only change this window's list: they do not change watched repositories, the tray's awake count/list, or notifications. Your view choices survive refreshes, tab changes, and closing/reopening the window, and reset when you restart the app.
+
+Press **⌘F** on macOS or **Ctrl+F** on Linux to open Reviews and focus search. Use **Tab** / **Shift+Tab** to move between search and filter controls, and **Enter** or **Space** to choose a filter. **Escape** in Reviews or **Reset** clears search and all filters. In short windows, the filter area scrolls while leaving space for reviews; keyboard focus scrolls each control into view. When no PRs match, the window shows a no-results message and a reset button.
+
+Clicking a notification about one review opens that PR. Clicking a notification about several reviews brings the Reviews tab to the front, reopening the window if you closed it; its **Open Reviews** button does the same. Your current search and filters stay active. At each launch, Octowatcher summarizes eligible reviews as GitHub confirms them. An incomplete check can announce confirmed requests, while unchecked saved reviews and their undelivered alerts wait for confirmation. Reviews confirmed later can notify then; they do not need a new request.
 
 **Snooze…** opens a duration picker for that pull request: 5, 10, 15 or 30 minutes, or 1 or 2 hours. The default from Settings is marked; choose a duration to snooze, or **Cancel** to leave the review waiting. Each choice applies only to that snooze and doesn't change the default. Only one picker is open at a time.
 
 The picker and snooze apply to the pull request on its displayed host. Matching repository names and pull request numbers on another host keep their own snooze durations and deadlines.
 
-A snoozed pull request leaves the tray. In the window it stays listed, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new review request ends its snooze early. A new notification about a single pull request also has a **Snooze** button, which uses the Settings default. One that covers several pull requests doesn't. Each snooze's deadline survives a restart.
+A snoozed pull request leaves the tray. With the default All filters, it stays listed in the window, dimmed, with the time it comes back. When the snooze runs out, you get its notification again. **Unsnooze** brings it back right away, without a notification. A new review request ends its snooze early. A new notification about a single pull request also has a **Snooze** button, which uses the Settings default. One that covers several pull requests doesn't. Each snooze's deadline survives a restart.
 
 ### Repositories
 
