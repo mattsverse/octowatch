@@ -2,17 +2,23 @@
 //! and no token ever needs to be stored by the app.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
+    io::{self, Read},
+    os::unix::{io::AsRawFd, process::CommandExt as _},
     path::Path,
-    process::Command,
-    sync::OnceLock,
+    process::{Child, Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, bail};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, de::DeserializeOwned};
 
-use crate::store::PendingReview;
+use crate::{
+    repository::{PUBLIC_HOST, RepositoryId, normalize_host},
+    store::PendingReview,
+};
 
 // Enumerate watched repositories rather than global search: search has a
 // 1,000-result ceiling and its dashboard qualifiers need not share API behavior.
@@ -81,16 +87,52 @@ query($id: ID!, $after: String) {
 }
 "#;
 
-pub fn viewer_login() -> Result<String> {
-    static LOGIN: OnceLock<String> = OnceLock::new();
-    if let Some(login) = LOGIN.get() {
-        return Ok(login.clone());
+/// gh is the authority for configured hosts. Ask only for names, never tokens.
+/// JSON mode keeps hosts with expired credentials in the list, allowing their
+/// local clones and cached reviews to remain visible until authentication recovers.
+/// Unlike text mode, JSON mode exits successfully even for authentication errors
+/// (gh 2.81+: https://cli.github.com/manual/gh_auth_status).
+pub fn known_hosts() -> Result<Vec<String>> {
+    known_hosts_with(gh_request)
+}
+
+fn known_hosts_with(mut run: impl FnMut(&[&str]) -> Result<String>) -> Result<Vec<String>> {
+    check_cli_version(&run(&["--version"])?)?;
+    let output = run(&[
+        "auth",
+        "status",
+        "--active",
+        "--json",
+        "hosts",
+        "--jq",
+        ".hosts | keys",
+    ])
+    .context("could not discover GitHub hosts; run `gh auth status`")?;
+    parse_hosts(&output)
+}
+
+fn check_cli_version(output: &str) -> Result<()> {
+    let version = output
+        .strip_prefix("gh version ")
+        .and_then(|s| s.split_whitespace().next())
+        .context("could not determine GitHub CLI version; gh 2.81 or newer is required")?;
+    let version = semver::Version::parse(version).context("unexpected GitHub CLI version")?;
+    if version < semver::Version::new(2, 81, 0) {
+        bail!("GitHub CLI {version} is too old; install gh 2.81 or newer for host discovery");
     }
-    let login = gh(&["api", "user", "--jq", ".login"])?.trim().to_string();
-    if login.is_empty() {
-        bail!("`gh api user` returned no login");
+    Ok(())
+}
+
+fn parse_hosts(output: &str) -> Result<Vec<String>> {
+    let names: Vec<String> = serde_json::from_str(output).context("unexpected gh host list")?;
+    let mut hosts = BTreeSet::from([PUBLIC_HOST.to_string()]);
+    for name in names {
+        let host = normalize_host(&name).with_context(|| {
+            format!("unsupported GitHub host {name:?}; use a bare hostname with standard HTTPS")
+        })?;
+        hosts.insert(host);
     }
-    Ok(LOGIN.get_or_init(|| login).clone())
+    Ok(hosts.into_iter().collect())
 }
 
 /// Confirmed requests can enter the queue even when some team lookups fail.
@@ -98,34 +140,76 @@ pub fn viewer_login() -> Result<String> {
 #[derive(Default)]
 pub struct FetchedReviews {
     pub pending: Vec<PendingReview>,
-    pub completed_repos: HashSet<String>,
+    pub completed_repos: HashSet<RepositoryId>,
     pub errors: Vec<String>,
 }
 
-pub fn fetch_awaiting_reviews(repos: &HashSet<String>) -> Result<FetchedReviews> {
-    if repos.is_empty() {
-        return Ok(FetchedReviews::default());
+pub fn fetch_awaiting_reviews(repos: &HashSet<RepositoryId>) -> Result<FetchedReviews> {
+    fetch_repositories_with(repos, gh_request)
+}
+
+fn fetch_repositories_with(
+    repos: &HashSet<RepositoryId>,
+    mut run: impl FnMut(&[&str]) -> Result<String>,
+) -> Result<FetchedReviews> {
+    let hosts: BTreeSet<_> = repos.iter().map(|repo| repo.host.clone()).collect();
+    let mut fetched = FetchedReviews::default();
+    for host in hosts {
+        let me = run(&["api", "--hostname", &host, "user", "--jq", ".login"])
+            .with_context(|| {
+                format!("could not read viewer; check `gh auth status --hostname {host}`")
+            })
+            .and_then(|login| {
+                let login = login.trim().to_string();
+                if login.is_empty() {
+                    bail!(
+                        "`gh api user` returned no login; check `gh auth status --hostname {host}`"
+                    );
+                }
+                Ok(login)
+            });
+        let me = match me {
+            Ok(me) => me,
+            Err(err) => {
+                fetched.errors.push(format!("{host}: {err:#}"));
+                continue;
+            }
+        };
+        let host_repos = repos
+            .iter()
+            .filter(|repo| repo.host == host)
+            .cloned()
+            .collect();
+        let result = fetch_with(&host_repos, &me, &mut |query, variables| {
+            let mut args = vec![
+                "api".to_string(),
+                "--hostname".into(),
+                host.clone(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+            ];
+            for (name, value) in variables {
+                args.extend(["-f".into(), format!("{name}={value}")]);
+            }
+            run(&args.iter().map(String::as_str).collect::<Vec<_>>())
+        })?;
+        fetched.pending.extend(result.pending);
+        fetched.completed_repos.extend(result.completed_repos);
+        fetched.errors.extend(result.errors);
     }
-    let me = viewer_login()?;
-    fetch_with(repos, &me, &mut |query, variables| {
-        let mut args = vec![
-            "api".to_string(),
-            "graphql".into(),
-            "-f".into(),
-            format!("query={query}"),
-        ];
-        for (name, value) in variables {
-            args.extend(["-f".into(), format!("{name}={value}")]);
-        }
-        gh(&args.iter().map(String::as_str).collect::<Vec<_>>())
-    })
+    Ok(fetched)
 }
 
 type Variables = Vec<(&'static str, String)>;
 type Api<'a> = dyn FnMut(&str, Variables) -> Result<String> + 'a;
-type Memberships = HashMap<String, std::result::Result<bool, String>>;
+type Memberships = HashMap<(String, String), std::result::Result<bool, String>>;
 
-fn fetch_with(repos: &HashSet<String>, me: &str, api: &mut Api<'_>) -> Result<FetchedReviews> {
+fn fetch_with(
+    repos: &HashSet<RepositoryId>,
+    me: &str,
+    api: &mut Api<'_>,
+) -> Result<FetchedReviews> {
     let mut fetched = FetchedReviews::default();
     // Membership can change between polls; cache it only within this poll.
     let mut memberships = HashMap::new();
@@ -137,7 +221,7 @@ fn fetch_with(repos: &HashSet<String>, me: &str, api: &mut Api<'_>) -> Result<Fe
             Ok(pending) => {
                 fetched.pending.extend(pending);
                 if errors.is_empty() {
-                    fetched.completed_repos.insert(repo.to_lowercase());
+                    fetched.completed_repos.insert(repo.clone());
                 }
             }
             Err(err) => errors.push(format!("{err:#}")),
@@ -150,13 +234,16 @@ fn fetch_with(repos: &HashSet<String>, me: &str, api: &mut Api<'_>) -> Result<Fe
 }
 
 fn fetch_repo(
-    repo: &str,
+    repo: &RepositoryId,
     me: &str,
     memberships: &mut Memberships,
     errors: &mut Vec<String>,
     api: &mut Api<'_>,
 ) -> Result<Vec<PendingReview>> {
-    let (owner, name) = repo.split_once('/').context("invalid repository slug")?;
+    let (owner, name) = repo
+        .slug
+        .split_once('/')
+        .context("invalid repository slug")?;
     let variables = vec![("owner", owner.into()), ("name", name.into())];
     let mut cursor = Cursor::default();
     let mut pending = HashMap::new();
@@ -201,9 +288,11 @@ fn fetch_repo(
                         // An unreadable team does not negate a known direct or
                         // other team request. Report uncertainty so this repo
                         // cannot clear saved state, but keep checking known targets.
-                        match memberships.entry(id.clone()).or_insert_with(|| {
-                            is_member(id, me, api).map_err(|err| format!("{err:#}"))
-                        }) {
+                        match memberships
+                            .entry((repo.host.clone(), id.clone()))
+                            .or_insert_with(|| {
+                                is_member(id, me, api).map_err(|err| format!("{err:#}"))
+                            }) {
                             Ok(true) => {
                                 relevant.insert(reviewer.key().unwrap());
                             }
@@ -231,9 +320,13 @@ fn fetch_repo(
                     break;
                 }
             }
-            if let Some(review) =
-                pr.into_pending(&repository.name_with_owner, me, &relevant, history)?
-            {
+            if let Some(review) = pr.into_pending(
+                &repo.host,
+                &repository.name_with_owner,
+                me,
+                &relevant,
+                history,
+            )? {
                 pending.insert(review.key(), review);
             }
         }
@@ -269,6 +362,7 @@ fn is_member(id: &str, me: &str, api: &mut Api<'_>) -> Result<bool> {
 impl Pr {
     fn into_pending(
         self,
+        host: &str,
         repo: &str,
         me: &str,
         relevant: &HashSet<String>,
@@ -322,6 +416,7 @@ impl Pr {
             return Ok(None);
         }
         Ok(Some(PendingReview {
+            host: host.into(),
             repo: repo.into(),
             number: self.number,
             title: self.title,
@@ -403,6 +498,20 @@ pub fn gh(args: &[&str]) -> Result<String> {
         .args(args)
         .output()
         .context("could not run `gh`; is the GitHub CLI installed?")?;
+    gh_output(args, output)
+}
+
+/// A stalled CLI request must not prevent the remaining hosts from polling.
+/// Release downloads use `gh` above because large assets can take longer.
+fn gh_request(args: &[&str]) -> Result<String> {
+    let mut command = Command::new(gh_binary());
+    command.args(args);
+    let output = command_output(&mut command, Duration::from_secs(60))
+        .with_context(|| format!("gh {} request failed", args.first().unwrap_or(&"")))?;
+    gh_output(args, output)
+}
+
+fn gh_output(args: &[&str], output: Output) -> Result<String> {
     if !output.status.success() {
         bail!(
             "gh {} failed: {}",
@@ -411,6 +520,97 @@ pub fn gh(args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8(output.stdout)?)
+}
+
+/// Drain both pipes without blocking: GraphQL responses can exceed a pipe buffer,
+/// and descendants can keep a pipe open after the direct child exits. One deadline
+/// covers both process execution and pipe reads, with no reader threads to join.
+fn command_output(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let deadline = Instant::now() + timeout;
+    let mut child = command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("could not run `gh`; is the GitHub CLI installed?")?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let result = (|| {
+        nonblocking(&stdout)?;
+        nonblocking(&stderr)?;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (mut out_closed, mut err_closed) = (false, false);
+        let mut status = None;
+        loop {
+            if Instant::now() >= deadline {
+                bail!("GitHub CLI timed out after {} seconds", timeout.as_secs());
+            }
+            if !out_closed {
+                out_closed = drain_pipe(&mut stdout, &mut out)?;
+            }
+            if !err_closed {
+                err_closed = drain_pipe(&mut stderr, &mut err)?;
+            }
+            if status.is_none() {
+                status = child.try_wait()?;
+            }
+            if out_closed
+                && err_closed
+                && let Some(status) = status
+            {
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            thread::sleep(
+                Duration::from_millis(10).min(deadline.saturating_duration_since(Instant::now())),
+            );
+        }
+    })();
+    if result.is_err() {
+        terminate_request(&mut child);
+    }
+    result
+}
+
+fn nonblocking(pipe: &impl AsRawFd) -> io::Result<()> {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: the pipe owns this live descriptor throughout both fcntl calls.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Limit each drain so continuous output cannot starve stderr or the deadline.
+fn drain_pipe(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> io::Result<bool> {
+    let mut buffer = [0; 8192];
+    for _ in 0..16 {
+        match pipe.read(&mut buffer) {
+            Ok(0) => return Ok(true),
+            Ok(n) => bytes.extend_from_slice(&buffer[..n]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(false)
+}
+
+fn terminate_request(child: &mut Child) {
+    // SAFETY: process_group(0) gives this request its own group whose id is the
+    // child's pid; the negative id targets only it and its descendants.
+    unsafe {
+        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+    }
+    // Also kill the direct child if it changed groups, and reap it on every error.
+    child.kill().ok();
+    child.wait().ok();
 }
 
 /// Apps launched from Finder get a bare PATH, so look in the usual places too.

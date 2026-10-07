@@ -65,7 +65,10 @@ fn step(query: &'static str, variables: &[(&'static str, &str)], data: Value) ->
 fn run(repos: &[&str], steps: Vec<Step>) -> FetchedReviews {
     let mut steps: VecDeque<_> = steps.into();
     let fetched = fetch_with(
-        &repos.iter().map(|repo| (*repo).into()).collect(),
+        &repos
+            .iter()
+            .map(|repo| RepositoryId::new(PUBLIC_HOST, repo))
+            .collect(),
         "me",
         &mut |query, variables| {
             let expected = steps.pop_front().expect("unexpected API call");
@@ -114,7 +117,10 @@ fn enumerates_watched_repo_beyond_the_search_ceiling() {
     steps.push(history_step("PR_1101", vec![requested(user("me"), T1)]));
     let fetched = run(&["o/r"], steps);
     assert!(fetched.errors.is_empty());
-    assert_eq!(fetched.completed_repos, HashSet::from(["o/r".into()]));
+    assert_eq!(
+        fetched.completed_repos,
+        HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")])
+    );
     assert_eq!(fetched.pending.len(), 1);
     assert_eq!(fetched.pending[0].number, 1101);
 }
@@ -259,7 +265,13 @@ fn completed_reviews_clear_and_only_relevant_active_requests_can_reopen() {
         let pull: Pr = serde_json::from_value(pr(1, vec![team("A")])).unwrap();
         let history = serde_json::from_value(json!(history)).unwrap();
         let result = pull
-            .into_pending("o/r", "me", &HashSet::from(["team:A".into()]), history)
+            .into_pending(
+                PUBLIC_HOST,
+                "o/r",
+                "me",
+                &HashSet::from(["team:A".into()]),
+                history,
+            )
             .unwrap();
         assert_eq!(
             result.map(|r| (r.requested_at.unwrap(), r.rereview)),
@@ -312,7 +324,11 @@ fn withdrawal_closed_own_and_archived_prs_do_not_enter_queue() {
         )],
     );
     assert!(fetched.pending.is_empty());
-    assert!(fetched.completed_repos.contains("o/r"));
+    assert!(
+        fetched
+            .completed_repos
+            .contains(&RepositoryId::new(PUBLIC_HOST, "o/r"))
+    );
     let mut archived = repository(vec![pr(1, vec![user("me")])], None);
     archived["repository"]["isArchived"] = json!(true);
     let fetched = run(
@@ -324,7 +340,11 @@ fn withdrawal_closed_own_and_archived_prs_do_not_enter_queue() {
         )],
     );
     assert!(fetched.pending.is_empty());
-    assert!(fetched.completed_repos.contains("o/r"));
+    assert!(
+        fetched
+            .completed_repos
+            .contains(&RepositoryId::new(PUBLIC_HOST, "o/r"))
+    );
 }
 
 #[test]
@@ -410,7 +430,10 @@ fn later_page_failure_discards_partial_repo_but_other_repos_still_update() {
         ],
     );
     assert!(fetched.pending.is_empty());
-    assert_eq!(fetched.completed_repos, HashSet::from(["o/s".into()]));
+    assert_eq!(
+        fetched.completed_repos,
+        HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/s")])
+    );
     assert!(fetched.errors[0].contains("network unavailable"));
 }
 
@@ -448,6 +471,143 @@ fn no_watched_repos_makes_no_api_calls() {
     let fetched = run(&[], vec![]);
     assert!(fetched.pending.is_empty());
     assert!(fetched.errors.is_empty());
+}
+
+#[test]
+fn paginated_queries_use_each_hosts_current_viewer_and_team_membership() {
+    let repos: HashSet<_> = [PUBLIC_HOST, "github.example.com", "acme.ghe.com"]
+        .into_iter()
+        .map(|host| RepositoryId::new(host, "o/r"))
+        .collect();
+    for poll in [1, 2] {
+        let mut calls = 0;
+        let fetched = fetch_repositories_with(&repos, |args| {
+            calls += 1;
+            assert_eq!(&args[..2], ["api", "--hostname"]);
+            let host = args[2];
+            assert!(repos.contains(&RepositoryId::new(host, "o/r")));
+            let viewer = format!("viewer-{host}-{poll}");
+            if args[3] == "user" {
+                assert_eq!(&args[4..], ["--jq", ".login"]);
+                return Ok(viewer);
+            }
+            assert_eq!(args[3], "graphql");
+            let field = |name: &str| {
+                args.iter()
+                    .find_map(|arg| arg.strip_prefix(&format!("{name}=")))
+            };
+            let data = match field("query").unwrap() {
+                REPOSITORY_QUERY => {
+                    assert_eq!(field("owner"), Some("o"));
+                    assert_eq!(field("name"), Some("r"));
+                    if field("after").is_some() {
+                        assert_eq!(field("after"), Some("repo-next"));
+                        repository(vec![], None)
+                    } else {
+                        let mut pull = pr(1, vec![]);
+                        pull["url"] = json!(format!("https://{host}/o/r/pull/1"));
+                        pull["reviewRequests"] = page(
+                            vec![json!({"requestedReviewer": user(&viewer)})],
+                            Some("requests-next"),
+                        );
+                        repository(vec![pull], Some("repo-next"))
+                    }
+                }
+                REQUESTS_QUERY => {
+                    assert_eq!(field("id"), Some("PR_1"));
+                    assert_eq!(field("after"), Some("requests-next"));
+                    json!({"node": {"reviewRequests": page(vec![json!({"requestedReviewer": team("shared-team-id")})], None)}})
+                }
+                MEMBERS_QUERY => {
+                    assert_eq!(field("id"), Some("shared-team-id"));
+                    assert_eq!(field("me"), Some(viewer.as_str()));
+                    // The same team node ID can identify unrelated teams on different hosts.
+                    let login = if host == PUBLIC_HOST { &viewer } else { "other" };
+                    json!({"node": {"members": page(vec![json!({"login": login})], None)}})
+                }
+                HISTORY_QUERY => {
+                    assert_eq!(field("id"), Some("PR_1"));
+                    if field("after").is_some() {
+                        assert_eq!(field("after"), Some("history-next"));
+                        json!({"node": {"timelineItems": page(vec![requested(team("shared-team-id"), T2)], None)}})
+                    } else {
+                        json!({"node": {"timelineItems": page(vec![requested(user(&viewer), T1)], Some("history-next"))}})
+                    }
+                }
+                query => panic!("unexpected query: {query}"),
+            };
+            Ok(json!({"data": data}).to_string())
+        })
+        .unwrap();
+        assert_eq!(calls, 21);
+        assert!(fetched.errors.is_empty());
+        assert_eq!(fetched.completed_repos, repos);
+        assert_eq!(fetched.pending.len(), 3);
+        let keys: HashSet<_> = fetched.pending.iter().map(PendingReview::key).collect();
+        assert_eq!(keys.len(), 3);
+        for review in fetched.pending {
+            assert_eq!(review.url, format!("https://{}/o/r/pull/1", review.host));
+            assert_eq!(
+                review.requested_at.as_deref(),
+                Some(if review.host == PUBLIC_HOST { T2 } else { T1 })
+            );
+        }
+    }
+}
+
+#[test]
+fn host_authentication_and_schema_failures_preserve_other_repositories() {
+    for failure in ["auth", "empty-viewer", "schema"] {
+        let healthy = RepositoryId::new(PUBLIC_HOST, "o/r");
+        let failed = RepositoryId::new("github.example.com", "o/r");
+        let watched = HashSet::from([healthy.clone(), failed.clone()]);
+        let fetched = fetch_repositories_with(&watched, |args| {
+            assert_eq!(&args[..2], ["api", "--hostname"]);
+            if args[2] == failed.host {
+                if failure == "auth" {
+                    bail!("HTTP 401: bad credentials");
+                }
+                if args[3] == "user" {
+                    return Ok(if failure == "empty-viewer" {
+                        "\n"
+                    } else {
+                        "me"
+                    }
+                    .into());
+                }
+                return Ok(
+                    r#"{"data":null,"errors":[{"message":"unsupported GraphQL field"}]}"#.into(),
+                );
+            }
+            if args[3] == "user" {
+                return Ok("me".into());
+            }
+            Ok(json!({"data": repository(vec![], None)}).to_string())
+        })
+        .unwrap();
+        assert_eq!(fetched.completed_repos, HashSet::from([healthy]));
+        assert_eq!(fetched.errors.len(), 1);
+        assert!(fetched.errors[0].contains(&failed.host));
+        let cached = PendingReview {
+            host: failed.host.clone(),
+            repo: "o/r".into(),
+            number: 1,
+            title: "Cached".into(),
+            url: "https://github.example.com/o/r/pull/1".into(),
+            author: "someone".into(),
+            is_draft: false,
+            rereview: false,
+            requested_at: Some(T1.into()),
+        };
+        let mut store = crate::store::Store {
+            pending: vec![cached.clone()],
+            ..Default::default()
+        };
+        store.snooze(&cached.key(), 5, 0);
+        store.reconcile_repositories(fetched.pending, &fetched.completed_repos, &watched);
+        assert_eq!(store.pending, vec![cached.clone()]);
+        assert!(store.snooze_for(&cached).is_some());
+    }
 }
 
 #[test]
@@ -510,7 +670,7 @@ fn unavailable_nested_nodes_and_missing_history_timestamps_fail_safely() {
 #[test]
 fn unreadable_team_does_not_hide_a_confirmed_direct_request() {
     let mut forbidden_lookups = 0;
-    let fetched = fetch_with(&HashSet::from(["o/r".into()]), "me", &mut |query, variables| {
+    let fetched = fetch_with(&HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]), "me", &mut |query, variables| {
         let id = variables.iter().find(|(name, _)| *name == "id").map(|(_, value)| value.as_str());
         let data = match query {
             REPOSITORY_QUERY => repository(vec![
@@ -561,7 +721,7 @@ fn unreadable_team_does_not_hide_a_confirmed_direct_request() {
     let result = store.reconcile_repositories(
         fetched.pending,
         &fetched.completed_repos,
-        &HashSet::from(["o/r".into()]),
+        &HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]),
     );
     assert_eq!(
         store
@@ -581,4 +741,134 @@ fn unreadable_team_does_not_hide_a_confirmed_direct_request() {
     );
     assert_eq!(store.snoozed.len(), 1);
     assert_eq!(store.next_snooze_until(), Some(4_600));
+}
+
+#[test]
+fn discovers_configured_hosts_including_unhealthy_ones() {
+    // Auth status JSON can succeed even when one host's credentials fail.
+    // Host names, rather than successful account states, are the authority.
+    assert_eq!(
+        parse_hosts(r#"["GITHUB.EXAMPLE.COM","acme.ghe.com","github.com"]"#).unwrap(),
+        vec!["acme.ghe.com", "github.com", "github.example.com"]
+    );
+    assert_eq!(parse_hosts("[]").unwrap(), vec!["github.com"]);
+    for invalid in [
+        r#"["https://ghe.example"]"#,
+        r#"["ghe.example:8443"]"#,
+        r#"["-option"]"#,
+        "{}",
+    ] {
+        assert!(parse_hosts(invalid).is_err());
+    }
+}
+
+#[test]
+fn requires_machine_readable_cli_version() {
+    assert!(
+        check_cli_version("gh version 2.81.0 (2025-10-01)\nhttps://github.com/cli/cli").is_ok()
+    );
+    assert!(check_cli_version("gh version 2.102.0 (2026-09-30)").is_ok());
+    let error = check_cli_version("gh version 2.80.0 (2025-09-23)").unwrap_err();
+    assert!(error.to_string().contains("2.81"));
+    assert!(check_cli_version("unrecognized version").is_err());
+}
+
+#[test]
+fn host_discovery_requests_only_names_and_reports_cli_failures() {
+    let mut calls = 0;
+    let hosts = known_hosts_with(|args| {
+        calls += 1;
+        match args {
+            ["--version"] => Ok("gh version 2.81.0 (2025-10-01)".into()),
+            [
+                "auth",
+                "status",
+                "--active",
+                "--json",
+                "hosts",
+                "--jq",
+                ".hosts | keys",
+            ] => Ok(r#"["github.example.com"]"#.into()),
+            _ => panic!("unexpected gh invocation: {args:?}"),
+        }
+    })
+    .unwrap();
+    assert_eq!(calls, 2);
+    assert_eq!(hosts, ["github.com", "github.example.com"]);
+    let error = known_hosts_with(|args| {
+        if args == ["--version"] {
+            Ok("gh version 2.81.0".into())
+        } else {
+            bail!("could not read configuration")
+        }
+    })
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("could not discover GitHub hosts"));
+}
+
+#[test]
+fn cli_timeout_terminates_the_request_instead_of_blocking_polling() {
+    let started = Instant::now();
+    let error = command_output(
+        Command::new("/bin/sh").args(["-c", "exec sleep 5"]),
+        Duration::from_millis(30),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn cli_timeout_does_not_wait_for_descendants_holding_pipes() {
+    for script in ["sleep 5 & exec sleep 5", "sleep 5 & exit 0"] {
+        let started = Instant::now();
+        let error = command_output(
+            Command::new("/bin/sh").args(["-c", script]),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{script}: {error}");
+        assert!(started.elapsed() < Duration::from_secs(2), "{script}");
+        // A failed request must leave the next host free to run immediately.
+        let next = command_output(
+            Command::new("/bin/sh").args(["-c", "printf healthy"]),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(next.stdout, b"healthy");
+    }
+}
+
+#[test]
+fn continuous_output_cannot_starve_the_cli_deadline() {
+    let started = Instant::now();
+    let error = command_output(
+        Command::new("/bin/sh").args(["-c", "yes stdout & yes stderr >&2 & wait"]),
+        Duration::from_millis(50),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn cli_output_drains_large_responses_and_preserves_failure_details() {
+    let output = command_output(
+        Command::new("/bin/sh").args(["-c", "printf 'bad credentials' >&2; exit 1"]),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    let error = gh_output(&["api"], output).unwrap_err();
+    assert!(error.to_string().contains("bad credentials"));
+    let output = command_output(
+        Command::new("/bin/sh").args([
+            "-c",
+            "head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2",
+        ]),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout.len(), 131072);
+    assert_eq!(output.stderr.len(), 131072);
 }

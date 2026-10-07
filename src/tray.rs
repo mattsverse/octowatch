@@ -112,7 +112,7 @@ fn build_menu(pending: &[PendingReview], update: UpdateItem, muted: bool) -> Res
         ))?;
     }
     for pr in pending {
-        let mut label = format!("{}#{}: {}", pr.repo, pr.number, truncate(&pr.title));
+        let mut label = format!("{}#{}: {}", pr.repo_label(), pr.number, truncate(&pr.title));
         if pr.rereview {
             label.push_str("  (re-review)");
         }
