@@ -1080,3 +1080,26 @@ fn request_beyond_twenty_events_ends_old_snooze_and_queues_one_fresh_alert() {
     assert_eq!(store.notifications_due().len(), 1);
     assert_eq!(store.pending[0].requested_at.as_deref(), Some(T2));
 }
+
+#[test]
+fn partial_graphql_error_still_invalidates_a_detected_account_change() {
+    let watched = HashSet::from([RepositoryId::new(PUBLIC_HOST, "o/r")]);
+    let fetched = fetch_repositories_with(&watched, |args| {
+        if args[3] == "user" {
+            return Ok("me".into());
+        }
+        Ok(
+            json!({"data": {"viewer": {"login": "new-account"}, "repository": null},
+            "errors": [{"message": "Repository unavailable"}]})
+            .to_string(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        fetched.readiness[PUBLIC_HOST],
+        Readiness::Ready("new-account".into())
+    );
+    assert!(fetched.completed_repos.is_empty());
+    assert!(fetched.successful_hosts.is_empty());
+    assert!(fetched.errors[0].contains("account changed"));
+}

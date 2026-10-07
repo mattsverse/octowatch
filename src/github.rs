@@ -256,21 +256,23 @@ fn fetch_repositories_with(
             let output = run(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
             let response: GraphqlResponse =
                 serde_json::from_str(&output).context("unexpected GitHub response")?;
-            // Preserve permission/schema errors, which explain missing viewer data.
-            if response.errors.is_empty() {
-                let viewer = response
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("viewer"))
-                    .and_then(|viewer| viewer.get("login"))
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|login| !login.is_empty())
-                    .context("GitHub response omitted the active account")?;
+            let viewer = response
+                .data
+                .as_ref()
+                .and_then(|data| data.get("viewer"))
+                .and_then(|viewer| viewer.get("login"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|login| !login.is_empty());
+            if let Some(viewer) = viewer {
                 if !viewer.eq_ignore_ascii_case(&me) {
                     readiness = Readiness::Ready(viewer.into());
                     bail!("GitHub account changed during this check. Refresh to retry.");
                 }
+            } else if response.errors.is_empty() {
+                bail!("GitHub response omitted the active account");
             }
+            // Permission/schema errors explain absent viewer data. A valid
+            // changed viewer still invalidates old identity even with errors.
             Ok(output)
         })?;
         // Any page under another identity invalidates this entire host result.

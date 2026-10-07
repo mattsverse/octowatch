@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::repository::{RepositoryId, default_host};
-use crate::theme::Appearance;
+use crate::{discovery::LocalRepo, theme::Appearance};
 
 /// Everything that survives a restart, saved as JSON in the platform config dir.
 #[derive(Debug, Serialize, Deserialize)]
@@ -16,6 +16,8 @@ use crate::theme::Appearance;
 pub struct Store {
     /// Folders scanned for local git clones.
     pub roots: Vec<PathBuf>,
+    /// Last discovered checkouts, retained when their folders are unavailable.
+    pub discovered: Vec<LocalRepo>,
     /// Host-qualified repository identities the user switched off.
     pub disabled: BTreeSet<RepositoryId>,
     /// Pull requests currently waiting on the user's review.
@@ -51,6 +53,7 @@ impl Default for Store {
     fn default() -> Self {
         Self {
             roots: Vec::new(),
+            discovered: Vec::new(),
             disabled: BTreeSet::new(),
             pending: Vec::new(),
             poll_minutes: 2,
@@ -418,6 +421,18 @@ impl Store {
             snoozes_changed,
             notifications_changed,
         }
+    }
+
+    /// Drop reviews and snoozes for repos no longer watched, even when GitHub
+    /// cannot be reached. Local discovery alone never produces fresh requests.
+    pub fn retain_watched(&mut self, watched: &HashSet<RepositoryId>) -> Reconciled {
+        let retained = self
+            .pending
+            .iter()
+            .filter(|pr| watched.contains(&pr.repository()))
+            .cloned()
+            .collect();
+        self.reconcile(retained)
     }
 
     /// Add confirmed requests even from incomplete checks. Only complete
@@ -952,6 +967,164 @@ mod tests {
         assert_eq!(order, vec![3, 1, 2]);
         let fresh: Vec<u64> = reconciled.fresh.iter().map(|pr| pr.number).collect();
         assert_eq!(fresh, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn discovery_cache_is_compatible_with_old_state_and_preserves_toggles() {
+        use crate::discovery::{LocalRepo, discover};
+        let old = r#"{"roots":["/missing/watched"],"disabled":["owner/repo"],"poll_minutes":10,"snooze_minutes":15}"#;
+        let mut store: Store = serde_json::from_str(old).unwrap();
+        assert!(store.discovered.is_empty());
+        assert_eq!(store.poll_minutes, 10);
+        assert_eq!(store.snooze_minutes, 15);
+        store.discovered.push(LocalRepo {
+            id: RepositoryId::new("github.com", "Owner/Repo"),
+            paths: vec!["/missing/watched/clone".into()],
+        });
+        store.notifications_muted = true;
+        store.notify_drafts = false;
+        store.pending = vec![pr("Owner/Repo", 1, Some(T1))];
+        store.queue_notifications(&store.pending.clone());
+        let saved = serde_json::to_string(&store).unwrap();
+        let restored: Store = serde_json::from_str(&saved).unwrap();
+        let mut incompatible = serde_json::to_value(&restored).unwrap();
+        incompatible["appearance"] = serde_json::json!({"unsupported": true});
+        let restored: Store = serde_json::from_value(incompatible).unwrap();
+        assert_eq!(restored.discovered, store.discovered);
+        let mut scan = discover(&restored.roots, &[default_host()]);
+        scan.retain_unavailable(&restored.discovered);
+        assert_eq!(scan.repos, store.discovered);
+        assert!(!restored.is_enabled(&scan.repos[0].id));
+        assert_eq!(restored.disabled, store.disabled);
+        assert!(restored.notifications_muted);
+        assert!(!restored.notify_drafts);
+        assert_eq!(restored.notification_queue, store.notification_queue);
+    }
+
+    #[test]
+    fn legacy_discovery_cache_migrates_without_colliding_with_enterprise() {
+        use crate::discovery::discover;
+        let legacy = r#"{
+            "roots":["/missing/watched"], "disabled":["Owner/Repo"],
+            "discovered":[
+                {"slug":"Owner/Repo","paths":["/missing/watched/public"]},
+                {"id":"github.example.com/owner/repo","paths":["/missing/watched/server"]}
+            ]
+        }"#;
+        let store: Store = serde_json::from_str(legacy).unwrap();
+        let public = RepositoryId::new("github.com", "owner/repo");
+        let server = RepositoryId::new("github.example.com", "owner/repo");
+        assert_eq!(store.discovered[0].id, public);
+        assert_eq!(store.discovered[1].id, server);
+        assert!(!store.is_enabled(&public));
+        assert!(store.is_enabled(&server));
+        let restored: Store = serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        assert_eq!(restored.discovered, store.discovered);
+        assert_eq!(restored.disabled, store.disabled);
+        let mut scan = discover(&restored.roots, &[default_host(), server.host]);
+        scan.retain_unavailable(&restored.discovered);
+        assert_eq!(scan.repos.len(), 2);
+        assert!(scan.repos.iter().all(|repo| repo.paths.len() == 1));
+        assert_ne!(scan.repos[0].id, scan.repos[1].id);
+    }
+
+    #[test]
+    fn local_scan_prunes_only_the_vanished_host_for_matching_reviews() {
+        let public = pr("owner/repo", 7, Some(T1));
+        let public_awake = pr("owner/repo", 8, Some(T1));
+        let server = PendingReview {
+            host: "github.example.com".into(),
+            ..public.clone()
+        };
+        let server_awake = PendingReview {
+            host: server.host.clone(),
+            ..public_awake.clone()
+        };
+        let mut store = Store::default();
+        store.reconcile(vec![
+            public.clone(),
+            public_awake,
+            server.clone(),
+            server_awake.clone(),
+        ]);
+        store.snooze(&public.key(), 5, 0);
+        store.snooze(&server.key(), 120, 0);
+        let deadline = store.snooze_for(&server).unwrap().clone();
+        let notice = store
+            .notification_queue
+            .iter()
+            .find(|notice| notice.matches(&server_awake))
+            .unwrap()
+            .clone();
+        let result = store.retain_watched(&[server.repository()].into());
+        assert!(result.fresh.is_empty());
+        assert_eq!(store.pending, vec![server, server_awake]);
+        assert_eq!(store.snoozed, vec![deadline]);
+        assert_eq!(store.notification_queue, vec![notice]);
+        assert!(result.pending_changed && result.snoozes_changed && result.notifications_changed);
+    }
+
+    #[test]
+    fn local_scan_removes_reviews_and_snoozes_without_new_notifications() {
+        let mut store = Store {
+            pending: vec![pr("Owner/Kept", 1, Some(T1)), pr("o/removed", 2, Some(T2))],
+            snoozed: vec![
+                snooze("owner/kept", 1, Some(T1)),
+                snooze("o/removed", 2, Some(T2)),
+            ],
+            ..Store::default()
+        };
+        store.queue_notifications(&store.pending.clone());
+        let kept_notice = store.notification_queue[0].clone();
+        let watched = [RepositoryId::new("github.com", "owner/kept")].into();
+        let changed = store.retain_watched(&watched);
+        assert!(changed.fresh.is_empty());
+        assert!(changed.pending_changed);
+        assert!(changed.snoozes_changed);
+        assert!(changed.notifications_changed);
+        assert_eq!(store.pending, vec![pr("Owner/Kept", 1, Some(T1))]);
+        assert_eq!(store.snoozed, vec![snooze("owner/kept", 1, Some(T1))]);
+        assert_eq!(store.notification_queue, vec![kept_notice]);
+        let unchanged = store.retain_watched(&watched);
+        assert!(!unchanged.pending_changed);
+        assert!(!unchanged.snoozes_changed);
+        assert!(!unchanged.notifications_changed);
+    }
+
+    #[test]
+    fn local_scan_prunes_alerts_during_delivery_without_a_github_check() {
+        use crate::review_notifications::Delivery;
+        let mut store = Store::default();
+        store.reconcile(vec![pr("o/removed", 1, Some(T1))]);
+        let mut delivery = Delivery::default();
+        let validated = [default_host()].into();
+        let in_flight = delivery.begin(&store, &validated).unwrap();
+        // Another request arrived while the earlier alert was sending.
+        store.reconcile(vec![
+            pr("o/removed", 1, Some(T1)),
+            pr("o/removed", 2, Some(T2)),
+        ]);
+        let result = store.retain_watched(&Default::default());
+        assert!(result.notifications_changed);
+        let mut restored: Store =
+            serde_json::from_str(&serde_json::to_string(&store).unwrap()).unwrap();
+        assert!(restored.notification_queue.is_empty());
+        // Late OS acceptance must not send the removed repository's next alert.
+        assert!(
+            delivery
+                .complete(&mut restored, &in_flight, true, &validated)
+                .is_none()
+        );
+        assert!(delivery.begin(&restored, &validated).is_none());
+
+        // Also report a queue-only cleanup so discovery saves stale cached
+        // notices even when pending reviews and snoozes were already empty.
+        restored.queue_notifications(&[pr("o/removed", 3, Some(T2))]);
+        let result = restored.retain_watched(&Default::default());
+        assert!(result.notifications_changed);
+        assert!(!result.pending_changed);
+        assert!(!result.snoozes_changed);
+        assert!(restored.notification_queue.is_empty());
     }
 
     #[test]

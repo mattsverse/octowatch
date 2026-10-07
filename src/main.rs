@@ -2,6 +2,7 @@ mod discovery;
 mod github;
 mod health;
 mod notifications;
+mod refresh_queue;
 mod repository;
 mod review_filter;
 mod review_notifications;
@@ -81,7 +82,7 @@ struct Octowatcher {
     repos: Option<Vec<LocalRepo>>,
     tab: Tab,
     health: SyncHealth,
-    folder_issues: Vec<String>,
+    scan_issues: Vec<discovery::ScanIssue>,
     load_warning: Option<String>,
     permission: notifications::Permission,
     review_filters: ReviewFilters,
@@ -119,9 +120,8 @@ struct Octowatcher {
     tray: Option<Tray>,
     update: Option<Update>,
     scan_task: Option<Task<()>>,
+    refresh_queue: refresh_queue::RefreshQueue,
     fetch_task: Option<Task<()>>,
-    /// Coalesces refreshes requested while a GitHub check is already running.
-    refresh_pending: bool,
     poll_task: Option<Task<()>>,
     /// Fires when the earliest snooze runs out.
     wake_task: Option<Task<()>>,
@@ -132,6 +132,12 @@ struct Octowatcher {
     _startup_and_updates: Task<()>,
     /// Reattached when a closed window is opened again.
     appearance_subscription: Option<Subscription>,
+}
+
+struct DiscoveryChanges {
+    cache_changed: bool,
+    reviews: store::Reconciled,
+    start_fetch: bool,
 }
 
 impl Octowatcher {
@@ -230,7 +236,7 @@ impl Octowatcher {
             repos: None,
             tab: Tab::Reviews,
             health: SyncHealth::default(),
-            folder_issues: Vec::new(),
+            scan_issues: Vec::new(),
             load_warning,
             permission: notifications::Permission::default(),
             review_filters: ReviewFilters::default(),
@@ -262,8 +268,8 @@ impl Octowatcher {
             tray,
             update: None,
             scan_task: None,
+            refresh_queue: refresh_queue::RefreshQueue::default(),
             fetch_task: None,
-            refresh_pending: false,
             poll_task: None,
             wake_task: None,
             update_check: None,
@@ -400,32 +406,48 @@ impl Octowatcher {
         woken
     }
 
-    /// Rediscovers local clones, then checks GitHub again.
+    /// Rediscovers local checkouts off the UI thread, then checks GitHub.
+    /// Requests received during a scan coalesce into one follow-up snapshot.
     fn rescan(&mut self, cx: &mut Context<Self>) {
+        if !self.refresh_queue.request_scan(self.scan_task.is_some()) {
+            return;
+        }
         self.health.verified = false;
         let roots = self.store.roots.clone();
+        let previous = self.store.discovered.clone();
         self.scan_task = Some(cx.spawn(async move |this, cx| {
+            let scan_roots = roots.clone();
             let scan = cx
                 .background_executor()
                 .spawn(async move {
-                    github::known_hosts().map(|hosts| discovery::discover(&roots, &hosts))
+                    github::known_hosts().map(|hosts| {
+                        let mut scan = discovery::discover(&scan_roots, &hosts);
+                        let previous = discovery::within_roots(&previous, &scan_roots);
+                        scan.retain_unavailable(&previous);
+                        scan
+                    })
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.scan_task = None;
-                match scan {
-                    Ok(scan) => {
-                        this.scan_error = None;
-                        this.repos = Some(scan.repos);
-                        this.folder_issues = scan.issues;
-                        // Results fetched against the old repo list are stale.
-                        this.fetch_task = None;
-                        this.refresh(cx);
+                if this.refresh_queue.scan_finished(roots != this.store.roots) {
+                    this.rescan(cx);
+                    return;
+                }
+                if let Some(changes) = this.apply_discovery(scan) {
+                    if changes.reviews.snoozes_changed {
+                        this.snoozes_changed(cx);
+                    } else if changes.cache_changed
+                        || changes.reviews.pending_changed
+                        || changes.reviews.notifications_changed
+                    {
+                        this.save();
+                        this.sync_tray();
                     }
-                    Err(err) => {
-                        this.health.readiness = github::classify_failure(&err);
-                        this.health.hosts.clear();
-                        this.scan_error = Some(format!("{err:#}"));
+                    // A later scan queues a fresh check for its current hosts.
+                    // Do not cancel and overlap synchronous gh subprocesses.
+                    if changes.start_fetch {
+                        this.fetch_reviews(cx);
                     }
                 }
                 cx.notify();
@@ -436,12 +458,59 @@ impl Octowatcher {
         cx.notify();
     }
 
+    /// Apply discovery independently of UI/save/fetch side effects. Failed host
+    /// lookup keeps the known snapshot, still respecting explicitly removed roots.
+    fn apply_discovery(
+        &mut self,
+        result: anyhow::Result<discovery::ScanResult>,
+    ) -> Option<DiscoveryChanges> {
+        let repos = match result {
+            Ok(scan) => {
+                self.scan_error = None;
+                self.scan_issues = scan.issues;
+                scan.repos
+            }
+            Err(err) => {
+                self.health.readiness = github::classify_failure(&err);
+                self.health.hosts.clear();
+                self.health.verified = false;
+                self.scan_error = Some(format!("{err:#}"));
+                self.scan_issues.clear();
+                // Legacy state has no discovery snapshot yet. Unknown local
+                // membership must not erase its saved reviews and snoozes.
+                if self.repos.is_none() && self.store.discovered.is_empty() {
+                    return None;
+                }
+                discovery::within_roots(&self.store.discovered, &self.store.roots)
+            }
+        };
+        let cache_changed = self.store.discovered != repos;
+        self.store.discovered = repos.clone();
+        self.repos = Some(repos);
+        let reviews = self.store.retain_watched(&self.watched_repositories());
+        if reviews.pending_changed {
+            self.review_filter_cache.invalidate_reviews();
+        }
+        if reviews.snoozes_changed {
+            self.review_filter_cache.invalidate_snoozes();
+        }
+        self.dismiss_stale_snooze_picker();
+        Some(DiscoveryChanges {
+            cache_changed,
+            reviews,
+            // Even a failed host lookup leaves a known, root-filtered snapshot.
+            // Replace any result discarded during scanning and keep cached hosts
+            // refreshing while discovery is unavailable.
+            start_fetch: self.refresh_queue.request_fetch(self.fetch_task.is_some()),
+        })
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.check_permission(cx);
-        if self.scan_task.is_none() && (self.repos.is_none() || self.scan_error.is_some()) {
-            self.rescan(cx);
-            return;
-        }
+        self.rescan(cx);
+    }
+
+    fn fetch_reviews(&mut self, cx: &mut Context<Self>) {
         self.refresh_with(
             |watched| async move { github::fetch_awaiting_reviews(&watched) },
             cx,
@@ -453,19 +522,28 @@ impl Octowatcher {
         F: Fn(HashSet<RepositoryId>) -> Fut + Clone + Send + 'static,
         Fut: Future<Output = anyhow::Result<github::FetchedReviews>> + Send + 'static,
     {
-        if self.repos.is_none() || self.scan_task.is_some() {
+        // Scope the API request to enabled local repos after discovery finishes.
+        if self.repos.is_none() || !self.refresh_queue.request_fetch(self.fetch_task.is_some()) {
             return;
         }
-        if self.fetch_task.is_some() {
-            self.refresh_pending = true;
-            return;
-        }
-        self.refresh_pending = false;
         let watched = self.watched_repositories();
         self.fetch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx.background_executor().spawn(fetch(watched)).await;
             this.update(cx, |this, cx| {
                 this.fetch_task = None;
+                let fetch_again = this.refresh_queue.fetch_finished(this.scan_task.is_some());
+                if fetch_again {
+                    // Discard the older result, including errors. This requested
+                    // check must run after it, without overlapping subprocesses.
+                    this.refresh_with(fetch.clone(), cx);
+                    return;
+                }
+                // A scan in progress may invalidate the filtering list. Its
+                // completion starts a fresh fetch; do not announce stale repos.
+                if this.scan_task.is_some() {
+                    cx.notify();
+                    return;
+                }
                 match result {
                     Ok(fetched) => {
                         let changed = this.health.apply_hosts(
@@ -489,9 +567,6 @@ impl Octowatcher {
                 this.save();
                 this.sync_tray();
                 cx.notify();
-                if std::mem::take(&mut this.refresh_pending) {
-                    this.refresh_with(fetch.clone(), cx);
-                }
             })
             .ok();
         }));
@@ -1107,7 +1182,7 @@ impl Octowatcher {
             (self.repos.is_none() && self.scan_error.is_none()) || self.scan_task.is_some(),
             self.fetch_task.is_some(),
             self.watched_repositories().len(),
-            !self.folder_issues.is_empty() || self.scan_error.is_some(),
+            !self.scan_issues.is_empty() || self.scan_error.is_some(),
         )
     }
 }
@@ -1294,10 +1369,10 @@ impl Octowatcher {
             "Scanning watched folders…".into()
         } else if self.store.roots.is_empty() {
             "No watched folders. Add a folder containing GitHub clones.".into()
-        } else if !self.folder_issues.is_empty() {
+        } else if !self.scan_issues.is_empty() {
             format!(
                 "Folder scan incomplete: {} issue(s). Fix the paths or access permissions, then Rescan.",
-                self.folder_issues.len()
+                self.scan_issues.len()
             )
         } else if self.repos.as_ref().is_some_and(Vec::is_empty) {
             "No GitHub clones found. Add a project folder or clone a repository there, then Rescan."
@@ -1351,7 +1426,7 @@ impl Octowatcher {
                 .child(button("health-test-notification", "Send test notification", theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send_test_notification(cx)))))
             .child(health_row("Review sync", format!("{} · {sync}", self.last_sync_text()), theme))
             .child(button("health-refresh", "Refresh", theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))))
-            .children(self.errors().into_iter().chain(self.folder_issues.iter().map(String::as_str)).map(|error| div().text_xs().text_color(rgb(theme.error)).child(error.to_string())))
+            .children(self.errors().into_iter().map(str::to_string).chain(self.scan_issues.iter().map(|issue| format!("{}: {}", issue.path.display(), issue.message))).map(|error| div().text_xs().text_color(rgb(theme.error)).child(error)))
     }
 
     fn render_header(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1434,6 +1509,14 @@ impl Octowatcher {
                     "{} issue(s) need attention — see Setup & health",
                     self.errors().len()
                 )))
+            })
+            .when(!self.scan_issues.is_empty(), |s| {
+                s.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(theme.warning))
+                        .child("Some folders could not be scanned. See Repositories for details."),
+                )
             })
             .children(self.render_update(theme, cx))
             .child(
@@ -2146,6 +2229,14 @@ impl Octowatcher {
                     ),
             );
 
+        let roots = roots.children(self.scan_issues.iter().map(|issue| {
+            div().text_xs().text_color(rgb(theme.warning)).child(format!(
+                "{}: {}. Previously found repositories are retained; retrying on the next check.",
+                display_path(&issue.path),
+                issue.message
+            ))
+        }));
+
         let repos = self.repos.as_deref().unwrap_or_default();
         let list = div()
             .flex()
@@ -2713,7 +2804,7 @@ mod review_view_tests {
                 verified: true,
                 ..SyncHealth::default()
             },
-            folder_issues: Vec::new(),
+            scan_issues: Vec::new(),
             load_warning: None,
             permission: notifications::Permission::Allowed("Allowed".into()),
             notifications_ready: true,
@@ -2732,8 +2823,8 @@ mod review_view_tests {
             tray: None,
             update: None,
             scan_task: None,
+            refresh_queue: refresh_queue::RefreshQueue::default(),
             fetch_task: None,
-            refresh_pending: false,
             poll_task: None,
             wake_task: None,
             update_check: None,
@@ -2821,6 +2912,41 @@ mod review_view_tests {
         cx.simulate_keystrokes("enter");
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_filters, ReviewFilters::default())
+        });
+    }
+
+    #[gpui::test]
+    fn discovery_pruning_updates_filtered_rows_without_resetting_view_choices(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, visual) = cx.add_window_view(|_, cx| {
+            let mut app = fixture(cx, 10);
+            app.store.snooze(&app.store.pending[7].key(), 120, 0);
+            app.review_filters.query = "#3".into();
+            app.review_filters.repository = Some(app.store.pending[7].repository());
+            app.review_filters.snooze = SnoozeFilter::Snoozed;
+            app
+        });
+        visual.simulate_resize(size(px(560.), px(680.)));
+        view.read_with(visual, |app, _| {
+            assert_eq!(app.review_scroll.item_count(), 1);
+            assert!(app.review_filter_passes > 0);
+        });
+        let filters = view.read_with(visual, |app, _| app.review_filters.clone());
+        view.update(visual, |app, cx| {
+            let changes = app
+                .apply_discovery(Ok(discovery::ScanResult::default()))
+                .unwrap();
+            assert!(changes.reviews.pending_changed && changes.reviews.snoozes_changed);
+            cx.notify();
+        });
+        visual.run_until_parked();
+        view.read_with(visual, |app, _| {
+            assert_eq!(app.review_scroll.item_count(), 0);
+            assert!(app.review_filter_cache.visible_indices().is_empty());
+            assert_eq!(app.review_filters, filters);
+            assert!(app.store.pending.is_empty());
+            assert!(app.store.snoozed.is_empty());
         });
     }
 
@@ -3708,7 +3834,7 @@ mod snooze_tests {
             let (release, blocked) = async_channel::bounded::<()>(1);
             let fetch = {
                 let calls = calls.clone();
-                move |watched| {
+                move |watched: HashSet<RepositoryId>| {
                     let calls = calls.clone();
                     let blocked = blocked.clone();
                     async move {
@@ -3849,6 +3975,158 @@ mod snooze_tests {
     }
 
     #[gpui::test]
+    fn host_discovery_failure_retains_cache_but_honors_removed_roots(cx: &mut TestAppContext) {
+        let app = cx.new(app_for_picker_test);
+        app.update(cx, |app, _| {
+            app.repos = None;
+            let public = review(1);
+            let enterprise = PendingReview {
+                host: "github.example.com".into(),
+                ..public.clone()
+            };
+            app.store.pending = vec![public.clone(), enterprise.clone()];
+            app.store.roots = vec!["/missing/kept".into()];
+            app.store.discovered = vec![
+                LocalRepo {
+                    id: public.repository(),
+                    paths: vec!["/missing/removed/clone".into()],
+                },
+                LocalRepo {
+                    id: enterprise.repository(),
+                    paths: vec!["/missing/kept/clone".into()],
+                },
+            ];
+            app.store.queue_notifications(&app.store.pending.clone());
+            app.store.snooze(&enterprise.key(), 120, 0);
+            let snoozed = app.store.snoozed.clone();
+            app.snooze_picker = Some(public.key());
+            let changes = app
+                .apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
+                .unwrap();
+            assert!(changes.start_fetch);
+            assert!(changes.cache_changed);
+            assert!(changes.reviews.pending_changed && changes.reviews.notifications_changed);
+            assert_eq!(app.store.pending, vec![enterprise.clone()]);
+            assert_eq!(app.store.snoozed, snoozed);
+            assert!(app.store.notification_queue.is_empty());
+            assert_eq!(app.store.discovered[0].id, enterprise.repository());
+            assert_eq!(app.repos.as_ref().unwrap(), &app.store.discovered);
+            assert!(app.snooze_picker.is_none());
+            assert!(
+                app.scan_error
+                    .as_deref()
+                    .unwrap()
+                    .contains("host discovery failed")
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn failed_discovery_still_checks_cached_hosts_in_both_completion_orders(
+        cx: &mut TestAppContext,
+    ) {
+        use std::sync::{Arc, Mutex};
+
+        for fetch_finishes_first in [true, false] {
+            let cached = review(1).repository();
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                let mut app = app_for_picker_test(cx);
+                app.store.pending.clear();
+                app.store.last_successful_sync = None;
+                app.store.roots = vec!["/missing/watched".into()];
+                app.store.discovered = vec![LocalRepo {
+                    id: cached.clone(),
+                    paths: vec!["/missing/watched/clone".into()],
+                }];
+                app.repos = Some(app.store.discovered.clone());
+                app
+            });
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let (release, blocked) = async_channel::bounded::<()>(1);
+            let fetch = {
+                let calls = calls.clone();
+                move |watched: HashSet<RepositoryId>| {
+                    let calls = calls.clone();
+                    let blocked = blocked.clone();
+                    async move {
+                        let first = {
+                            let mut calls = calls.lock().unwrap();
+                            calls.push(watched.clone());
+                            calls.len() == 1
+                        };
+                        if first {
+                            blocked.recv().await.unwrap();
+                        }
+                        Ok(github::FetchedReviews {
+                            completed_repos: watched,
+                            readiness: [(
+                                "github.com".into(),
+                                github::Readiness::Ready("test-viewer".into()),
+                            )]
+                            .into(),
+                            successful_hosts: ["github.com".into()].into(),
+                            ..Default::default()
+                        })
+                    }
+                }
+            };
+            view.update(cx, |app, cx| {
+                app.refresh_with(fetch.clone(), cx);
+                assert!(app.refresh_queue.request_scan(false));
+                // Hold discovery open while the real fetch callback completes.
+                app.scan_task = Some(Task::ready(()));
+            });
+            cx.run_until_parked();
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            if fetch_finishes_first {
+                release.try_send(()).unwrap();
+                cx.run_until_parked();
+                assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
+                assert!(view.read_with(cx, |app, _| app.store.last_successful_sync.is_none()));
+            }
+            view.update(cx, |app, cx| {
+                app.scan_task = None;
+                assert!(!app.refresh_queue.scan_finished(false));
+                let changes = app
+                    .apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
+                    .unwrap();
+                if changes.start_fetch {
+                    app.refresh_with(fetch.clone(), cx);
+                }
+            });
+            if !fetch_finishes_first {
+                cx.run_until_parked();
+                assert_eq!(calls.lock().unwrap().len(), 1, "checks must not overlap");
+                release.try_send(()).unwrap();
+            }
+            cx.run_until_parked();
+            assert_eq!(
+                *calls.lock().unwrap(),
+                vec![HashSet::from([cached.clone()]); 2],
+                "failed scan must request a replacement check for the cached repository"
+            );
+            assert!(view.read_with(cx, |app, _| app.store.last_successful_sync.is_some()));
+            assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
+
+            // A persistent discovery error must not block the next scheduled check.
+            view.update(cx, |app, cx| {
+                assert!(app.refresh_queue.request_scan(false));
+                assert!(!app.refresh_queue.scan_finished(false));
+                let changes = app
+                    .apply_discovery(Err(anyhow::anyhow!("host discovery still failed")))
+                    .unwrap();
+                if changes.start_fetch {
+                    app.refresh_with(fetch.clone(), cx);
+                }
+            });
+            cx.run_until_parked();
+            assert_eq!(*calls.lock().unwrap(), vec![HashSet::from([cached]); 3]);
+            assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
+            assert!(view.read_with(cx, |app, _| app.scan_error.is_some()));
+        }
+    }
+
+    #[gpui::test]
     fn stale_cache_regressions_keep_tray_reviews_after_failed_startup_and_rescan(
         cx: &mut TestAppContext,
     ) {
@@ -3913,6 +4191,24 @@ mod snooze_tests {
     }
 
     #[gpui::test]
+    fn first_host_discovery_failure_preserves_legacy_reviews_and_snoozes(cx: &mut TestAppContext) {
+        let app = cx.new(app_for_picker_test);
+        app.update(cx, |app, _| {
+            app.repos = None;
+            app.store.snooze(&review(1).key(), 5, 0);
+            let pending = app.store.pending.clone();
+            let snoozed = app.store.snoozed.clone();
+            assert!(
+                app.apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
+                    .is_none()
+            );
+            assert_eq!(app.store.pending, pending);
+            assert_eq!(app.store.snoozed, snoozed);
+            assert!(app.repos.is_none());
+        });
+    }
+
+    #[gpui::test]
     fn stale_cache_regressions_permission_wait_preserves_expired_snooze(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| app_for_picker_test(cx));
         view.update(cx, |app, cx| {
@@ -3925,6 +4221,20 @@ mod snooze_tests {
             app.notifications_ready = true;
             assert_eq!(app.wake(cx), vec![review(1)]);
             assert!(app.wake(cx).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn discovery_pruning_dismisses_the_removed_review_picker(cx: &mut TestAppContext) {
+        let app = cx.new(app_for_picker_test);
+        app.update(cx, |app, _| {
+            app.snooze_picker = Some(review(1).key());
+            let changes = app
+                .apply_discovery(Ok(discovery::ScanResult::default()))
+                .unwrap();
+            assert!(changes.start_fetch);
+            assert!(changes.reviews.pending_changed);
+            assert!(app.snooze_picker.is_none());
         });
     }
 
