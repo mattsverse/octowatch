@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fs, path::PathBuf};
+use std::{
+    collections::{BTreeSet, HashMap},
+    fs,
+    path::PathBuf,
+};
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -73,6 +77,15 @@ impl Snooze {
     }
 }
 
+/// What `Store::reconcile` changed, so the caller knows which side effects to run.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Reconciled {
+    /// Reviews requested for the first time, or requested again.
+    pub fresh: Vec<PendingReview>,
+    pub pending_changed: bool,
+    pub snoozes_changed: bool,
+}
+
 impl Store {
     fn path() -> Result<PathBuf> {
         let dir = dirs::config_dir().context("no config directory on this platform")?;
@@ -120,6 +133,60 @@ impl Store {
             .cloned()
             .collect()
     }
+
+    /// Replaces the pending list with what GitHub reports now, newest first.
+    /// A PR that drops out (reviewed, request removed, closed) is gone, and
+    /// so is its snooze.
+    pub fn reconcile(&mut self, mut fetched: Vec<PendingReview>) -> Reconciled {
+        fetched.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
+
+        // A request is new when the PR wasn't listed, or when it was asked
+        // again after the request already on file.
+        let known: HashMap<_, _> = self
+            .pending
+            .iter()
+            .map(|pr| (pr.key(), pr.requested_at.clone()))
+            .collect();
+        let fresh: Vec<PendingReview> = fetched
+            .iter()
+            .filter(|pr| match known.get(&pr.key()) {
+                None => true,
+                Some(previous) => pr.requested_at > *previous,
+            })
+            .cloned()
+            .collect();
+
+        // A snooze ends when its PR leaves the list or is requested again.
+        let snoozed = self.snoozed.len();
+        self.snoozed.retain(|snooze| {
+            fetched
+                .iter()
+                .any(|pr| pr.key() == snooze.key() && pr.requested_at == snooze.requested_at)
+        });
+        let snoozes_changed = self.snoozed.len() != snoozed;
+
+        let pending_changed = fetched != self.pending;
+        self.pending = fetched;
+        Reconciled {
+            fresh,
+            pending_changed,
+            snoozes_changed,
+        }
+    }
+
+    /// Ends every snooze that ran out by `now`, and returns the pending
+    /// reviews they hid.
+    pub fn take_expired(&mut self, now: i64) -> Vec<PendingReview> {
+        let (expired, remaining): (Vec<Snooze>, Vec<Snooze>) = std::mem::take(&mut self.snoozed)
+            .into_iter()
+            .partition(|s| s.until <= now);
+        self.snoozed = remaining;
+        self.pending
+            .iter()
+            .filter(|pr| expired.iter().any(|s| s.key() == pr.key()))
+            .cloned()
+            .collect()
+    }
 }
 
 fn default_roots() -> Vec<PathBuf> {
@@ -128,4 +195,203 @@ fn default_roots() -> Vec<PathBuf> {
     };
     let dev = home.join("Dev");
     vec![if dev.is_dir() { dev } else { home }]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PendingReview, Snooze, Store};
+
+    fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
+        PendingReview {
+            repo: repo.to_string(),
+            number,
+            title: format!("PR {number}"),
+            url: format!("https://github.com/{repo}/pull/{number}"),
+            author: "someone".to_string(),
+            is_draft: false,
+            rereview: false,
+            requested_at: requested_at.map(str::to_string),
+        }
+    }
+
+    fn snooze(repo: &str, number: u64, requested_at: Option<&str>) -> Snooze {
+        Snooze {
+            repo: repo.to_string(),
+            number,
+            until: 100,
+            requested_at: requested_at.map(str::to_string),
+        }
+    }
+
+    const T1: &str = "2026-01-01T00:00:00Z";
+    const T2: &str = "2026-01-02T00:00:00Z";
+
+    /// Pins how `reconcile` behaves today. Some rows (`None` to `Some`, and
+    /// `Some` to `None`) record current behaviour, not necessarily intended.
+    #[test]
+    fn reconciles_requests_and_snoozes() {
+        struct Case {
+            name: &'static str,
+            pending: Vec<PendingReview>,
+            snoozed: Vec<Snooze>,
+            fetched: Vec<PendingReview>,
+            fresh: Vec<u64>,
+            pending_changed: bool,
+            snoozes_kept: usize,
+        }
+        let cases = [
+            Case {
+                name: "unknown key is fresh",
+                pending: vec![],
+                snoozed: vec![],
+                fetched: vec![pr("o/r", 1, Some(T1))],
+                fresh: vec![1],
+                pending_changed: true,
+                snoozes_kept: 0,
+            },
+            Case {
+                name: "later request is fresh and ends the snooze",
+                pending: vec![pr("o/r", 1, Some(T1))],
+                snoozed: vec![snooze("o/r", 1, Some(T1))],
+                fetched: vec![pr("o/r", 1, Some(T2))],
+                fresh: vec![1],
+                pending_changed: true,
+                snoozes_kept: 0,
+            },
+            Case {
+                name: "equal request is not fresh and keeps the snooze",
+                pending: vec![pr("o/r", 1, Some(T1))],
+                snoozed: vec![snooze("o/r", 1, Some(T1))],
+                fetched: vec![pr("o/r", 1, Some(T1))],
+                fresh: vec![],
+                pending_changed: false,
+                snoozes_kept: 1,
+            },
+            Case {
+                // `Option` orders `None` before `Some`.
+                name: "None to Some is fresh",
+                pending: vec![pr("o/r", 1, None)],
+                snoozed: vec![snooze("o/r", 1, None)],
+                fetched: vec![pr("o/r", 1, Some(T1))],
+                fresh: vec![1],
+                pending_changed: true,
+                snoozes_kept: 0,
+            },
+            Case {
+                // Freshness compares with `>`, the snooze retain with `==`.
+                name: "Some to None is not fresh but ends the snooze",
+                pending: vec![pr("o/r", 1, Some(T1))],
+                snoozed: vec![snooze("o/r", 1, Some(T1))],
+                fetched: vec![pr("o/r", 1, None)],
+                fresh: vec![],
+                pending_changed: true,
+                snoozes_kept: 0,
+            },
+            Case {
+                name: "PR that drops out ends its snooze",
+                pending: vec![pr("o/r", 1, Some(T1)), pr("o/r", 2, Some(T1))],
+                snoozed: vec![snooze("o/r", 1, Some(T1)), snooze("o/r", 2, Some(T1))],
+                fetched: vec![pr("o/r", 2, Some(T1))],
+                fresh: vec![],
+                pending_changed: true,
+                snoozes_kept: 1,
+            },
+            Case {
+                name: "repo case doesn't matter, keys are lowercase",
+                pending: vec![pr("owner/repo", 1, Some(T1))],
+                snoozed: vec![snooze("owner/repo", 1, Some(T1))],
+                fetched: vec![pr("Owner/Repo", 1, Some(T1))],
+                fresh: vec![],
+                pending_changed: true,
+                snoozes_kept: 1,
+            },
+            Case {
+                name: "nothing changes",
+                pending: vec![],
+                snoozed: vec![],
+                fetched: vec![],
+                fresh: vec![],
+                pending_changed: false,
+                snoozes_kept: 0,
+            },
+        ];
+        for case in cases {
+            let snoozed = case.snoozed.len();
+            let mut store = Store {
+                pending: case.pending,
+                snoozed: case.snoozed,
+                ..Store::default()
+            };
+            let reconciled = store.reconcile(case.fetched.clone());
+            let fresh: Vec<u64> = reconciled.fresh.iter().map(|pr| pr.number).collect();
+            assert_eq!(fresh, case.fresh, "{}: fresh", case.name);
+            assert_eq!(
+                reconciled.pending_changed, case.pending_changed,
+                "{}: pending_changed",
+                case.name
+            );
+            assert_eq!(
+                store.snoozed.len(),
+                case.snoozes_kept,
+                "{}: snoozes",
+                case.name
+            );
+            assert_eq!(
+                reconciled.snoozes_changed,
+                case.snoozes_kept != snoozed,
+                "{}: snoozes_changed",
+                case.name
+            );
+            assert_eq!(store.pending, case.fetched, "{}: pending", case.name);
+        }
+    }
+
+    #[test]
+    fn reconcile_sorts_newest_first() {
+        let mut store = Store::default();
+        let reconciled = store.reconcile(vec![
+            pr("o/r", 1, Some(T1)),
+            pr("o/r", 2, None),
+            pr("o/r", 3, Some(T2)),
+        ]);
+        let order: Vec<u64> = store.pending.iter().map(|pr| pr.number).collect();
+        assert_eq!(order, vec![3, 1, 2]);
+        let fresh: Vec<u64> = reconciled.fresh.iter().map(|pr| pr.number).collect();
+        assert_eq!(fresh, vec![3, 1, 2]);
+    }
+
+    #[test]
+    fn key_lowercases_repo() {
+        assert_eq!(
+            pr("Owner/Repo", 7, None).key(),
+            ("owner/repo".to_string(), 7)
+        );
+    }
+
+    #[test]
+    fn take_expired_wakes_snoozes_that_ran_out() {
+        let mut store = Store {
+            pending: vec![pr("o/r", 1, Some(T1)), pr("o/r", 2, Some(T1))],
+            snoozed: vec![
+                Snooze {
+                    until: 50,
+                    ..snooze("o/r", 1, Some(T1))
+                },
+                Snooze {
+                    until: 150,
+                    ..snooze("o/r", 2, Some(T1))
+                },
+                // A snooze whose PR is no longer pending wakes nothing.
+                Snooze {
+                    until: 50,
+                    ..snooze("o/r", 3, Some(T1))
+                },
+            ],
+            ..Store::default()
+        };
+        let woken: Vec<u64> = store.take_expired(100).iter().map(|pr| pr.number).collect();
+        assert_eq!(woken, vec![1]);
+        assert_eq!(store.snoozed.len(), 1);
+        assert_eq!(store.snoozed[0].number, 2);
+    }
 }

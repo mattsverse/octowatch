@@ -5,7 +5,7 @@ mod store;
 mod tray;
 mod updater;
 
-use std::{collections::{HashMap, HashSet}, path::PathBuf, time::Duration};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 
 use chrono::{DateTime, Local};
 use gpui::{
@@ -230,19 +230,7 @@ impl Octowatcher {
 
     /// Brings back every review whose snooze ran out, and notifies again.
     fn wake(&mut self, cx: &mut Context<Self>) {
-        let now = Local::now().timestamp();
-        let (expired, remaining): (Vec<Snooze>, Vec<Snooze>) =
-            std::mem::take(&mut self.store.snoozed)
-                .into_iter()
-                .partition(|s| s.until <= now);
-        self.store.snoozed = remaining;
-        let woken: Vec<PendingReview> = self
-            .store
-            .pending
-            .iter()
-            .filter(|pr| expired.iter().any(|s| s.key() == pr.key()))
-            .cloned()
-            .collect();
+        let woken = self.store.take_expired(Local::now().timestamp());
         self.snoozes_changed(cx);
         self.notify(woken, cx);
     }
@@ -300,48 +288,20 @@ impl Octowatcher {
     /// The first check after launch announces everything waiting instead.
     fn reconcile(&mut self, fetched: Vec<PendingReview>, cx: &mut Context<Self>) {
         let watched = self.watched_slugs();
-        let mut fetched: Vec<PendingReview> = fetched
+        let fetched: Vec<PendingReview> = fetched
             .into_iter()
             .filter(|pr| watched.contains(&pr.repo.to_lowercase()))
             .collect();
-        fetched.sort_by(|a, b| b.requested_at.cmp(&a.requested_at));
-
-        // A request is new when the PR wasn't listed, or when it was asked
-        // again after the request already on file.
-        let known: HashMap<_, _> = self
-            .store
-            .pending
-            .iter()
-            .map(|pr| (pr.key(), pr.requested_at.clone()))
-            .collect();
-        let fresh: Vec<PendingReview> = fetched
-            .iter()
-            .filter(|pr| match known.get(&pr.key()) {
-                None => true,
-                Some(previous) => pr.requested_at > *previous,
-            })
-            .cloned()
-            .collect();
-
-        // A snooze ends when its PR leaves the list or is requested again.
-        let snoozed = self.store.snoozed.len();
-        self.store.snoozed.retain(|snooze| {
-            fetched
-                .iter()
-                .any(|pr| pr.key() == snooze.key() && pr.requested_at == snooze.requested_at)
-        });
-        let snoozes_changed = self.store.snoozed.len() != snoozed;
-
-        if fetched != self.store.pending {
-            self.store.pending = fetched;
+        let reconciled = self.store.reconcile(fetched);
+        // Saving the snoozes also saves the pending list.
+        if reconciled.snoozes_changed {
+            self.snoozes_changed(cx);
+        } else if reconciled.pending_changed {
             self.save();
             self.sync_tray();
         }
-        if snoozes_changed {
-            self.snoozes_changed(cx);
-        }
         if self.announced_launch {
-            self.notify(fresh, cx);
+            self.notify(reconciled.fresh, cx);
         } else {
             self.announced_launch = true;
             self.announce_waiting(cx);

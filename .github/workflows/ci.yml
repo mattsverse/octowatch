@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Linux only: the macOS runner is the expensive part of CI, and the tests
+  # don't touch platform code.
+  test:
+    runs-on: blacksmith-4vcpu-ubuntu-2204
+    steps:
+      - uses: actions/checkout@v7
+        # cargo test runs dependency build scripts; keep the token out of reach.
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-linux
+      - run: cargo test --locked
