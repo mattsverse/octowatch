@@ -594,6 +594,8 @@ fn host_authentication_and_schema_failures_preserve_other_repositories() {
         assert!(fetched.errors[0].contains(&failed.host));
         let cached = PendingReview {
             host: failed.host.clone(),
+            account: "me".into(),
+            account_id: 0,
             repo: "o/r".into(),
             number: 1,
             title: "Cached".into(),
@@ -605,6 +607,7 @@ fn host_authentication_and_schema_failures_preserve_other_repositories() {
         };
         let mut store = crate::store::Store {
             pending: vec![cached.clone()],
+            local_repos: [failed.store_key()].into(),
             ..Default::default()
         };
         store.snooze(&cached.key(), 5, 0);
@@ -719,6 +722,8 @@ fn unreadable_team_does_not_hide_a_confirmed_direct_request() {
     saved.number = 2;
     let mut store = crate::store::Store {
         pending: vec![saved.clone()],
+        available_accounts: ["me".into()].into(),
+        local_repos: ["o/r".into()].into(),
         ..Default::default()
     };
     assert!(store.snooze(&saved.key(), 60, 1_000));
@@ -992,6 +997,8 @@ fn account_change_on_a_history_page_discards_host_results_and_old_account_cache(
     store.activate_host_account(PUBLIC_HOST, "me");
     store.pending = vec![PendingReview {
         host: PUBLIC_HOST.into(),
+        account: "me".into(),
+        account_id: 1,
         repo: "o/r".into(),
         number: 1,
         title: "Old account".into(),
@@ -1039,6 +1046,8 @@ fn request_beyond_twenty_events_ends_old_snooze_and_queues_one_fresh_alert() {
     store.activate_host_account(PUBLIC_HOST, "me");
     let old = PendingReview {
         host: PUBLIC_HOST.into(),
+        account: "me".into(),
+        account_id: 1,
         repo: "o/r".into(),
         number: 1,
         title: "Review 1".into(),
@@ -1048,7 +1057,9 @@ fn request_beyond_twenty_events_ends_old_snooze_and_queues_one_fresh_alert() {
         rereview: false,
         requested_at: Some(T1.into()),
     };
-    store.reconcile(vec![old.clone()]);
+    store.local_repos.insert("o/r".into());
+    store.available_accounts.insert("me".into());
+    store.reconcile(vec![old.clone()], &BTreeMap::from([("me".into(), 1)]));
     store.mark_delivered(&store.notification_queue.clone());
     store.snooze(&old.key(), 30, 1_000);
     let fetched = fetch_repositories_with(&watched, |args| {
@@ -1074,7 +1085,16 @@ fn request_beyond_twenty_events_ends_old_snooze_and_queues_one_fresh_alert() {
     })
     .unwrap();
     assert!(fetched.errors.is_empty());
-    let changed = store.reconcile_repositories(fetched.pending, &fetched.completed_repos, &watched);
+    let pending = fetched
+        .pending
+        .into_iter()
+        .map(|mut pr| {
+            pr.account = "me".into();
+            pr.account_id = 1;
+            pr
+        })
+        .collect();
+    let changed = store.reconcile_repositories(pending, &fetched.completed_repos, &watched);
     assert_eq!(changed.fresh.len(), 1);
     assert!(store.snoozed.is_empty());
     assert_eq!(store.notifications_due().len(), 1);

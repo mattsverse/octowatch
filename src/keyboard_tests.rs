@@ -6,6 +6,8 @@ use gpui::{Modifiers, TestAppContext, VisualTestContext};
 fn review(number: u64) -> PendingReview {
     PendingReview {
         host: repository::default_host(),
+        account: "alice".into(),
+        account_id: 1,
         repo: "owner/repo".into(),
         number,
         title: format!("Review number {number}"),
@@ -28,11 +30,11 @@ fn fixture(window: &mut Window, cx: &mut Context<Octowatcher>) -> Octowatcher {
         id: RepositoryId::new("github.com", "owner/repo"),
         paths: vec!["/test/repo".into()],
     }]);
-    view.announced_hosts.insert(repository::default_host());
-    // Keep discovery and fetching occupied so repository activation coalesces
-    // work without starting native filesystem or network activity.
-    view.scan_task = Some(Task::ready(()));
+    view.announced_launch = true;
+    view.store.local_repos.insert("owner/repo".into());
+    // Occupied to prevent the enable-repository test from starting a fetch.
     view.fetch_task = Some(Task::ready(()));
+    view.scan_task = Some(Task::ready(()));
     view
 }
 
@@ -58,8 +60,8 @@ fn press(cx: &mut VisualTestContext, keys: &str) {
     }
 }
 
-fn key(number: u64) -> (RepositoryId, u64) {
-    (RepositoryId::new("github.com", "owner/repo"), number)
+fn key(number: u64) -> ReviewKey {
+    (1, "owner/repo".into(), number)
 }
 
 #[gpui::test]
@@ -185,6 +187,9 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
     let enterprise_key = enterprise.key();
     view.update(cx, |view, cx| {
         view.store.pending = vec![public.clone(), enterprise.clone()];
+        view.store
+            .local_repos
+            .insert(enterprise.repository().store_key());
         view.repos = Some(vec![
             LocalRepo {
                 id: public.repository(),
@@ -331,11 +336,14 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
     press(cx, "tab");
     assert_eq!(focused(&view, cx), Some(Control::AddRoot));
     press(cx, "tab tab");
-    assert_eq!(focused(&view, cx), Some(Control::Repository(key(1).0)));
+    assert_eq!(
+        focused(&view, cx),
+        Some(Control::Repository(review(1).repository()))
+    );
     press(cx, "space");
-    cx.update(|_, cx| assert!(!view.read(cx).store.is_enabled(&key(1).0)));
+    cx.update(|_, cx| assert!(!view.read(cx).store.is_enabled(&key(1).1)));
     press(cx, "enter");
-    cx.update(|_, cx| assert!(view.read(cx).store.is_enabled(&key(1).0)));
+    cx.update(|_, cx| assert!(view.read(cx).store.is_enabled(&key(1).1)));
     focus(&view, Control::Tab(Tab::Settings), cx);
     press(cx, "space");
     let health = view.read_with(cx, |view, _| view.health_controls());
@@ -819,5 +827,105 @@ fn first_run_health_actions_scroll_into_view_and_keep_reset_reachable(cx: &mut T
     });
     press(cx, "enter");
     assert_eq!(focused(&view, cx), Some(Control::Search));
+    assert_eq!(cx.opened_url(), None);
+}
+
+#[gpui::test]
+fn matching_requests_for_two_accounts_keep_independent_keyboard_actions(cx: &mut TestAppContext) {
+    let (view, cx) = cx.add_window_view(fixture);
+    let alice = review(1);
+    let bob = PendingReview {
+        account: "bob".into(),
+        account_id: 2,
+        ..alice.clone()
+    };
+    view.update(cx, |view, cx| {
+        view.store.record_account("alice", 1);
+        view.store.record_account("bob", 2);
+        view.store.available_accounts.insert("bob".into());
+        view.store.pending = vec![alice.clone(), bob.clone()];
+        view.review_filter_cache.invalidate_reviews();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    focus(&view, Control::Review(alice.key()), cx);
+    press(cx, "down");
+    assert_eq!(focused(&view, cx), Some(Control::Review(bob.key())));
+    press(cx, "tab enter tab space");
+    view.read_with(cx, |view, _| {
+        assert!(view.store.snooze_for(&bob).is_some());
+        assert!(view.store.snooze_for(&alice).is_none());
+    });
+    assert_eq!(cx.opened_url(), None);
+    view.update(cx, |view, cx| {
+        view.store.pending.reverse();
+        view.review_filter_cache.invalidate_reviews();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert_eq!(focused(&view, cx), Some(Control::Snooze(bob.key())));
+}
+
+#[gpui::test]
+fn keyboard_account_controls_retain_cache_and_do_not_toggle_the_repository(
+    cx: &mut TestAppContext,
+) {
+    let (view, cx) = cx.add_window_view(fixture);
+    view.update(cx, |view, cx| {
+        view.store.record_account("alice", 1);
+        view.store.record_account("bob", 2);
+        view.store.available_accounts.insert("bob".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    focus(&view, Control::Tab(Tab::Settings), cx);
+    press(cx, "enter");
+    let health = view.read_with(cx, |view, _| view.health_controls());
+    for control in health {
+        press(cx, "tab");
+        assert_eq!(focused(&view, cx), Some(control));
+    }
+    press(cx, "tab");
+    assert_eq!(focused(&view, cx), Some(Control::Account("alice".into())));
+    press(cx, "space");
+    view.read_with(cx, |view, _| {
+        assert!(!view.store.account_enabled("alice"));
+        assert!(view.store.account_enabled("bob"));
+        assert_eq!(view.store.pending.len(), 2);
+        assert!(view.store.awake().is_empty());
+    });
+    press(cx, "enter");
+    focus(&view, Control::Tab(Tab::Repositories), cx);
+    press(cx, "enter");
+    focus(
+        &view,
+        Control::RepositoryAccount("owner/repo".into(), "alice".into()),
+        cx,
+    );
+    press(cx, "space");
+    view.read_with(cx, |view, _| {
+        assert!(view.store.is_enabled("owner/repo"));
+        assert!(!view.store.repo_account_selected("owner/repo", "alice"));
+        assert!(view.store.repo_account_selected("owner/repo", "bob"));
+        assert_eq!(view.store.pending.len(), 2);
+    });
+    focus(
+        &view,
+        Control::AllRepositoryAccounts("owner/repo".into()),
+        cx,
+    );
+    press(cx, "enter");
+    view.read_with(cx, |view, _| {
+        assert!(view.store.all_repo_accounts("owner/repo"));
+        assert_eq!(view.store.pending.len(), 2);
+        // Re-enabling an account waits for a successful check before showing it.
+        assert!(view.store.awake().is_empty());
+    });
+    view.update(cx, |view, cx| {
+        view.store.available_accounts.insert("alice".into());
+        view.review_filter_cache.invalidate_reviews();
+        cx.notify();
+    });
+    view.read_with(cx, |view, _| assert_eq!(view.store.awake().len(), 2));
     assert_eq!(cx.opened_url(), None);
 }

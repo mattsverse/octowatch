@@ -932,6 +932,8 @@ mod tests {
         let mut store = Store {
             pending: vec![PendingReview {
                 host: crate::repository::default_host(),
+                account: "alice".into(),
+                account_id: 1,
                 repo: "o/r".into(),
                 number: 1,
                 title: "review".into(),
@@ -943,6 +945,8 @@ mod tests {
             }],
             snoozed: vec![Snooze {
                 host: crate::repository::default_host(),
+                account: "alice".into(),
+                account_id: 1,
                 repo: "o/r".into(),
                 number: 1,
                 until: 100,

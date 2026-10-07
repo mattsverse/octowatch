@@ -1,8 +1,8 @@
-//! Talks to GitHub through the `gh` CLI, so the user's existing login is reused
+//! Talks to GitHub through the `gh` CLI, so the user's saved accounts are reused
 //! and no token ever needs to be stored by the app.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io::{self, Read},
     os::unix::{io::AsRawFd, process::CommandExt as _},
     path::Path,
@@ -12,84 +12,12 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
-use chrono::{DateTime, SecondsFormat, Utc};
-use serde::{Deserialize, de::DeserializeOwned};
+use serde::Deserialize;
 
 use crate::{
     repository::{PUBLIC_HOST, RepositoryId, normalize_host},
-    store::PendingReview,
+    store::{PendingReview, Store},
 };
-
-// Enumerate watched repositories rather than global search: search has a
-// 1,000-result ceiling and its dashboard qualifiers need not share API behavior.
-const REPOSITORY_QUERY: &str = r#"
-query($owner: String!, $name: String!, $after: String) {
-  viewer { login }
-  repository(owner: $owner, name: $name) {
-    nameWithOwner
-    isArchived
-    pullRequests(first: 100, after: $after, states: OPEN) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        id number title url isDraft state author { login }
-        reviewRequests(first: 100) {
-          pageInfo { hasNextPage endCursor }
-          nodes { requestedReviewer { __typename ... on User { login } ... on Team { id } } }
-        }
-      }
-    }
-  }
-}
-"#;
-
-const REQUESTS_QUERY: &str = r#"
-query($id: ID!, $after: String) {
-  viewer { login }
-  node(id: $id) {
-    ... on PullRequest {
-      reviewRequests(first: 100, after: $after) {
-        pageInfo { hasNextPage endCursor }
-        nodes { requestedReviewer { __typename ... on User { login } ... on Team { id } } }
-      }
-    }
-  }
-}
-"#;
-
-const MEMBERS_QUERY: &str = r#"
-query($id: ID!, $me: String!, $after: String) {
-  viewer { login }
-  node(id: $id) {
-    ... on Team {
-      members(first: 100, after: $after, query: $me, membership: ALL) {
-        pageInfo { hasNextPage endCursor }
-        nodes { login }
-      }
-    }
-  }
-}
-"#;
-
-const HISTORY_QUERY: &str = r#"
-query($id: ID!, $after: String) {
-  viewer { login }
-  node(id: $id) {
-    ... on PullRequest {
-      timelineItems(first: 100, after: $after, itemTypes: [REVIEW_REQUESTED_EVENT, PULL_REQUEST_REVIEW]) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          __typename
-          ... on ReviewRequestedEvent {
-            createdAt
-            requestedReviewer { __typename ... on User { login } ... on Team { id } }
-          }
-          ... on PullRequestReview { submittedAt state author { login } }
-        }
-      }
-    }
-  }
-}
-"#;
 
 /// gh is the authority for configured hosts. Ask only for names, never tokens.
 /// JSON mode keeps hosts with expired credentials in the list, allowing their
@@ -159,436 +87,11 @@ pub struct Check {
     pub reviews: Result<Vec<PendingReview>>,
 }
 
-/// Confirmed requests can enter the queue even when some team lookups fail.
-/// Only complete repository snapshots may remove saved requests.
-#[derive(Default)]
-pub struct FetchedReviews {
-    pub pending: Vec<PendingReview>,
-    pub completed_repos: HashSet<RepositoryId>,
-    pub errors: Vec<String>,
-    pub readiness: BTreeMap<String, Readiness>,
-    pub successful_hosts: BTreeSet<String>,
-}
+mod queue;
+pub use queue::FetchedReviews;
 
 pub fn fetch_awaiting_reviews(repos: &HashSet<RepositoryId>) -> Result<FetchedReviews> {
-    let mut active_host = String::new();
-    let mut started = Instant::now();
-    fetch_repositories_with(repos, |args| {
-        let host = args.get(2).copied().unwrap_or(PUBLIC_HOST);
-        if active_host != host {
-            active_host = host.into();
-            started = Instant::now();
-        }
-        let remaining = CHECK_TIMEOUT.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            bail!(
-                "GitHub check timed out after 60 seconds. Cached reviews remain unverified; Refresh to retry."
-            );
-        }
-        gh_output(
-            args,
-            command_output(
-                Command::new(gh_binary()).args(args),
-                remaining.min(Duration::from_secs(30)),
-            )?,
-        )
-    })
-}
-
-fn viewer_login(host: &str, run: &mut impl FnMut(&[&str]) -> Result<String>) -> Result<String> {
-    let login = run(&["api", "--hostname", host, "user", "--jq", ".login"]).with_context(|| {
-        format!("could not read viewer; check `gh auth status --hostname {host}`")
-    })?;
-    let login = login.trim();
-    if login.is_empty() {
-        bail!("GitHub returned no account");
-    }
-    Ok(login.into())
-}
-
-fn fetch_repositories_with(
-    repos: &HashSet<RepositoryId>,
-    mut run: impl FnMut(&[&str]) -> Result<String>,
-) -> Result<FetchedReviews> {
-    let mut hosts: BTreeSet<_> = repos.iter().map(|repo| repo.host.clone()).collect();
-    // Zero repositories still needs CLI/auth setup details, but cannot establish
-    // that no reviews are waiting or advance the successful-sync timestamp.
-    if hosts.is_empty() {
-        hosts.insert(PUBLIC_HOST.into());
-    }
-    let mut fetched = FetchedReviews::default();
-    for host in hosts {
-        let me = match viewer_login(&host, &mut run) {
-            Ok(me) => me,
-            Err(err) => {
-                fetched
-                    .readiness
-                    .insert(host.clone(), classify_failure(&err));
-                fetched.errors.push(format!("{host}: {err:#}"));
-                continue;
-            }
-        };
-        let mut readiness = Readiness::Ready(me.clone());
-        let host_repos: HashSet<_> = repos
-            .iter()
-            .filter(|repo| repo.host == host)
-            .cloned()
-            .collect();
-        if host_repos.is_empty() {
-            fetched.readiness.insert(host, readiness);
-            continue;
-        }
-        let result = fetch_with(&host_repos, &me, &mut |query, variables| {
-            if readiness != Readiness::Ready(me.clone()) {
-                bail!("GitHub account changed during this check. Refresh to retry.");
-            }
-            let mut args = vec![
-                "api".to_string(),
-                "--hostname".into(),
-                host.clone(),
-                "graphql".into(),
-                "-f".into(),
-                format!("query={query}"),
-            ];
-            for (name, value) in variables {
-                args.extend(["-f".into(), format!("{name}={value}")]);
-            }
-            let output = run(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
-            let response: GraphqlResponse =
-                serde_json::from_str(&output).context("unexpected GitHub response")?;
-            let viewer = response
-                .data
-                .as_ref()
-                .and_then(|data| data.get("viewer"))
-                .and_then(|viewer| viewer.get("login"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|login| !login.is_empty());
-            if let Some(viewer) = viewer {
-                if !viewer.eq_ignore_ascii_case(&me) {
-                    readiness = Readiness::Ready(viewer.into());
-                    bail!("GitHub account changed during this check. Refresh to retry.");
-                }
-            } else if response.errors.is_empty() {
-                bail!("GitHub response omitted the active account");
-            }
-            // Permission/schema errors explain absent viewer data. A valid
-            // changed viewer still invalidates old identity even with errors.
-            Ok(output)
-        })?;
-        // Any page under another identity invalidates this entire host result.
-        if readiness == Readiness::Ready(me) {
-            if result.errors.is_empty() && result.completed_repos == host_repos {
-                fetched.successful_hosts.insert(host.clone());
-            }
-            fetched.pending.extend(result.pending);
-            fetched.completed_repos.extend(result.completed_repos);
-        }
-        fetched.errors.extend(result.errors);
-        fetched.readiness.insert(host, readiness);
-    }
-    Ok(fetched)
-}
-
-type Variables = Vec<(&'static str, String)>;
-type Api<'a> = dyn FnMut(&str, Variables) -> Result<String> + 'a;
-type Memberships = HashMap<(String, String), std::result::Result<bool, String>>;
-
-fn fetch_with(
-    repos: &HashSet<RepositoryId>,
-    me: &str,
-    api: &mut Api<'_>,
-) -> Result<FetchedReviews> {
-    let mut fetched = FetchedReviews::default();
-    // Membership can change between polls; cache it only within this poll.
-    let mut memberships = HashMap::new();
-    let mut repos: Vec<_> = repos.iter().collect();
-    repos.sort();
-    for repo in repos {
-        let mut errors = Vec::new();
-        match fetch_repo(repo, me, &mut memberships, &mut errors, api) {
-            Ok(pending) => {
-                fetched.pending.extend(pending);
-                if errors.is_empty() {
-                    fetched.completed_repos.insert(repo.clone());
-                }
-            }
-            Err(err) => errors.push(format!("{err:#}")),
-        }
-        fetched
-            .errors
-            .extend(errors.into_iter().map(|error| format!("{repo}: {error}")));
-    }
-    Ok(fetched)
-}
-
-fn fetch_repo(
-    repo: &RepositoryId,
-    me: &str,
-    memberships: &mut Memberships,
-    errors: &mut Vec<String>,
-    api: &mut Api<'_>,
-) -> Result<Vec<PendingReview>> {
-    let (owner, name) = repo
-        .slug
-        .split_once('/')
-        .context("invalid repository slug")?;
-    let variables = vec![("owner", owner.into()), ("name", name.into())];
-    let mut cursor = Cursor::default();
-    let mut pending = HashMap::new();
-    loop {
-        let data: RepositoryData = request(api, REPOSITORY_QUERY, cursor.variables(&variables))?;
-        let repository = data.repository.context("repository unavailable")?;
-        if repository.is_archived {
-            return Ok(Vec::new());
-        }
-        for mut pr in repository.pull_requests.nodes {
-            if pr.state != "OPEN"
-                || pr
-                    .author
-                    .as_ref()
-                    .is_some_and(|a| a.login.eq_ignore_ascii_case(me))
-            {
-                continue;
-            }
-            let id = vec![("id", pr.id.clone())];
-            let mut requests_cursor = Cursor::default();
-            while requests_cursor.advance(&pr.review_requests.page_info)? {
-                let data: NodeData<RequestsData> =
-                    request(api, REQUESTS_QUERY, requests_cursor.variables(&id))?;
-                let page = data
-                    .node
-                    .context("pull request unavailable")?
-                    .review_requests;
-                pr.review_requests.nodes.extend(page.nodes);
-                pr.review_requests.page_info = page.page_info;
-            }
-            let mut relevant = HashSet::new();
-            for review in &pr.review_requests.nodes {
-                let reviewer = review
-                    .requested_reviewer
-                    .as_ref()
-                    .context("requested reviewer unavailable")?;
-                match reviewer {
-                    Reviewer::User { login } if login.eq_ignore_ascii_case(me) => {
-                        relevant.insert(reviewer.key().unwrap());
-                    }
-                    Reviewer::Team { id } => {
-                        // An unreadable team does not negate a known direct or
-                        // other team request. Report uncertainty so this repo
-                        // cannot clear saved state, but keep checking known targets.
-                        match memberships
-                            .entry((repo.host.clone(), id.clone()))
-                            .or_insert_with(|| {
-                                is_member(id, me, api).map_err(|err| format!("{err:#}"))
-                            }) {
-                            Ok(true) => {
-                                relevant.insert(reviewer.key().unwrap());
-                            }
-                            Ok(false) => {}
-                            Err(err) => errors.push(format!("PR #{}: team {id}: {err}", pr.number)),
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if relevant.is_empty() {
-                continue;
-            }
-            let mut history = Vec::new();
-            let mut history_cursor = Cursor::default();
-            loop {
-                let data: NodeData<HistoryData> =
-                    request(api, HISTORY_QUERY, history_cursor.variables(&id))?;
-                let page = data
-                    .node
-                    .context("pull request unavailable")?
-                    .timeline_items;
-                history.extend(page.nodes);
-                if !history_cursor.advance(&page.page_info)? {
-                    break;
-                }
-            }
-            if let Some(review) = pr.into_pending(
-                &repo.host,
-                &repository.name_with_owner,
-                me,
-                &relevant,
-                history,
-            )? {
-                pending.insert(review.key(), review);
-            }
-        }
-        if !cursor.advance(&repository.pull_requests.page_info)? {
-            break;
-        }
-    }
-    let mut pending: Vec<_> = pending.into_values().collect();
-    pending.sort_by_key(PendingReview::key);
-    Ok(pending)
-}
-
-fn is_member(id: &str, me: &str, api: &mut Api<'_>) -> Result<bool> {
-    let variables = vec![("id", id.into()), ("me", me.into())];
-    let mut cursor = Cursor::default();
-    loop {
-        let data: NodeData<MembersData> =
-            request(api, MEMBERS_QUERY, cursor.variables(&variables))?;
-        let page = data.node.context("team membership unavailable")?.members;
-        if page
-            .nodes
-            .iter()
-            .any(|member| member.login.eq_ignore_ascii_case(me))
-        {
-            return Ok(true);
-        }
-        if !cursor.advance(&page.page_info)? {
-            return Ok(false);
-        }
-    }
-}
-
-impl Pr {
-    fn into_pending(
-        self,
-        host: &str,
-        repo: &str,
-        me: &str,
-        relevant: &HashSet<String>,
-        history: Vec<HistoryItem>,
-    ) -> Result<Option<PendingReview>> {
-        let mut requests = HashMap::new();
-        let mut last_review = None;
-        for item in history {
-            match item {
-                HistoryItem::ReviewRequestedEvent {
-                    created_at,
-                    requested_reviewer,
-                } => {
-                    if let Some(key) = requested_reviewer.and_then(|reviewer| reviewer.key())
-                        && relevant.contains(&key)
-                    {
-                        let date = timestamp(&created_at)?;
-                        let previous = requests.entry(key).or_insert(date);
-                        *previous = (*previous).max(date);
-                    }
-                }
-                HistoryItem::PullRequestReview {
-                    submitted_at,
-                    state,
-                    author,
-                } => {
-                    if state != "PENDING"
-                        && author.is_some_and(|a| a.login.eq_ignore_ascii_case(me))
-                    {
-                        let date = timestamp(
-                            &submitted_at.context("submitted review timestamp unavailable")?,
-                        )?;
-                        last_review = Some(
-                            last_review.map_or(date, |previous: DateTime<Utc>| previous.max(date)),
-                        );
-                    }
-                }
-            }
-        }
-        // Never infer completion or freshness from a truncated/inaccessible history.
-        if requests.len() != relevant.len() {
-            bail!("review request history incomplete for PR #{}", self.number);
-        }
-        let requested_at = requests
-            .into_values()
-            .max()
-            .context("no relevant request timestamp")?;
-        // A timestamp tie cannot prove that the review satisfied the latest
-        // request. Preserve the existing conservative behavior: keep it visible.
-        if last_review.is_some_and(|reviewed| reviewed > requested_at) {
-            return Ok(None);
-        }
-        Ok(Some(PendingReview {
-            host: host.into(),
-            repo: repo.into(),
-            number: self.number,
-            title: self.title,
-            url: self.url,
-            author: self
-                .author
-                .map(|a| a.login)
-                .unwrap_or_else(|| "ghost".into()),
-            is_draft: self.is_draft,
-            rereview: last_review.is_some(),
-            requested_at: Some(requested_at.to_rfc3339_opts(SecondsFormat::Secs, true)),
-        }))
-    }
-}
-
-fn timestamp(value: &str) -> Result<DateTime<Utc>> {
-    Ok(DateTime::parse_from_rfc3339(value)
-        .context("invalid GitHub timestamp")?
-        .with_timezone(&Utc))
-}
-
-// Reject GraphQL partial data even when `gh` exits successfully. Strict node
-// decoding rejects null connection entries instead of silently dropping them.
-fn request<T: DeserializeOwned>(api: &mut Api<'_>, query: &str, variables: Variables) -> Result<T> {
-    let output = api(query, variables)?;
-    let response: GraphqlResponse =
-        serde_json::from_str(&output).context("unexpected GitHub response")?;
-    if !response.errors.is_empty() {
-        bail!(
-            "GitHub GraphQL: {}",
-            response
-                .errors
-                .into_iter()
-                .map(|error| error.message)
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
-    }
-    // Read errors before decoding typed data: partial fields can be missing
-    // precisely because GitHub denied access, and the error explains why.
-    serde_json::from_value(response.data.context("GitHub returned no data")?)
-        .context("incomplete GitHub response")
-}
-
-#[derive(Default)]
-struct Cursor {
-    after: Option<String>,
-    seen: HashSet<String>,
-}
-
-impl Cursor {
-    fn variables(&self, base: &Variables) -> Variables {
-        let mut variables = base.clone();
-        if let Some(after) = &self.after {
-            variables.push(("after", after.clone()));
-        }
-        variables
-    }
-
-    fn advance(&mut self, page: &PageInfo) -> Result<bool> {
-        if !page.has_next_page {
-            return Ok(false);
-        }
-        let cursor = page
-            .end_cursor
-            .clone()
-            .filter(|cursor| !cursor.is_empty())
-            .context("missing pagination cursor")?;
-        if !self.seen.insert(cursor.clone()) {
-            bail!("GitHub pagination cursor repeated");
-        }
-        self.after = Some(cursor);
-        Ok(true)
-    }
-}
-
-pub fn gh(args: &[&str]) -> Result<String> {
-    let timeout = if args.starts_with(&["release", "download"]) {
-        Duration::from_secs(10 * 60)
-    } else {
-        Duration::from_secs(30)
-    };
-    let output = command_output(Command::new(gh_binary()).args(args), timeout)?;
-    gh_output(args, output)
+    queue::fetch_awaiting_reviews(repos)
 }
 
 /// A stalled CLI request must not prevent the remaining hosts from polling.
@@ -618,10 +121,10 @@ fn gh_output(args: &[&str], output: Output) -> Result<String> {
 fn command_output(command: &mut Command, timeout: Duration) -> Result<Output> {
     let deadline = Instant::now() + timeout;
     let mut child = command
-        .process_group(0)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_PAGER", "cat")
         .env_remove("GH_DEBUG")
+        .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -706,7 +209,525 @@ fn terminate_request(child: &mut Child) {
     child.wait().ok();
 }
 
+/// Account metadata from gh; tokens are never part of this structure.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Account {
+    pub login: String,
+    pub state: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub account_id: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct AuthStatus {
+    hosts: BTreeMap<String, Vec<Account>>,
+}
+
+pub struct AccountReviews {
+    pub account_id: u64,
+    pub pending: Vec<PendingReview>,
+    pub unavailable_repos: BTreeSet<String>,
+    pub completed_repos: BTreeSet<String>,
+}
+
+pub struct AccountCheck {
+    pub account: String,
+    pub reviews: Result<AccountReviews>,
+    /// Repository-specific failures do not block other repositories.
+    pub access_errors: Vec<(String, String)>,
+}
+
+pub struct Poll {
+    pub accounts: Vec<Account>,
+    pub checks: Vec<AccountCheck>,
+    pub access_cache: AccessCache,
+}
+
+/// Session-only positive access results. No credentials are cached.
+#[derive(Clone, Default)]
+pub struct AccessCache {
+    allowed: BTreeMap<(u64, String), Instant>,
+}
+
+const ACCESS_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+
+trait GhRunner {
+    /// `token` lives only for this invocation, never in command arguments.
+    fn run(&self, args: &[&str], token: Option<&str>) -> Result<String>;
+    fn begin_check(&self) {}
+}
+
+struct Cli(std::cell::Cell<Instant>);
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self(std::cell::Cell::new(Instant::now()))
+    }
+}
+
+impl GhRunner for Cli {
+    fn begin_check(&self) {
+        self.0.set(Instant::now());
+    }
+    fn run(&self, args: &[&str], token: Option<&str>) -> Result<String> {
+        let remaining = CHECK_TIMEOUT.saturating_sub(self.0.get().elapsed());
+        if remaining.is_zero() {
+            bail!("GitHub account check timed out after 60 seconds. Refresh to retry.");
+        }
+        run_command_with_timeout(
+            command(args, token),
+            token,
+            remaining.min(Duration::from_secs(30)),
+        )
+    }
+}
+
+fn accounts(runner: &impl GhRunner) -> Result<Vec<Account>> {
+    let output = runner.run(&["auth", "status", "--hostname", "github.com", "--json", "hosts"], None)
+        .context("Could not discover saved github.com accounts. Update gh if it lacks auth status --json.")?;
+    let status: AuthStatus =
+        serde_json::from_str(&output).context("unexpected gh account response")?;
+    let mut accounts = status.hosts.get("github.com").cloned().unwrap_or_default();
+    accounts.retain(|account| !account.login.is_empty());
+    accounts.sort_by_key(|account| account.login.to_lowercase());
+    accounts.dedup_by(|a, b| a.login.eq_ignore_ascii_case(&b.login));
+    Ok(accounts)
+}
+
+/// Identity verified through the github.com user endpoint.
+#[derive(Deserialize)]
+struct Viewer {
+    login: String,
+    id: u64,
+}
+
+struct Session {
+    token: String,
+    viewer: Viewer,
+}
+
+/// Look up an explicitly named saved credential and verify who it belongs to
+/// on every check. Neither a cached login nor gh's active account is trusted.
+fn credential(runner: &impl GhRunner, account: &str, known_id: Option<u64>) -> Result<Session> {
+    let token = runner
+        .run(
+            &[
+                "auth",
+                "token",
+                "--hostname",
+                "github.com",
+                "--user",
+                account,
+            ],
+            None,
+        )
+        .with_context(|| {
+            format!(
+                "@{account}: saved credential unavailable; run gh auth login --hostname github.com"
+            )
+        })?;
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        bail!("@{account}: gh returned no saved credential");
+    }
+    let output = runner.run(&["api", "user"], Some(&token))?;
+    let viewer: Viewer =
+        serde_json::from_str(&output).context("unexpected GitHub identity response")?;
+    if viewer.id == 0
+        || (!viewer.login.eq_ignore_ascii_case(account) && known_id != Some(viewer.id))
+    {
+        bail!("@{account}: credential identity changed; refresh gh authentication");
+    }
+    Ok(Session { token, viewer })
+}
+
+pub fn poll(repos: &[String], preferences: Store, cache: AccessCache) -> Result<Poll> {
+    poll_with(&Cli::default(), repos, preferences, cache, Instant::now())
+}
+
+fn poll_with(
+    runner: &impl GhRunner,
+    repos: &[String],
+    mut preferences: Store,
+    mut cache: AccessCache,
+    now: Instant,
+) -> Result<Poll> {
+    let mut accounts = accounts(runner)?;
+    cache.allowed.retain(|_, expires| *expires > now);
+    let mut checks = Vec::new();
+    let mut checked_ids = BTreeSet::new();
+    for account in &mut accounts {
+        runner.begin_check();
+        // Verify disabled identities too, so renames cannot re-enable them.
+        let identity = if account.state != "success" {
+            Err(anyhow::anyhow!(
+                "@{}: authentication unavailable ({}); check gh auth status --hostname github.com and sign in again",
+                account.login,
+                account.state
+            ))
+        } else {
+            credential(
+                runner,
+                &account.login,
+                preferences
+                    .account_ids
+                    .get(&account.login.to_lowercase())
+                    .copied(),
+            )
+        };
+        let session = match identity {
+            Ok(session) => session,
+            Err(err) => {
+                if let Some(id) = preferences.account_ids.get(&account.login.to_lowercase()) {
+                    cache.allowed.retain(|(account_id, _), _| account_id != id);
+                }
+                if preferences.account_enabled(&account.login) {
+                    checks.push(AccountCheck {
+                        account: account.login.clone(),
+                        reviews: Err(err),
+                        access_errors: Vec::new(),
+                    });
+                }
+                continue;
+            }
+        };
+        preferences.record_account(&session.viewer.login, session.viewer.id);
+        account.login = session.viewer.login.clone();
+        account.account_id = Some(session.viewer.id);
+        if !preferences.account_enabled(&account.login) || !checked_ids.insert(session.viewer.id) {
+            continue;
+        }
+        let mut access_errors = Vec::new();
+        let reviews = fetch_account_reviews(
+            runner,
+            &session,
+            repos,
+            &preferences,
+            &mut cache,
+            now,
+            &mut access_errors,
+        );
+        if reviews.is_err() {
+            cache.allowed.retain(|(id, _), _| *id != session.viewer.id);
+        }
+        checks.push(AccountCheck {
+            account: account.login.clone(),
+            reviews,
+            access_errors,
+        });
+    }
+    accounts.sort_by_key(|account| account.login.to_lowercase());
+    accounts.dedup_by(|a, b| a.login.eq_ignore_ascii_case(&b.login));
+    cache.allowed.retain(|(id, _), _| checked_ids.contains(id));
+    Ok(Poll {
+        accounts,
+        checks,
+        access_cache: cache,
+    })
+}
+
+fn fetch_account_reviews(
+    runner: &impl GhRunner,
+    session: &Session,
+    repos: &[String],
+    preferences: &Store,
+    cache: &mut AccessCache,
+    now: Instant,
+    access_errors: &mut Vec<(String, String)>,
+) -> Result<AccountReviews> {
+    let me = &session.viewer.login;
+    let token = session.token.as_str();
+    let watched = repos.iter().filter(|repo| preferences.monitors(me, repo));
+    let mut accessible = BTreeSet::new();
+    let mut cached_access = BTreeSet::new();
+    let mut unavailable_repos = BTreeSet::new();
+    for repo in watched {
+        let key = (session.viewer.id, repo.to_lowercase());
+        if cache
+            .allowed
+            .get(&key)
+            .is_some_and(|expires| *expires > now)
+        {
+            accessible.insert(repo.to_lowercase());
+            cached_access.insert(repo.to_lowercase());
+            continue;
+        }
+        if check_repo_access(runner, session, repo, cache, now, access_errors)? {
+            accessible.insert(repo.to_lowercase());
+        } else {
+            unavailable_repos.insert(repo.to_lowercase());
+        }
+    }
+    if accessible.is_empty() {
+        return Ok(AccountReviews {
+            account_id: session.viewer.id,
+            pending: Vec::new(),
+            unavailable_repos,
+            completed_repos: BTreeSet::new(),
+        });
+    }
+    let repositories: HashSet<_> = accessible
+        .iter()
+        .map(|repo| RepositoryId::new(PUBLIC_HOST, repo))
+        .collect();
+    let mut account_failure = None;
+    let mut identity_failed = false;
+    // Share membership results only within this verified account's current poll.
+    let result = queue::fetch_with(&repositories, me, &mut |query, variables| {
+        if identity_failed {
+            bail!("Credential identity changed during this check; Refresh to retry.");
+        }
+        let mut args = vec![
+            "api".to_string(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={query}"),
+        ];
+        for (name, value) in variables {
+            args.extend(["-f".into(), format!("{name}={value}")]);
+        }
+        let result = runner.run(
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
+            Some(token),
+        );
+        let result = result.and_then(|output| {
+            let value: serde_json::Value = serde_json::from_str(&output)?;
+            let viewer = value.pointer("/data/viewer").and_then(|viewer| {
+                Some((
+                    viewer
+                        .get("login")?
+                        .as_str()
+                        .filter(|login| !login.is_empty())?,
+                    viewer.get("databaseId")?.as_u64()?,
+                ))
+            });
+            if let Some((login, id)) = viewer {
+                if id != session.viewer.id || !login.eq_ignore_ascii_case(me) {
+                    identity_failed = true;
+                    account_failure = Some(
+                        "Credential identity changed during this check; Refresh to retry.".into(),
+                    );
+                    bail!("Credential identity changed during this check; Refresh to retry.");
+                }
+            } else if value
+                .get("errors")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(Vec::is_empty)
+            {
+                identity_failed = true;
+                account_failure =
+                    Some("GitHub response omitted the verified account; Refresh to retry.".into());
+                bail!("GitHub response omitted the verified account; Refresh to retry.");
+            }
+            Ok(output)
+        });
+        if let Err(error) = &result {
+            let message = format!("{error:#}");
+            let lower = message.to_lowercase();
+            if message.contains("HTTP 401")
+                || lower.contains("rate limit")
+                || lower.contains("connection")
+                || lower.contains("network")
+                || lower.contains("timed out")
+                || lower.contains("could not run")
+            {
+                account_failure = Some(message);
+            }
+        }
+        result
+    })?;
+    if let Some(error) = account_failure {
+        bail!("{error}");
+    }
+    let mut completed_repos: BTreeSet<_> = result
+        .completed_repos
+        .into_iter()
+        .map(|repo| repo.slug)
+        .collect();
+    for repo in accessible.difference(&completed_repos) {
+        cache.allowed.remove(&(session.viewer.id, repo.clone()));
+        unavailable_repos.insert(repo.clone());
+    }
+    for error in result.errors {
+        let repo = repositories
+            .iter()
+            .find(|repo| error.starts_with(&format!("{repo}: ")))
+            .map(|repo| repo.slug.clone())
+            .unwrap_or_else(|| "unknown repository".into());
+        access_errors.push((
+            repo,
+            format!("@{me}: {error}. Unconfirmed cache and snoozes are retained."),
+        ));
+    }
+    let pending: Vec<_> = result
+        .pending
+        .into_iter()
+        .map(|mut pr| {
+            pr.account_id = session.viewer.id;
+            pr.account = me.clone();
+            pr
+        })
+        .collect();
+    // Before removing a saved request after a cached access result,
+    // verify the repository again; incomplete snapshots cannot remove state.
+    let missing_repos: BTreeSet<_> = preferences
+        .pending
+        .iter()
+        .filter(|old| {
+            old.account_id == session.viewer.id
+                && cached_access.contains(&old.repo.to_lowercase())
+                && completed_repos.contains(&old.repo.to_lowercase())
+                && !pending.iter().any(|pr| pr.key() == old.key())
+        })
+        .map(|pr| pr.repo.to_lowercase())
+        .collect();
+    for repo in missing_repos {
+        if !check_repo_access(runner, session, &repo, cache, now, access_errors)? {
+            accessible.remove(&repo);
+            completed_repos.remove(&repo);
+            unavailable_repos.insert(repo);
+        }
+    }
+    Ok(AccountReviews {
+        account_id: session.viewer.id,
+        pending: pending
+            .into_iter()
+            .filter(|pr| accessible.contains(&pr.repo.to_lowercase()))
+            .collect(),
+        unavailable_repos,
+        completed_repos,
+    })
+}
+
+fn check_repo_access(
+    runner: &impl GhRunner,
+    session: &Session,
+    repo: &str,
+    cache: &mut AccessCache,
+    now: Instant,
+    access_errors: &mut Vec<(String, String)>,
+) -> Result<bool> {
+    let key = (session.viewer.id, repo.to_lowercase());
+    match runner.run(
+        &["api", &format!("repos/{repo}"), "--jq", ".full_name"],
+        Some(&session.token),
+    ) {
+        Ok(_) => {
+            cache.allowed.insert(key, now + ACCESS_CACHE_TTL);
+            Ok(true)
+        }
+        Err(err) => {
+            cache.allowed.remove(&key);
+            let message = format!("{err:#}");
+            if !message.contains("HTTP 404")
+                && (!message.contains("HTTP 403") || message.to_lowercase().contains("rate limit"))
+            {
+                return Err(err);
+            }
+            // Repository failures never prove its review requests disappeared.
+            let me = &session.viewer.login;
+            access_errors.push((repo.into(), format!("@{me} cannot check {repo}: {message}. Cached reviews and snoozes are retained. Check repository permissions and organization SSO authorization.")));
+            Ok(false)
+        }
+    }
+}
+
+/// Updates use saved github.com credentials independently of monitoring
+/// settings. Prefer the active healthy account, then try other saved accounts.
+pub fn gh(args: &[&str]) -> Result<String> {
+    update_gh(&Cli::default(), args)
+}
+
+fn update_gh(runner: &impl GhRunner, args: &[&str]) -> Result<String> {
+    let mut accounts = accounts(runner)?;
+    accounts.sort_by_key(|a| !a.active);
+    let mut last_error = None;
+    for account in accounts.iter().filter(|a| a.state == "success") {
+        runner.begin_check();
+        match credential(runner, &account.login, None)
+            .and_then(|session| runner.run(args, Some(&session.token)))
+        {
+            Ok(output) => return Ok(output),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "No usable saved github.com account; run gh auth login --hostname github.com"
+        )
+    }))
+}
+
+fn command(args: &[&str], token: Option<&str>) -> Command {
+    let mut command = Command::new(gh_binary());
+    // Saved credentials only. Inherited token/host/debug settings must never
+    // select another identity, redirect credentials, or expose them in logs.
+    for name in [
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_ENTERPRISE_TOKEN",
+        "GITHUB_ENTERPRISE_TOKEN",
+        "GH_DEBUG",
+        "DEBUG",
+        "GH_REPO",
+        "GH_FORCE_TTY",
+    ] {
+        command.env_remove(name);
+    }
+    command
+        .env("GH_HOST", "github.com")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_PAGER", "cat");
+    if let Some(token) = token {
+        command.env("GH_TOKEN", token);
+    }
+    if args.first() == Some(&"api") {
+        command
+            .args(["api", "--hostname", "github.com"])
+            .args(&args[1..]);
+    } else {
+        command.args(args);
+    }
+    command
+}
+
+#[cfg(test)]
+fn run_command(command: Command, token: Option<&str>) -> Result<String> {
+    run_command_with_timeout(command, token, Duration::from_secs(30))
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    token: Option<&str>,
+    timeout: Duration,
+) -> Result<String> {
+    let download = command.get_args().any(|arg| arg == "download");
+    let output = command_output(
+        &mut command,
+        if download {
+            Duration::from_secs(10 * 60)
+        } else {
+            timeout
+        },
+    )?;
+    if !output.status.success() {
+        let mut error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if let Some(token) = token {
+            error = error.replace(token, "[redacted]");
+        }
+        bail!("gh failed: {error}");
+    }
+    Ok(String::from_utf8(output.stdout)?)
+}
+
 pub fn classify_failure(err: &anyhow::Error) -> Readiness {
+    let message = format!("{err:#}").to_lowercase();
+    if message.contains("could not run `gh`") && message.contains("no such file or directory") {
+        return Readiness::Missing;
+    }
     if err
         .downcast_ref::<std::io::Error>()
         .is_some_and(|err| err.kind() == std::io::ErrorKind::NotFound)
@@ -719,14 +740,18 @@ pub fn classify_failure(err: &anyhow::Error) -> Readiness {
     {
         return Readiness::NotRunnable;
     }
-    let message = format!("{err:#}").to_lowercase();
+    if is_connection_error(err) {
+        return Readiness::Offline;
+    }
     if message.contains("http 401")
+        || message.contains("authentication unavailable")
+        || message.contains("credential identity changed")
         || message.contains("gh auth login")
         || message.contains("authentication token")
+        || message.contains("no saved credential")
+        || message.contains("saved credential unavailable")
     {
         Readiness::SignedOut
-    } else if is_connection_error(err) {
-        Readiness::Offline
     } else {
         Readiness::Unavailable
     }
@@ -760,129 +785,975 @@ fn gh_binary() -> &'static str {
         .unwrap_or("gh")
 }
 
-#[derive(Deserialize)]
-struct GraphqlResponse {
-    data: Option<serde_json::Value>,
-    #[serde(default)]
-    errors: Vec<GraphqlError>,
-}
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::RefCell,
+        collections::{BTreeMap, BTreeSet, VecDeque},
+    };
 
-#[derive(Deserialize)]
-struct GraphqlError {
-    message: String,
-}
+    use super::*;
+    use crate::store::Store;
 
-#[derive(Deserialize)]
-struct RepositoryData {
-    repository: Option<Repository>,
-}
+    const ACCOUNTS: &str = include_str!("../tests/fixtures/accounts.json");
+    const REVIEWS: &str = include_str!("../tests/fixtures/shared-review.json");
+    const REPO: &str = "owner/repo";
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Repository {
-    name_with_owner: String,
-    is_archived: bool,
-    pull_requests: Connection<Pr>,
-}
+    struct Step {
+        args: Vec<String>,
+        token: Option<String>,
+        output: Result<String>,
+    }
 
-#[derive(Deserialize)]
-struct NodeData<T> {
-    node: Option<T>,
-}
+    #[derive(Default)]
+    struct Script(RefCell<VecDeque<Step>>);
 
-#[derive(Deserialize)]
-struct Connection<T> {
-    nodes: Vec<T>,
-    #[serde(rename = "pageInfo")]
-    page_info: PageInfo,
-}
+    impl Script {
+        fn step(&self, args: &[&str], token: Option<&str>, output: Result<String>) {
+            self.0.borrow_mut().push_back(Step {
+                args: args.iter().map(|s| s.to_string()).collect(),
+                token: token.map(str::to_string),
+                output,
+            });
+        }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PageInfo {
-    has_next_page: bool,
-    end_cursor: Option<String>,
-}
+        fn status(&self, output: &str) {
+            self.step(
+                &[
+                    "auth",
+                    "status",
+                    "--hostname",
+                    "github.com",
+                    "--json",
+                    "hosts",
+                ],
+                None,
+                Ok(output.into()),
+            );
+        }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Pr {
-    id: String,
-    number: u64,
-    title: String,
-    url: String,
-    is_draft: bool,
-    state: String,
-    author: Option<Login>,
-    review_requests: Connection<ReviewRequest>,
-}
+        fn identity(&self, account: &str, id: u64) {
+            self.renamed_identity(account, account, id);
+        }
 
-#[derive(Deserialize)]
-struct Login {
-    login: String,
-}
+        fn renamed_identity(&self, account: &str, current_login: &str, id: u64) {
+            let token = format!("fixture-token-{account}");
+            self.step(
+                &[
+                    "auth",
+                    "token",
+                    "--hostname",
+                    "github.com",
+                    "--user",
+                    account,
+                ],
+                None,
+                Ok(token.clone()),
+            );
+            self.step(
+                &["api", "user"],
+                Some(&token),
+                Ok(serde_json::json!({"login": current_login, "id": id}).to_string()),
+            );
+        }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ReviewRequest {
-    requested_reviewer: Option<Reviewer>,
-}
+        fn access(&self, account: &str, repo: &str, output: Result<String>) {
+            self.step(
+                &["api", &format!("repos/{repo}"), "--jq", ".full_name"],
+                Some(&format!("fixture-token-{account}")),
+                output,
+            );
+        }
 
-#[derive(Deserialize)]
-#[serde(tag = "__typename")]
-enum Reviewer {
-    User {
-        login: String,
-    },
-    Team {
-        id: String,
-    },
-    #[serde(other)]
-    Other,
-}
+        fn search(&self, account: &str, output: &str) {
+            self.snapshot(account, account, REPO, output);
+        }
 
-impl Reviewer {
-    fn key(&self) -> Option<String> {
-        match self {
-            Self::User { login } => Some(format!("user:{}", login.to_lowercase())),
-            Self::Team { id } => Some(format!("team:{id}")),
-            Self::Other => None,
+        fn snapshot(&self, credential: &str, account: &str, repo: &str, output: &str) {
+            let account_id = if credential == "alice" { 1 } else { 2 };
+            self.snapshot_with_id(credential, account, account_id, repo, output);
+        }
+
+        fn snapshot_with_id(
+            &self,
+            credential: &str,
+            account: &str,
+            account_id: u64,
+            repo: &str,
+            output: &str,
+        ) {
+            let response: serde_json::Value = serde_json::from_str(output).unwrap();
+            let mut nodes = response["data"]["search"]["nodes"]
+                .as_array()
+                .unwrap()
+                .clone();
+            let mut histories = Vec::new();
+            for pr in &mut nodes {
+                let number = pr["number"].as_u64().unwrap();
+                pr["id"] = format!("PR_{number}").into();
+                pr["state"] = "OPEN".into();
+                pr["reviewRequests"]["pageInfo"] =
+                    serde_json::json!({"hasNextPage":false,"endCursor":null});
+                let mut history = pr["timelineItems"]["nodes"].as_array().unwrap().clone();
+                for item in &mut history {
+                    item["__typename"] = "ReviewRequestedEvent".into();
+                }
+                for review in pr["reviews"]["nodes"].as_array().unwrap() {
+                    let mut review = review.clone();
+                    review["__typename"] = "PullRequestReview".into();
+                    history.push(review);
+                }
+                histories.push((format!("PR_{number}"), history));
+            }
+            let (owner, name) = repo.split_once('/').unwrap();
+            let token = format!("fixture-token-{credential}");
+            self.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY),
+                "-f", &format!("owner={owner}"), "-f", &format!("name={name}")], Some(&token),
+                Ok(serde_json::json!({"data":{"viewer":{"login":account,"databaseId":account_id},"repository":{"nameWithOwner":repo,"isArchived":false,"pullRequests":{
+                    "nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}
+                }}}}).to_string()));
+            for (id, nodes) in histories {
+                self.step(
+                    &[
+                        "api",
+                        "graphql",
+                        "-f",
+                        &format!("query={}", queue::HISTORY_QUERY),
+                        "-f",
+                        &format!("id={id}"),
+                    ],
+                    Some(&token),
+                    Ok(serde_json::json!({"data":{"viewer":{"login":account,"databaseId":account_id},"node":{"timelineItems":{
+                        "nodes":nodes,"pageInfo":{"hasNextPage":false,"endCursor":null}
+                    }}}})
+                    .to_string()),
+                );
+            }
+        }
+
+        fn successful(&self, account: &str, id: u64) {
+            self.identity(account, id);
+            self.access(account, REPO, Ok(REPO.into()));
+            self.snapshot_with_id(account, account, id, REPO, REVIEWS);
+        }
+
+        fn finished(&self) {
+            assert!(self.0.borrow().is_empty(), "not all expected gh calls ran");
         }
     }
-}
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RequestsData {
-    review_requests: Connection<ReviewRequest>,
-}
+    impl GhRunner for Script {
+        fn run(&self, args: &[&str], token: Option<&str>) -> Result<String> {
+            let step = self.0.borrow_mut().pop_front().expect("unexpected gh call");
+            assert_eq!(args, step.args);
+            assert_eq!(token, step.token.as_deref(), "wrong account credential");
+            step.output
+        }
+    }
 
-#[derive(Deserialize)]
-struct MembersData {
-    members: Connection<Login>,
-}
+    fn poll_script(script: &Script) -> Poll {
+        poll_with(
+            script,
+            &[REPO.into()],
+            Store::default(),
+            AccessCache::default(),
+            Instant::now(),
+        )
+        .unwrap()
+    }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct HistoryData {
-    timeline_items: Connection<HistoryItem>,
-}
+    fn apply(store: &mut Store, poll: Poll) {
+        store.available_accounts.clear();
+        store.stale_accounts.clear();
+        store.unavailable_repos.clear();
+        store.confirmed_requests.clear();
+        for account in poll.accounts {
+            if let Some(id) = account.account_id {
+                store.record_account(&account.login, id);
+            }
+        }
+        let mut completed = BTreeSet::new();
+        let mut fetched = Vec::new();
+        for check in poll.checks {
+            if let Ok(reviews) = check.reviews {
+                store
+                    .available_accounts
+                    .insert(check.account.to_lowercase());
+                completed.extend(
+                    reviews
+                        .completed_repos
+                        .iter()
+                        .map(|repo| (reviews.account_id, repo.clone())),
+                );
+                store.unavailable_repos.extend(
+                    reviews
+                        .unavailable_repos
+                        .into_iter()
+                        .map(|repo| (reviews.account_id, repo)),
+                );
+                fetched.extend(reviews.pending);
+            }
+        }
+        store
+            .confirmed_requests
+            .extend(fetched.iter().map(|pr| (pr.key(), pr.requested_at.clone())));
+        let watched = store
+            .pending
+            .iter()
+            .chain(fetched.iter())
+            .map(|pr| pr.repository().store_key())
+            .chain(completed.iter().map(|(_, repo)| repo.clone()))
+            .collect();
+        store.reconcile_partitions(fetched, &completed, &watched);
+    }
 
-#[derive(Deserialize)]
-#[serde(tag = "__typename")]
-enum HistoryItem {
-    #[serde(rename_all = "camelCase")]
-    ReviewRequestedEvent {
-        created_at: String,
-        requested_reviewer: Option<Reviewer>,
-    },
-    #[serde(rename_all = "camelCase")]
-    PullRequestReview {
-        submitted_at: Option<String>,
-        state: String,
-        author: Option<Login>,
-    },
-}
+    #[test]
+    fn paginated_public_queries_keep_each_receiving_accounts_credential() {
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        for (account, id) in [("alice", 1), ("bob", 2)] {
+            script.identity(account, id);
+            script.access(account, REPO, Ok(REPO.into()));
+            script.search(account, REVIEWS);
+            {
+                let mut steps = script.0.borrow_mut();
+                let step = steps
+                    .iter_mut()
+                    .rev()
+                    .find(|s| {
+                        s.args
+                            .iter()
+                            .any(|a| a == &format!("query={}", queue::REPOSITORY_QUERY))
+                    })
+                    .unwrap();
+                let mut output: serde_json::Value =
+                    serde_json::from_str(step.output.as_ref().unwrap()).unwrap();
+                output["data"]["repository"]["pullRequests"]["pageInfo"] =
+                    serde_json::json!({"hasNextPage":true,"endCursor":"next"});
+                step.output = Ok(output.to_string());
+            }
+            script.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY),
+                "-f", "owner=owner", "-f", "name=repo", "-f", "after=next"],
+                Some(&format!("fixture-token-{account}")), Ok(serde_json::json!({"data":{"viewer":{"login":account,"databaseId":if account == "alice" {1} else {2}},"repository":{
+                    "nameWithOwner":REPO,"isArchived":false,"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}
+                }}}).to_string()));
+        }
+        let poll = poll_script(&script);
+        assert_eq!(
+            poll.checks[0].reviews.as_ref().unwrap().pending[0].account_id,
+            1
+        );
+        assert_eq!(
+            poll.checks[1].reviews.as_ref().unwrap().pending[0].account_id,
+            2
+        );
+        script.finished();
+    }
 
-#[cfg(test)]
-mod tests;
+    #[test]
+    fn unreadable_team_keeps_only_confirmed_requests_visible_under_that_account() {
+        let mut store = Store::from_json(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        store.local_repos.insert(REPO.into());
+        let mut uncertain = store.pending[0].clone();
+        uncertain.number = 8;
+        store.pending.push(uncertain.clone());
+        let mut snooze = store.snoozed[0].clone();
+        snooze.number = 8;
+        snooze.until = 50;
+        store.snoozed.push(snooze.clone());
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        {
+            let mut steps = script.0.borrow_mut();
+            let repository_ix = steps
+                .iter()
+                .position(|s| {
+                    s.args
+                        .iter()
+                        .any(|a| a == &format!("query={}", queue::REPOSITORY_QUERY))
+                })
+                .unwrap();
+            let step = &mut steps[repository_ix];
+            let mut output: serde_json::Value =
+                serde_json::from_str(step.output.as_ref().unwrap()).unwrap();
+            output["data"]["repository"]["pullRequests"]["nodes"][0]["reviewRequests"]["nodes"].as_array_mut().unwrap()
+                .push(serde_json::json!({"requestedReviewer":{"__typename":"Team","id":"hidden-team"}}));
+            step.output = Ok(output.to_string());
+            steps.insert(
+                repository_ix + 1,
+                Step {
+                    args: vec![
+                        "api".into(),
+                        "graphql".into(),
+                        "-f".into(),
+                        format!("query={}", queue::MEMBERS_QUERY),
+                        "-f".into(),
+                        "id=hidden-team".into(),
+                        "-f".into(),
+                        "me=alice".into(),
+                    ],
+                    token: Some("fixture-token-alice".into()),
+                    output: Err(anyhow::anyhow!(
+                        "GraphQL: Resource not accessible by integration"
+                    )),
+                },
+            );
+        }
+        script.successful("bob", 2);
+        let poll = poll_script(&script);
+        let alice = poll.checks[0].reviews.as_ref().unwrap();
+        assert!(alice.completed_repos.is_empty());
+        assert_eq!(alice.pending.len(), 1);
+        assert_eq!(poll.checks[0].access_errors.len(), 1);
+        apply(&mut store, poll);
+        assert_eq!(store.pending.len(), 3);
+        assert_eq!(store.visible_pending().len(), 2);
+        assert!(!store.visible(&uncertain));
+        assert!(store.take_expired(100).is_empty());
+        assert!(store.snoozed.contains(&snooze));
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.successful("bob", 2);
+        apply(&mut store, poll_script(&script));
+        assert_eq!(store.pending.len(), 2);
+        assert!(!store.snoozed.contains(&snooze));
+        script.finished();
+    }
+
+    #[test]
+    fn changed_numeric_identity_on_a_history_page_invalidates_the_entire_account_check() {
+        let script = Script::default();
+        script.status(
+            r#"{"hosts":{"github.com":[{"login":"alice","state":"success","active":true}]}}"#,
+        );
+        script.identity("alice", 1);
+        script.access("alice", REPO, Ok(REPO.into()));
+        script.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY), "-f", "owner=owner", "-f", "name=repo"], Some("fixture-token-alice"),
+            Ok(serde_json::json!({"data":{"viewer":{"login":"alice","databaseId":1},"repository":{"nameWithOwner":REPO,"isArchived":false,"pullRequests":{
+                "pageInfo":{"hasNextPage":false,"endCursor":null}, "nodes":[{"id":"PR_7","number":7,"title":"Review","url":"https://github.com/owner/repo/pull/7","isDraft":false,"state":"OPEN","author":{"login":"author"},
+                "reviewRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"requestedReviewer":{"__typename":"User","login":"alice"}}]}}]
+            }}}}).to_string()));
+        script.step(&["api", "graphql", "-f", &format!("query={}", queue::HISTORY_QUERY), "-f", "id=PR_7"], Some("fixture-token-alice"),
+            Ok(serde_json::json!({"data":{"viewer":{"login":"alice","databaseId":99},"node":null}, "errors":[{"message":"Repository unavailable"}]}).to_string()));
+        let poll = poll_script(&script);
+        let error = poll.checks[0].reviews.as_ref().err().unwrap();
+        assert!(error.to_string().contains("identity changed"));
+        assert_eq!(classify_failure(error), Readiness::SignedOut);
+        script.finished();
+    }
+
+    #[test]
+    fn public_response_with_empty_errors_still_requires_verified_viewer() {
+        let script = Script::default();
+        script.status(
+            r#"{"hosts":{"github.com":[{"login":"alice","state":"success","active":true}]}}"#,
+        );
+        script.identity("alice", 1);
+        script.access("alice", REPO, Ok(REPO.into()));
+        script.step(&["api", "graphql", "-f", &format!("query={}", queue::REPOSITORY_QUERY), "-f", "owner=owner", "-f", "name=repo"], Some("fixture-token-alice"),
+            Ok(serde_json::json!({"data":{"repository":{"nameWithOwner":REPO,"isArchived":false,"pullRequests":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}},"errors":[]}).to_string()));
+        let poll = poll_script(&script);
+        assert!(
+            poll.checks[0]
+                .reviews
+                .as_ref()
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("omitted the verified account")
+        );
+        script.finished();
+    }
+
+    #[test]
+    fn account_deadline_expires_before_starting_another_subprocess() {
+        let runner = Cli(std::cell::Cell::new(Instant::now() - CHECK_TIMEOUT));
+        let error = runner.run(&["api", "user"], None).unwrap_err();
+        assert!(error.to_string().contains("timed out after 60 seconds"));
+        assert_eq!(
+            classify_failure(&anyhow::anyhow!(
+                "Could not discover accounts: could not run `gh`; is the GitHub CLI installed?: No such file or directory (os error 2)"
+            )),
+            Readiness::Missing
+        );
+        runner.begin_check();
+        assert!(runner.0.get().elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn same_repo_is_polled_with_separate_credentials_despite_active_account_changes() {
+        let script = Script::default();
+        let mut changed: serde_json::Value = serde_json::from_str(ACCOUNTS).unwrap();
+        changed["hosts"]["github.com"][0]["active"] = false.into();
+        changed["hosts"]["github.com"][1]["active"] = true.into();
+        let mut expected = None;
+        for status in [ACCOUNTS.to_string(), changed.to_string()] {
+            script.status(&status);
+            script.successful("alice", 1);
+            script.successful("bob", 2);
+            let poll = poll_script(&script);
+            assert_eq!(
+                poll.accounts.len(),
+                2,
+                "Enterprise accounts must be excluded"
+            );
+            let pending: Vec<_> = poll
+                .checks
+                .into_iter()
+                .flat_map(|c| c.reviews.unwrap().pending)
+                .collect();
+            assert_eq!(pending.len(), 2);
+            assert_ne!(pending[0].key(), pending[1].key());
+            if let Some(previous) = expected.as_ref() {
+                assert_eq!(&pending, previous);
+            }
+            expected = Some(pending);
+        }
+        script.finished();
+    }
+
+    #[test]
+    fn disabled_account_and_explicit_repo_restriction_do_not_poll_another_identity() {
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        // Disabled Alice is still verified; Bob cannot poll Alice's restricted repo.
+        script.identity("alice", 1);
+        script.identity("bob", 2);
+        let poll = poll_with(
+            &script,
+            &[REPO.into()],
+            Store {
+                disabled_accounts: BTreeSet::from(["alice".into()]),
+                repo_accounts: BTreeMap::from([(REPO.into(), BTreeSet::from(["alice".into()]))]),
+                ..Store::default()
+            },
+            AccessCache::default(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(poll.checks.len(), 1);
+        assert_eq!(poll.checks[0].account, "bob");
+        assert!(poll.checks[0].reviews.as_ref().unwrap().pending.is_empty());
+        script.finished();
+    }
+
+    #[test]
+    fn expired_auth_hides_only_its_account_and_keeps_its_snooze() {
+        let script = Script::default();
+        script.status(include_str!("../tests/fixtures/expired-account.json"));
+        script.successful("bob", 2);
+        let poll = poll_script(&script);
+        let error = format!("{:#}", poll.checks[0].reviews.as_ref().err().unwrap());
+        assert!(error.contains("@alice"));
+        assert!(error.contains("gh auth status"));
+        let mut store = Store::from_json(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        store.local_repos.insert(REPO.into());
+        apply(&mut store, poll);
+        assert_eq!(store.visible_pending().len(), 1);
+        assert_eq!(store.visible_pending()[0].account, "bob");
+        assert_eq!(store.pending.len(), 2);
+        assert_eq!(store.snoozed.len(), 1);
+        script.finished();
+    }
+
+    #[test]
+    fn sign_out_hides_all_cached_reviews_without_reassigning_them() {
+        let script = Script::default();
+        script.status(include_str!("../tests/fixtures/signed-out.json"));
+        let mut store = Store::from_json(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        store.local_repos.insert(REPO.into());
+        store
+            .available_accounts
+            .extend(["alice".into(), "bob".into()]);
+        apply(&mut store, poll_script(&script));
+        assert!(store.awake().is_empty());
+        assert!(store.visible_pending().is_empty());
+        assert_eq!(store.pending.len(), 2);
+        assert_eq!(store.snoozed.len(), 1);
+        script.finished();
+    }
+
+    #[test]
+    fn missing_saved_credential_does_not_fall_back_to_the_active_account() {
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        script.step(
+            &[
+                "auth",
+                "token",
+                "--hostname",
+                "github.com",
+                "--user",
+                "alice",
+            ],
+            None,
+            Err(anyhow::anyhow!("saved token was removed")),
+        );
+        script.successful("bob", 2);
+        let poll = poll_script(&script);
+        assert!(poll.checks[0].reviews.is_err());
+        assert!(poll.checks[1].reviews.is_ok());
+        script.finished();
+    }
+
+    #[test]
+    fn mismatched_credential_identity_never_searches_as_the_wrong_account() {
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        script.step(
+            &[
+                "auth",
+                "token",
+                "--hostname",
+                "github.com",
+                "--user",
+                "alice",
+            ],
+            None,
+            Ok("wrong-fixture-token".into()),
+        );
+        script.step(
+            &["api", "user"],
+            Some("wrong-fixture-token"),
+            Ok(r#"{"login":"bob","id":2}"#.into()),
+        );
+        script.successful("bob", 2);
+        let poll = poll_script(&script);
+        let error = format!("{:#}", poll.checks[0].reviews.as_ref().err().unwrap());
+        assert!(error.contains("identity changed"));
+        assert!(poll.checks[1].reviews.is_ok());
+        script.finished();
+    }
+
+    #[test]
+    fn inaccessible_repo_reports_account_and_permission_help_while_others_continue() {
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        script.identity("alice", 1);
+        script.access("alice", REPO, Ok(REPO.into()));
+        script.access(
+            "alice",
+            "private/repo",
+            Err(anyhow::anyhow!("Not Found (HTTP 404)")),
+        );
+        script.search("alice", REVIEWS);
+        script.successful("bob", 2);
+        let poll = poll_with(
+            &script,
+            &[REPO.into(), "private/repo".into()],
+            Store {
+                repo_accounts: BTreeMap::from([(
+                    "private/repo".into(),
+                    BTreeSet::from(["alice".into()]),
+                )]),
+                ..Store::default()
+            },
+            AccessCache::default(),
+            Instant::now(),
+        )
+        .unwrap();
+        assert_eq!(poll.checks[0].access_errors.len(), 1);
+        let error = &poll.checks[0].access_errors[0].1;
+        assert!(error.contains("@alice"));
+        assert!(error.contains("private/repo"));
+        assert!(error.contains("SSO"));
+        assert_eq!(poll.checks[0].reviews.as_ref().unwrap().pending.len(), 1);
+        assert_eq!(poll.checks[1].reviews.as_ref().unwrap().pending.len(), 1);
+        script.finished();
+    }
+
+    #[test]
+    fn transport_auth_and_rate_limit_errors_invalidate_the_account_check() {
+        for error in [
+            "connection refused",
+            "Bad credentials (HTTP 401)",
+            "API rate limit exceeded (HTTP 403)",
+        ] {
+            let script = Script::default();
+            script.status(ACCOUNTS);
+            script.identity("alice", 1);
+            script.access("alice", REPO, Err(anyhow::anyhow!(error)));
+            script.successful("bob", 2);
+            let poll = poll_script(&script);
+            assert!(poll.checks[0].reviews.is_err(), "{error}");
+            assert!(poll.checks[1].reviews.is_ok());
+            script.finished();
+        }
+    }
+
+    #[test]
+    fn repository_failures_hide_and_preserve_snoozes_until_access_recovers() {
+        for error in ["Forbidden (HTTP 403)", "Not Found (HTTP 404)"] {
+            let mut store = Store::from_json(include_str!(
+                "../tests/fixtures/multiple-account-state.json"
+            ))
+            .unwrap();
+            store.local_repos.insert(REPO.into());
+            store.snoozed[0].until = 50;
+            let original = store.snoozed.clone();
+            let script = Script::default();
+            script.status(ACCOUNTS);
+            script.identity("alice", 1);
+            script.access("alice", REPO, Err(anyhow::anyhow!(error)));
+            script.successful("bob", 2);
+            apply(&mut store, poll_script(&script));
+            assert_eq!(store.pending.len(), 2);
+            assert_eq!(store.visible_pending().len(), 1);
+            assert_eq!(store.visible_pending()[0].account, "bob");
+            assert_eq!(store.snoozed, original);
+            assert!(store.take_expired(100).is_empty());
+            script.status(ACCOUNTS);
+            script.successful("alice", 1);
+            script.successful("bob", 2);
+            apply(&mut store, poll_script(&script));
+            assert_eq!(store.visible_pending().len(), 2);
+            assert_eq!(store.take_expired(100)[0].account, "alice");
+            script.finished();
+        }
+    }
+
+    #[test]
+    fn failing_repo_does_not_prevent_removing_completed_reviews_in_another_repo() {
+        let mut store = Store::from_json(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        let mut completed = store.pending[0].clone();
+        completed.repo = "other/repo".into();
+        store.pending.push(completed);
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        script.identity("alice", 1);
+        script.access("alice", REPO, Err(anyhow::anyhow!("Forbidden (HTTP 403)")));
+        script.access("alice", "other/repo", Ok("other/repo".into()));
+        script.snapshot(
+            "alice",
+            "alice",
+            "other/repo",
+            r#"{"data":{"search":{"nodes":[]}}}"#,
+        );
+        script.successful("bob", 2);
+        let poll = poll_with(
+            &script,
+            &[REPO.into(), "other/repo".into()],
+            Store {
+                repo_accounts: BTreeMap::from([(
+                    "other/repo".into(),
+                    BTreeSet::from(["alice".into()]),
+                )]),
+                ..store.clone()
+            },
+            AccessCache::default(),
+            Instant::now(),
+        )
+        .unwrap();
+        apply(&mut store, poll);
+        assert_eq!(store.pending.len(), 2);
+        assert!(
+            store
+                .pending
+                .iter()
+                .all(|pr| pr.repo.to_lowercase() == REPO)
+        );
+        assert_eq!(store.snoozed.len(), 1);
+        script.finished();
+    }
+
+    #[test]
+    fn renamed_accounts_preserve_disabled_and_repository_choices() {
+        for disabled in [false, true] {
+            let mut store = Store::from_json(include_str!(
+                "../tests/fixtures/multiple-account-state.json"
+            ))
+            .unwrap();
+            store
+                .repo_accounts
+                .insert(REPO.into(), BTreeSet::from(["alice".into()]));
+            if disabled {
+                store.toggle_account("alice");
+            }
+            let script = Script::default();
+            script.status(ACCOUNTS);
+            // gh's saved credential still has its old name, but /user is canonical.
+            script.renamed_identity("alice", "alice-renamed", 1);
+            if !disabled {
+                script.access("alice", REPO, Ok(REPO.into()));
+                let renamed = REVIEWS.replace("alice", "alice-renamed");
+                script.snapshot("alice", "alice-renamed", REPO, &renamed);
+            }
+            script.identity("bob", 2);
+            let poll = poll_with(
+                &script,
+                &[REPO.into()],
+                store.clone(),
+                AccessCache::default(),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(poll.checks.len(), if disabled { 1 } else { 2 });
+            apply(&mut store, poll);
+            assert_eq!(store.account_enabled("alice-renamed"), !disabled);
+            assert!(store.repo_account_selected(REPO, "alice-renamed"));
+            assert!(!store.repo_account_selected(REPO, "bob"));
+            assert_eq!(store.snoozed[0].account, "alice-renamed");
+            assert!(!store.known_accounts.contains("alice"));
+            let restarted = Store::from_json(&serde_json::to_string(&store).unwrap()).unwrap();
+            assert_eq!(restarted.account_enabled("alice-renamed"), !disabled);
+            assert!(restarted.repo_account_selected(REPO, "alice-renamed"));
+            script.finished();
+        }
+    }
+
+    #[test]
+    fn access_cache_skips_probes_but_still_verifies_and_searches_each_account() {
+        let script = Script::default();
+        let now = Instant::now();
+        let mut cache = AccessCache::default();
+        for elapsed in [0, 120, 1800, 1920] {
+            script.status(ACCOUNTS);
+            for (account, id) in [("alice", 1), ("bob", 2)] {
+                script.identity(account, id);
+                if elapsed == 0 || elapsed == 1800 {
+                    script.access(account, REPO, Ok(REPO.into()));
+                }
+                script.search(account, REVIEWS);
+            }
+            let poll = poll_with(
+                &script,
+                &[REPO.into()],
+                Store::default(),
+                cache,
+                now + Duration::from_secs(elapsed),
+            )
+            .unwrap();
+            assert!(
+                poll.checks
+                    .iter()
+                    .all(|check| check.reviews.as_ref().unwrap().pending.len() == 1)
+            );
+            cache = poll.access_cache;
+        }
+        // Manual Refresh deliberately drops the cache and probes immediately.
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.successful("bob", 2);
+        poll_with(
+            &script,
+            &[REPO.into()],
+            Store::default(),
+            AccessCache::default(),
+            now + Duration::from_secs(1921),
+        )
+        .unwrap();
+        script.finished();
+    }
+
+    #[test]
+    fn access_results_are_never_reused_for_another_user_id() {
+        let script = Script::default();
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.successful("bob", 2);
+        let now = Instant::now();
+        let first = poll_with(
+            &script,
+            &[REPO.into()],
+            Store::default(),
+            AccessCache::default(),
+            now,
+        )
+        .unwrap();
+        script.status(ACCOUNTS);
+        script.successful("alice", 99);
+        script.identity("bob", 2);
+        script.search("bob", REVIEWS);
+        let second = poll_with(
+            &script,
+            &[REPO.into()],
+            Store::default(),
+            first.access_cache,
+            now + Duration::from_secs(120),
+        )
+        .unwrap();
+        assert_eq!(second.checks[0].reviews.as_ref().unwrap().account_id, 99);
+        script.finished();
+    }
+
+    #[test]
+    fn auth_failure_invalidates_only_that_accounts_cached_access() {
+        let script = Script::default();
+        let now = Instant::now();
+        let store = Store::from_json(include_str!(
+            "../tests/fixtures/multiple-account-state.json"
+        ))
+        .unwrap();
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.successful("bob", 2);
+        let first = poll_with(
+            &script,
+            &[REPO.into()],
+            store.clone(),
+            AccessCache::default(),
+            now,
+        )
+        .unwrap();
+        script.status(include_str!("../tests/fixtures/expired-account.json"));
+        script.identity("bob", 2);
+        script.search("bob", REVIEWS);
+        let failed = poll_with(
+            &script,
+            &[REPO.into()],
+            store.clone(),
+            first.access_cache,
+            now + Duration::from_secs(120),
+        )
+        .unwrap();
+        assert!(failed.checks[0].reviews.is_err());
+        script.status(ACCOUNTS);
+        script.successful("alice", 1);
+        script.identity("bob", 2);
+        script.search("bob", REVIEWS);
+        let recovered = poll_with(
+            &script,
+            &[REPO.into()],
+            store,
+            failed.access_cache,
+            now + Duration::from_secs(240),
+        )
+        .unwrap();
+        assert!(recovered.checks.iter().all(|check| check.reviews.is_ok()));
+        script.finished();
+    }
+
+    #[test]
+    fn missing_requests_recheck_cached_access_before_deleting_state() {
+        for accessible in [false, true] {
+            let script = Script::default();
+            let now = Instant::now();
+            let mut store = Store::from_json(include_str!(
+                "../tests/fixtures/multiple-account-state.json"
+            ))
+            .unwrap();
+            script.status(ACCOUNTS);
+            script.successful("alice", 1);
+            script.successful("bob", 2);
+            let first = poll_with(
+                &script,
+                &[REPO.into()],
+                store.clone(),
+                AccessCache::default(),
+                now,
+            )
+            .unwrap();
+            script.status(ACCOUNTS);
+            script.identity("alice", 1);
+            script.search("alice", r#"{"data":{"search":{"nodes":[]}}}"#);
+            script.access(
+                "alice",
+                REPO,
+                if accessible {
+                    Ok(REPO.into())
+                } else {
+                    Err(anyhow::anyhow!("Forbidden (HTTP 403)"))
+                },
+            );
+            script.identity("bob", 2);
+            script.search("bob", REVIEWS);
+            let next = poll_with(
+                &script,
+                &[REPO.into()],
+                store.clone(),
+                first.access_cache,
+                now + Duration::from_secs(120),
+            )
+            .unwrap();
+            apply(&mut store, next);
+            assert_eq!(store.pending.len(), if accessible { 1 } else { 2 });
+            assert_eq!(store.snoozed.len(), usize::from(!accessible));
+            script.finished();
+        }
+    }
+
+    #[test]
+    fn updater_uses_a_healthy_saved_account_without_monitoring_selection() {
+        let script = Script::default();
+        script.status(include_str!("../tests/fixtures/expired-account.json"));
+        script.identity("bob", 2);
+        let args = [
+            "release",
+            "download",
+            "v0.5.0",
+            "--repo",
+            "mattsverse/octowatch",
+            "--dir",
+            "/fixture-staging",
+        ];
+        script.step(&args, Some("fixture-token-bob"), Ok(String::new()));
+        assert!(update_gh(&script, &args).is_ok());
+        script.finished();
+    }
+
+    #[test]
+    fn command_is_host_pinned_and_clears_inherited_tokens_and_debugging() {
+        let invocation = command(&["api", "user"], Some("fixture-token"));
+        let args: Vec<_> = invocation.get_args().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(args, ["api", "--hostname", "github.com", "user"]);
+        let env: BTreeMap<_, _> = invocation
+            .get_envs()
+            .map(|(name, value)| (name.to_str().unwrap(), value.and_then(|v| v.to_str())))
+            .collect();
+        assert_eq!(env["GH_HOST"], Some("github.com"));
+        assert_eq!(env["GH_TOKEN"], Some("fixture-token"));
+        for name in [
+            "GITHUB_TOKEN",
+            "GH_ENTERPRISE_TOKEN",
+            "GITHUB_ENTERPRISE_TOKEN",
+            "GH_DEBUG",
+            "DEBUG",
+            "GH_REPO",
+        ] {
+            assert_eq!(env[name], None, "{name}");
+        }
+        let token_lookup = command(
+            &[
+                "auth",
+                "token",
+                "--hostname",
+                "github.com",
+                "--user",
+                "alice",
+            ],
+            None,
+        );
+        assert!(
+            token_lookup
+                .get_envs()
+                .any(|(key, value)| key == "GH_TOKEN" && value.is_none())
+        );
+    }
+
+    #[test]
+    fn child_failure_redacts_credentials_from_error_text() {
+        let mut child = Command::new("sh");
+        child
+            .args(["-c", "printf '%s' \"$GH_TOKEN\" >&2; exit 1"])
+            .env("GH_TOKEN", "fixture-secret");
+        let error = format!(
+            "{:#}",
+            run_command(child, Some("fixture-secret")).unwrap_err()
+        );
+        assert!(error.contains("[redacted]"));
+        assert!(!error.contains("fixture-secret"));
+    }
+}

@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     repository::RepositoryId,
-    store::{PendingReview, Store},
+    store::{PendingReview, ReviewKey, Store},
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -67,7 +67,9 @@ impl SearchTerm {
 /// a query scans these values without allocating lowercase strings per PR.
 struct SearchableReview {
     fields: [String; 4],
-    key: (RepositoryId, u64),
+    key: ReviewKey,
+    repository: RepositoryId,
+    visible: bool,
     draft: bool,
     rereview: bool,
 }
@@ -82,6 +84,8 @@ impl From<&PendingReview> for SearchableReview {
                 pr.number.to_string(),
             ],
             key: pr.key(),
+            repository: pr.repository(),
+            visible: true,
             draft: pr.is_draft,
             rereview: pr.rereview,
         }
@@ -93,7 +97,7 @@ impl From<&PendingReview> for SearchableReview {
 pub struct ReviewFilterCache {
     reviews: Vec<SearchableReview>,
     repositories: BTreeMap<RepositoryId, String>,
-    snoozed: HashSet<(RepositoryId, u64)>,
+    snoozed: HashSet<ReviewKey>,
     filters: Option<ReviewFilters>,
     visible: Rc<Vec<usize>>,
     reviews_dirty: bool,
@@ -129,9 +133,17 @@ impl ReviewFilterCache {
             return false;
         }
         if self.reviews_dirty {
-            self.reviews = store.pending.iter().map(SearchableReview::from).collect();
+            self.reviews = store
+                .pending
+                .iter()
+                .map(|pr| {
+                    let mut searchable = SearchableReview::from(pr);
+                    searchable.visible = store.visible(pr);
+                    searchable
+                })
+                .collect();
             self.repositories.clear();
-            for pr in &store.pending {
+            for pr in store.pending.iter().filter(|pr| store.visible(pr)) {
                 self.repositories
                     .entry(pr.repository())
                     .or_insert_with(|| pr.repo_label());
@@ -150,11 +162,14 @@ impl ReviewFilterCache {
                 .iter()
                 .enumerate()
                 .filter_map(|(ix, pr)| {
+                    if !pr.visible {
+                        return None;
+                    }
                     let asleep = self.snoozed.contains(&pr.key);
                     let matches = filters
                         .repository
                         .as_ref()
-                        .is_none_or(|repo| repo == &pr.key.0)
+                        .is_none_or(|repo| repo == &pr.repository)
                         && match filters.draft {
                             DraftFilter::All => true,
                             DraftFilter::Ready => !pr.draft,
@@ -171,7 +186,7 @@ impl ReviewFilterCache {
                             SnoozeFilter::Snoozed => asleep,
                         }
                         && terms.iter().all(|term| match term {
-                            SearchTerm::Number(number) => *number == Some(pr.key.1),
+                            SearchTerm::Number(number) => *number == Some(pr.key.2),
                             SearchTerm::Text(text) => {
                                 pr.fields.iter().any(|field| field.contains(text))
                             }
@@ -226,6 +241,20 @@ impl ReviewFilters {
 mod tests {
     use super::*;
     use crate::store::Snooze;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn verified_store() -> Store {
+        Store {
+            available_accounts: BTreeSet::from(["alice".into()]),
+            local_repos: BTreeSet::from([
+                "acme/api".into(),
+                "other/web".into(),
+                "new/repo".into(),
+                "ghe.example.com/acme/api".into(),
+            ]),
+            ..Store::default()
+        }
+    }
 
     fn pr(
         repo: &str,
@@ -237,6 +266,8 @@ mod tests {
     ) -> PendingReview {
         PendingReview {
             host: "github.com".into(),
+            account: "alice".into(),
+            account_id: 1,
             repo: repo.into(),
             number,
             title: title.into(),
@@ -258,13 +289,65 @@ mod tests {
             ],
             snoozed: vec![Snooze {
                 host: "github.com".into(),
+                account: "alice".into(),
+                account_id: 1,
                 repo: "acme/api".into(),
                 number: 1234,
                 until: 200,
                 requested_at: None,
             }],
-            ..Default::default()
+            ..verified_store()
         }
+    }
+
+    #[test]
+    fn shared_requests_filter_snoozes_by_account_and_hide_unavailable_partitions() {
+        let alice = pr("Acme/API", 7, "Shared request", "Author", false, false);
+        let bob = PendingReview {
+            account: "bob".into(),
+            account_id: 2,
+            ..alice.clone()
+        };
+        let mut store = Store {
+            pending: vec![alice.clone(), bob.clone()],
+            ..verified_store()
+        };
+        store.available_accounts.insert("bob".into());
+        assert!(store.snooze(&alice.key(), 30, 0));
+        let mut filters = ReviewFilters {
+            query: "#7 shared".into(),
+            snooze: SnoozeFilter::Awake,
+            ..Default::default()
+        };
+        let mut cache = ReviewFilterCache::default();
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![1]);
+        filters.snooze = SnoozeFilter::Snoozed;
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![0]);
+
+        store.unavailable_repos.insert((1, "acme/api".into()));
+        cache.invalidate_reviews();
+        cache.refresh(&store, &filters);
+        assert!(cache.visible_indices().is_empty());
+        filters.snooze = SnoozeFilter::All;
+        cache.refresh(&store, &filters);
+        // Indices still refer to the retained Store queue, not a compacted copy.
+        assert_eq!(*cache.visible_indices(), vec![1]);
+        store.available_accounts.remove("bob");
+        cache.invalidate_reviews();
+        cache.refresh(&store, &filters);
+        assert!(cache.visible_indices().is_empty());
+        assert!(cache.repositories(&filters).is_empty());
+        assert_eq!(store.pending, vec![alice, bob]);
+        assert_eq!(store.snoozed.len(), 1);
+
+        store.available_accounts.insert("bob".into());
+        store.unavailable_repos.clear();
+        cache.invalidate_reviews();
+        cache.refresh(&store, &filters);
+        assert_eq!(*cache.visible_indices(), vec![0, 1]);
+        assert_eq!(cache.repositories(&filters).len(), 1);
     }
 
     #[test]
@@ -276,7 +359,7 @@ mod tests {
         };
         let mut store = Store {
             pending: vec![public.clone(), enterprise.clone()],
-            ..Default::default()
+            ..verified_store()
         };
         assert!(store.snooze(&public.key(), 5, 0));
         let mut filters = ReviewFilters {
@@ -393,7 +476,7 @@ mod tests {
         store.snooze(&key, 5, 0);
         let mut fetched = store.pending.clone();
         fetched[0].requested_at = Some("2026-10-07T00:00:00Z".into());
-        let changes = store.reconcile(fetched);
+        let changes = store.reconcile(fetched, &BTreeMap::from([("alice".into(), 1)]));
         assert!(changes.pending_changed && changes.snoozes_changed);
         cache.invalidate_reviews();
         cache.invalidate_snoozes();
@@ -533,7 +616,12 @@ mod tests {
         );
         let mut fetched = store.pending.clone();
         fetched.push(new_pr.clone());
-        assert_eq!(store.reconcile(fetched).fresh, vec![new_pr]);
+        assert_eq!(
+            store
+                .reconcile(fetched, &BTreeMap::from([("alice".into(), 1)]))
+                .fresh,
+            vec![new_pr]
+        );
         assert!(filters.visible_indices(&store).is_empty());
     }
 
@@ -566,20 +654,19 @@ mod tests {
             filters.repositories(&store),
             vec!["github.com/Acme/API", "github.com/Other/Web"]
         );
-        store.reconcile(vec![pr(
-            "Other/Web",
-            99,
-            "Login change",
-            "Alice",
-            false,
-            false,
-        )]);
+        store.reconcile(
+            vec![pr("Other/Web", 99, "Login change", "Alice", false, false)],
+            &BTreeMap::from([("alice".into(), 1)]),
+        );
         assert!(filters.visible_indices(&store).is_empty());
         assert_eq!(
             filters.repositories(&store),
             vec!["github.com/acme/api", "github.com/Other/Web"]
         );
-        store.reconcile(vec![pr("acme/api", 100, "LOGIN fix", "Bob", false, false)]);
+        store.reconcile(
+            vec![pr("acme/api", 100, "LOGIN fix", "Bob", false, false)],
+            &BTreeMap::from([("alice".into(), 1)]),
+        );
         assert_eq!(filters.visible_indices(&store), vec![0]);
         assert_eq!(filters.query, "login");
         assert_eq!(
@@ -604,7 +691,7 @@ mod tests {
                     )
                 })
                 .collect(),
-            ..Default::default()
+            ..verified_store()
         };
         let all = ReviewFilters::default().visible_indices(&store);
         assert_eq!(all.len(), 10_000);

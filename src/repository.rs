@@ -20,6 +20,15 @@ pub struct RepositoryId {
 }
 
 impl RepositoryId {
+    /// Preserve the public-host settings spelling while qualifying other hosts.
+    pub fn store_key(&self) -> String {
+        if self.host == PUBLIC_HOST {
+            self.slug.clone()
+        } else {
+            self.to_string()
+        }
+    }
+
     pub fn new(host: &str, slug: &str) -> Self {
         Self {
             host: host.to_ascii_lowercase(),
