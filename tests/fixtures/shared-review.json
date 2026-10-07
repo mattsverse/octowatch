@@ -1,0 +1,57 @@
+{
+  "data": {
+    "search": {
+      "nodes": [
+        {
+          "number": 7,
+          "title": "Review the shared change",
+          "url": "https://github.com/Owner/Repo/pull/7",
+          "isDraft": false,
+          "author": {
+            "login": "author"
+          },
+          "repository": {
+            "nameWithOwner": "Owner/Repo"
+          },
+          "reviewRequests": {
+            "nodes": [
+              {
+                "requestedReviewer": {
+                  "__typename": "User",
+                  "login": "alice"
+                }
+              },
+              {
+                "requestedReviewer": {
+                  "__typename": "User",
+                  "login": "bob"
+                }
+              }
+            ]
+          },
+          "reviews": {
+            "nodes": []
+          },
+          "timelineItems": {
+            "nodes": [
+              {
+                "createdAt": "2026-10-07T10:00:00Z",
+                "requestedReviewer": {
+                  "__typename": "User",
+                  "login": "alice"
+                }
+              },
+              {
+                "createdAt": "2026-10-07T10:00:00Z",
+                "requestedReviewer": {
+                  "__typename": "User",
+                  "login": "bob"
+                }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  }
+}

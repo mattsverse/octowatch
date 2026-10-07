@@ -590,6 +590,8 @@ fn host_authentication_and_schema_failures_preserve_other_repositories() {
         assert!(fetched.errors[0].contains(&failed.host));
         let cached = PendingReview {
             host: failed.host.clone(),
+            account: "me".into(),
+            account_id: 0,
             repo: "o/r".into(),
             number: 1,
             title: "Cached".into(),
@@ -601,6 +603,7 @@ fn host_authentication_and_schema_failures_preserve_other_repositories() {
         };
         let mut store = crate::store::Store {
             pending: vec![cached.clone()],
+            local_repos: [failed.store_key()].into(),
             ..Default::default()
         };
         store.snooze(&cached.key(), 5, 0);
@@ -715,6 +718,8 @@ fn unreadable_team_does_not_hide_a_confirmed_direct_request() {
     saved.number = 2;
     let mut store = crate::store::Store {
         pending: vec![saved.clone()],
+        available_accounts: ["me".into()].into(),
+        local_repos: ["o/r".into()].into(),
         ..Default::default()
     };
     assert!(store.snooze(&saved.key(), 60, 1_000));

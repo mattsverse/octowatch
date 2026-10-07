@@ -15,9 +15,10 @@ It finds the GitHub repositories in your project folders, checks GitHub every fe
 - **Lets you choose draft alerts.** Drafts always stay in the queue; switch their notifications off to wait until they're ready for review.
 - **Opens reviews from notifications.** Click a single-review notification to open its PR, or a summary to open the Reviews tab.
 - **Lives in the tray.** The icon shows how many reviews are waiting, and its menu lists them, marked `(draft)` or `(re-review)` where that applies.
-- **Supports Enterprise hosts.** Watch clones from github.com, GitHub Enterprise Server, and Enterprise Cloud with data residency (`*.ghe.com`) together. Repositories and reviews with the same name on different hosts stay separate.
+- **Monitors multiple accounts together.** Enable your work and personal accounts independently. Each review shows its receiving account, and requests for the same PR under different accounts have separate snoozes.
+- **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), using saved github.com accounts and existing Enterprise host credentials without switching your active CLI account.
+- **Supports Enterprise hosts.** Watch github.com, Enterprise Server and Enterprise Cloud with data residency together; matching repositories on different hosts stay separate.
 - **Follows your desktop appearance.** Use System, Light or Dark in Settings. System is the default, and your choice survives restarts.
-- **Stores no token.** Octowatcher talks to GitHub through the [GitHub CLI](https://cli.github.com/), so it uses the login you already have.
 - **Updates itself.** It looks for a new release every six hours, or right away when you choose **Check for Updates…** from the tray menu. When one is out, a notification offers **Update**. On macOS, and on Linux when you run the AppImage, that installs it and then asks whether to restart now or later.
 
 ## Requirements
@@ -70,15 +71,17 @@ The window has three tabs.
 
 ### Reviews
 
-This tab lists the pull requests waiting on you, most recent request first. Click one to open it on GitHub. The tray menu lists the awake reviews.
+This tab lists the pull requests waiting on you, most recent request first. Each card, tray entry, and review notification includes the receiving `@login`. Click one to open it on GitHub. The tray menu lists the awake reviews. If the same PR needs a review from two accounts, it appears twice and counts twice toward the tray total; snoozing one account's request does not snooze the other.
 
-If GitHub can't completely check a repository, Octowatcher shows the error and keeps unchecked saved reviews and snoozes until a complete check succeeds. Confirmed requests still enter the queue when some team memberships can't be checked, so an unreadable team doesn't hide a direct request. Other repositories continue updating. The saved list may be out of date while an error is shown. Large repositories or long review histories take more API requests to check; GitHub rate-limit errors also preserve the saved list.
+Opening a PR uses your browser's current GitHub session. Octowatcher does not switch your browser login; choose the matching account in GitHub before reviewing.
+
+If GitHub can't completely check a repository, Octowatcher shows the error and keeps unchecked saved reviews and snoozes until a complete check succeeds. Confirmed requests still enter the queue when some team memberships can't be checked, so an unreadable team doesn't hide a direct request. Other repositories continue updating. The saved list may be out of date while an error is shown. Large repositories or long review histories take more API requests to check; GitHub rate-limit errors also preserve the saved list. Unconfirmed github.com requests are hidden for a failed account or repository, while individually confirmed requests can remain visible during an incomplete repository check.
 
 If a team request and your review have exactly the same timestamp, the request stays visible: Octowatcher can't prove which happened first.
 
 **Search and filters** help you find reviews in a busy queue. Search matches title, owner/repository, author, and PR number without regard to case. Every space-separated term must match, and terms can match different fields: `acme alice login` finds login PRs by Alice in an Acme repository. A plain number is a substring search; `#123` matches exactly PR number 123.
 
-Repository choices include the host, so matching owner/repository names on different hosts remain separate. You can also search by host as part of the repository label. Choose a repository, **Ready** (non-draft) or **Draft**, **First review** or **Re-review**, and **Awake** or **Snoozed**. These filters combine with search and each other. All four default to **All**, including snoozed reviews. Repository choices come from the full review list; a selected repository stays selected even if its last PR disappears during a refresh.
+Repository choices include the host, so matching owner/repository names on different hosts remain separate. You can also search by host as part of the repository label. Choose a repository, **Ready** (non-draft) or **Draft**, **First review** or **Re-review**, and **Awake** or **Snoozed**. These filters combine with search and each other. All four default to **All**, including snoozed reviews. Repository choices come from the full available review list, excluding hidden account and repository caches; a selected repository stays selected even if its last PR disappears during a refresh.
 
 The list shows **X of Y reviews**. The Reviews tab keeps the total count, including snoozed PRs. Search and filters only change this window's list: they do not change watched repositories, the tray's awake count/list, or notifications. Your view choices survive refreshes, tab changes, and closing/reopening the window, and reset when you restart the app.
 
@@ -100,11 +103,15 @@ The scan goes up to five levels deep. It skips hidden folders and `node_modules`
 
 **GitHub repositories found** lists every repository that has at least one clone in those folders, with the paths of its clones. Click a repository to switch between **watching** and **off**. Reviews from repositories that are off don't show up and don't notify you.
 
-Enabling a repository checks it right away. If a GitHub check is already running, Octowatcher checks the updated repository list as soon as that check finishes.
+Each github.com repository defaults to **All enabled accounts**. Under **Monitor with**, click account names to restrict it to selected accounts, or choose **All enabled accounts** to restore the default, including accounts added later. Selecting no accounts pauses that repository. Account selections still respect the account's global enable/disable setting. Repository-access errors name the account and repository; check permissions and organization SSO authorization if a private repository is inaccessible. Other accessible repositories continue normally. A failed access check hides that repository’s requests for the affected account and retains its cached reviews and snoozes until access recovers. Successful repository metadata probes are cached in memory for 30 minutes. **Refresh** bypasses this cache. Every poll still verifies each account and fetches repository review pages; incomplete responses retain unconfirmed state.
+
+Enabling a repository checks it right away. Repeated refreshes during a running check coalesce into a follow-up check. Changing account or repository monitoring choices requests a check under the new scope; a running check finishes before its replacement starts.
 
 Octowatcher reads each checkout's Git config, resolving `.git` files and the shared metadata of linked worktrees even when the main clone is outside watched folders. A submodule is included when its folder is watched explicitly; scans do not descend into its parent checkout to find it. It understands scp-like SSH (`git@HOST:owner/repo.git`), `ssh://`, and HTTPS remotes. A clone with several GitHub remotes, like a fork and its upstream, counts for each of them. Repository labels include the host, for example `github.com/owner/repo` and `github.example.com/owner/repo`.
 
 It also reads straightforward literal `Host` / `HostName` aliases from `~/.ssh/config`. For example, `git@github-work:owner/repo.git` maps to the host named by `HostName` in the `Host github-work` block. Aliases work for SSH remotes only, and each alias stays scoped to its destination host. Octowatcher does not evaluate `Include`, `Match`, wildcard or negated SSH host rules; use a direct host remote or a literal alias for those configurations.
+
+SSH aliases identify destinations and do not assign a github.com API account.
 
 If a watched folder is missing or unreadable, or a checkout’s Git metadata cannot be read, the window shows a warning with details in **Repositories**. Octowatcher retains previously discovered repositories in the affected folders, including across restarts, and retries on the next scan. Git configs are streamed without a total file-size limit; individual lines exceeding 64 KiB of content (excluding LF or CRLF terminators) produce the same warning and retention behavior. A successful scan updates the list; removing a watched folder removes its checkouts from the list.
 
@@ -119,7 +126,7 @@ gh auth login --hostname github.example.com
 gh auth login --hostname acme.ghe.com
 ```
 
-Octowatcher recognizes the hosts configured in `gh`, plus github.com. You can watch several hosts at once; only hosts with enabled local repositories are polled for reviews. An expired login remains discoverable, so re-authenticating can recover its reviews. There is no separate host or token list in Octowatcher. It uses gh's active account on each host, including gh's normal environment-token precedence. SSH keys and aliases select a remote destination; they do not select the account used by the API. Multiple accounts on one host are not independently monitored.
+Octowatcher recognizes the hosts configured in `gh`, plus github.com. You can watch several hosts at once; only hosts with enabled local repositories are polled for reviews. An expired login remains discoverable, so re-authenticating can recover its reviews. There is no separate host or token list in Octowatcher. On Enterprise hosts it uses gh's active account, including gh's normal environment-token precedence. SSH keys and aliases select a remote destination; they do not select the account used by the API. Enterprise accounts on one host are not independently monitored; the simultaneous-account controls apply to github.com.
 
 API requests explicitly target the repository's web host. GitHub CLI chooses the endpoint: `api.github.com` for github.com, `HOST/api/v3` and `HOST/api/graphql` for Enterprise Server, and `api.TENANT.ghe.com` for Enterprise Cloud with data residency. Hosts must provide standard HTTPS APIs. Custom API ports, HTTP-only APIs, reverse-proxy path prefixes, and IPv6 host literals are not supported. SSH remote URLs may use a custom SSH port; HTTPS remotes may use the standard port 443.
 
@@ -132,6 +139,10 @@ Self-updates always use `github.com/mattsverse/octowatch`, independently of moni
 Host routing and failure handling are covered by local fixtures and command-routing tests. Enterprise Server and data-residency service behavior has not been exercised against a live Enterprise instance.
 
 ### Settings
+
+**GitHub accounts** lists saved github.com accounts discovered through `gh`. New accounts are enabled automatically. Enable/disable choices and per-repository restrictions follow the verified GitHub user ID when its login changes. Use **Disable** or **Enable** to control monitoring without signing an account out of `gh`. To add an account, run `gh auth login --hostname github.com` in a terminal, sign in as that account, then click **Refresh**. Account additions, removals, and external `gh auth switch` changes are picked up on the next check; changing the CLI's active account does not change which enabled accounts Octowatcher monitors.
+
+If an account is signed out, its authentication expires, or its check fails, its reviews are hidden from the window and tray and it sends no new review notifications. Settings shows an account-specific error. Its cache and snoozes are retained separately; other accounts continue checking. After a successful check, its current reviews return and snoozes that expired while unavailable can notify again. Cached reviews also stay hidden after app restart until the first successful check.
 
 **Appearance** offers **System**, **Light** and **Dark**. System follows the desktop's appearance and updates an open window when it changes. Light and Dark override it immediately, and the choice is saved across restarts. Missing, unrecognized or invalid appearance values default to System while preserving the rest of your saved settings and reviews. The dark palette keeps Octowatcher's existing identity, with clearer muted text and hover states; the light palette uses matching shades. Snoozed reviews use dimmer text while their buttons and status labels stay readable.
 
@@ -158,7 +169,7 @@ Octowatcher observes at most 32 active notifications, with a one-hour action lif
 - **Up / Down** move between the reviews matching your search and filters. **Home / End** move to the first or last matching review. If a Snooze button has focus, these keys move between the Snooze buttons instead.
 - **Command+R / Command+Q** on macOS, or **Control+R / Control+Q** on Linux, refresh reviews or quit.
 
-Focus follows the same review or repository when a background check reorders the list. Matching repository names and PR numbers on different GitHub hosts have separate focus stops and actions. If a focused control disappears, focus moves to a nearby remaining control of the same type when possible, so review-card focus stays on a card and Snooze focus stays on Snooze. Empty and loading lists still allow navigation through the header and tabs.
+Focus follows the same review or repository when a background check reorders the list. Matching repository names and PR numbers on different GitHub hosts or receiving accounts have separate focus stops and actions. Account toggles and per-repository account selections also support keyboard navigation. If a focused control disappears, focus moves to a nearby remaining control of the same type when possible, so review-card focus stays on a card and Snooze focus stays on Snooze. Empty and loading lists still allow navigation through the header and tabs.
 
 The current GPUI dependency (0.2.2) does not expose an accessibility tree or APIs for control roles, accessible names, selected states, or screen-reader announcements. Keyboard access is supported, but the custom window controls cannot currently be exposed to VoiceOver or Linux screen readers. Native menus and dialogs depend on platform support. Full assistive-technology support requires a framework change; this feature does not upgrade GPUI or change saved settings.
 
@@ -168,23 +179,24 @@ Closing the window doesn't quit Octowatcher. It keeps checking from the tray. To
 
 ## Where your data lives
 
-Octowatcher saves your settings (folders, switched-off repositories, check interval, snooze length, appearance, review mute and draft preference), the last discovered checkout paths, your snoozes, the current review list, and undelivered review alerts to one JSON file. Existing state files keep their settings and snoozes; new notification preferences default to unmuted with draft alerts on.
-
-The file lives at:
+Octowatcher saves your settings (folders, switched-off repositories and accounts, per-repository account selections, check interval, snooze length, appearance, review mute and draft preference), the last discovered checkout paths, account-specific snoozes, cached review lists, and undelivered review alerts to one JSON file:
 
 | Platform | Path |
 | --- | --- |
 | macOS | `~/Library/Application Support/octowatcher/state.json` |
 | Linux | `~/.config/octowatcher/state.json` |
 
-State from v0.4.3 and earlier loads automatically: repositories, reviews, snoozes, and queued alerts without a host belong to github.com. Settings and existing snooze deadlines are retained. New state records host-qualified identities; repository switches and snoozes affect only that host.
-
 Delete this file to reset Octowatcher. Everything it sends to GitHub goes through `gh`.
+
+Review and snooze identity includes the GitHub host, repository, and PR number, plus the stable user ID on github.com. Enterprise keeps its existing per-host active-account state. Monitoring preferences also use verified user IDs; older login-based preferences migrate when the corresponding identity is known or verified. Credentials are retrieved by account from `gh`, used temporarily in memory and the child process environment, and never saved to the state file or passed in command arguments. For github.com monitoring and updates, Octowatcher uses saved CLI credentials and ignores inherited `GH_TOKEN`/`GITHUB_TOKEN` overrides. Enterprise host calls retain gh’s normal environment-token precedence. Update checks and downloads can use a healthy saved github.com account even if it is disabled for monitoring.
+
+When upgrading github.com state without account identity, folders, disabled repositories, check interval, and snooze duration are preserved. Old cached reviews, snoozes and undelivered alerts are discarded because their receiving account is unknown; current requests are fetched again and may notify again. Host-qualified Enterprise caches, snoozes and queued alerts are retained, and old repository switches remain compatible.
 
 ## Troubleshooting
 
 - **Notifications are disabled on macOS**: Octowatcher requests permission at startup. If you denied it, enable **Allow Notifications** for **Octowatcher** in **System Settings → Notifications**, then use **Send test notification** or wait for the next successful GitHub check. Octowatcher checks permission before each send.
 - **"could not run `gh`; is the GitHub CLI installed?"**: install the GitHub CLI, or put it in one of the folders listed under [Requirements](#requirements).
+- **An account is unavailable**: run `gh auth status --hostname github.com` in a terminal, sign back into the affected account with `gh auth login --hostname github.com`, then click **Refresh**. Upgrade `gh` if account discovery reports unsupported JSON flags. An environment token alone is not a saved account.
 - **A host reports an API or authentication error**: run `gh auth status --hostname HOST` in a terminal, and `gh auth login --hostname HOST` if you're logged out. Permission or schema errors may require your Enterprise administrator. Other hosts continue updating while this host's cached reviews remain visible.
 - **A team membership check fails**: make sure your GitHub CLI login can read the organization’s teams. For an OAuth CLI login, `gh auth refresh -h HOST -s read:org` can grant the required scope; organizations using SAML SSO may also require authorizing the login for that organization.
 - **"install gh 2.81 or newer"**: update GitHub CLI, then choose **Rescan**. Host discovery uses [JSON authentication status added in gh 2.81](https://github.com/cli/cli/releases/tag/v2.81.0).
