@@ -1,5 +1,8 @@
 mod discovery;
 mod github;
+mod keyboard;
+#[cfg(test)]
+mod keyboard_tests;
 mod notifications;
 mod refresh_queue;
 mod repository;
@@ -22,12 +25,14 @@ use std::{
 use chrono::{DateTime, Local};
 use gpui::{
     App, Application, AsyncApp, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    FontWeight, Global, KeyBinding, ListAlignment, ListOffset, ListState, PathPromptOptions,
-    PromptButton, PromptLevel, ScrollHandle, SharedString, Subscription, Task, Window,
-    WindowBounds, WindowOptions, actions, div, list, point, prelude::*, px, relative, rgb, size,
+    FontWeight, Global, KeyBinding, KeyDownEvent, ListAlignment, ListOffset, ListState,
+    PathPromptOptions, PromptButton, PromptLevel, ScrollHandle, SharedString, Subscription, Task,
+    Window, WindowBounds, WindowOptions, actions, div, list, point, prelude::*, px, relative, rgb,
+    size,
 };
 
 use discovery::LocalRepo;
+use keyboard::{Control, Keyboard};
 use notifications::Response;
 use repository::RepositoryId;
 use review_filter::{DraftFilter, ReviewFilter, ReviewFilterCache, ReviewFilters, SnoozeFilter};
@@ -61,7 +66,7 @@ enum Update {
     Manual(Release),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
     Reviews,
     Repositories,
@@ -75,6 +80,9 @@ struct ReviewListItem {
 }
 
 struct Octowatcher {
+    keyboard: Keyboard,
+    #[cfg(test)]
+    persist: bool,
     store: Store,
     /// `None` until the first scan of the roots finishes.
     repos: Option<Vec<LocalRepo>>,
@@ -132,6 +140,128 @@ struct DiscoveryChanges {
 }
 
 impl Octowatcher {
+    fn controls(&self) -> Vec<Control> {
+        let mut controls = vec![Control::Refresh];
+        if matches!(
+            self.update,
+            Some(Update::Available(_) | Update::Ready(_) | Update::Manual(_))
+        ) {
+            controls.push(Control::Update);
+        }
+        controls.extend([Tab::Reviews, Tab::Repositories, Tab::Settings].map(Control::Tab));
+        match self.tab {
+            Tab::Reviews => {
+                controls.push(Control::Search);
+                controls.extend(
+                    ["review-repository", "reset-review-filters"]
+                        .map(|id| Control::Filter(id.into())),
+                );
+                if self.repository_picker_open {
+                    controls.push(Control::Filter("review-repository-all".into()));
+                    controls.extend(
+                        self.review_filter_cache
+                            .repositories(&self.review_filters)
+                            .into_iter()
+                            .map(|(repo, _)| {
+                                Control::Filter(
+                                    SharedString::from(format!("repo-filter:{repo}")).into(),
+                                )
+                            }),
+                    );
+                }
+                for group in ["draft-filter", "request-filter", "snooze-filter"] {
+                    controls.extend((0usize..3).map(|ix| Control::Filter((group, ix).into())));
+                }
+                let indices = self.review_filter_cache.visible_indices();
+                if indices.is_empty() {
+                    controls.push(Control::Filter("no-results-reset".into()));
+                }
+                for &ix in indices.iter() {
+                    let pr = &self.store.pending[ix];
+                    controls.extend([Control::Review(pr.key()), Control::Snooze(pr.key())]);
+                    if self.snooze_picker.as_ref() == Some(&pr.key())
+                        && self.store.snooze_for(pr).is_none()
+                    {
+                        controls.extend(
+                            snooze_duration_choices(self.store.snooze_minutes)
+                                .map(|minutes| Control::SnoozeDuration(pr.key(), minutes)),
+                        );
+                        controls.push(Control::CancelSnooze(pr.key()));
+                    }
+                }
+            }
+            Tab::Repositories => {
+                controls.extend(self.store.roots.iter().cloned().map(Control::RemoveRoot));
+                controls.extend([Control::AddRoot, Control::Rescan]);
+                controls.extend(
+                    self.repos
+                        .iter()
+                        .flatten()
+                        .map(|repo| Control::Repository(repo.id.clone())),
+                );
+            }
+            Tab::Settings => {
+                controls.extend(Appearance::CHOICES.map(Control::Appearance));
+                controls.extend(POLL_CHOICES.map(Control::Poll));
+                controls.extend(SNOOZE_CHOICES.map(Control::SnoozeMinutes));
+                controls.extend([
+                    Control::MuteNotifications,
+                    Control::NotifyDrafts,
+                    Control::TestNotification,
+                ]);
+            }
+        }
+        controls
+    }
+
+    fn navigate(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let stroke = &event.keystroke;
+        // Leave modified keys to the platform shortcuts and assistive technology.
+        if stroke.modifiers.control || stroke.modifiers.platform || stroke.modifiers.alt {
+            return;
+        }
+        if stroke.key == "escape" {
+            let Some(key) = self.snooze_picker.take() else {
+                return;
+            };
+            self.keyboard.focus(&Control::Snooze(key), window);
+        } else if stroke.key == "tab" {
+            let current = self.keyboard.focused(window);
+            if let Some(next) = self
+                .keyboard
+                .tab_neighbor(current.as_ref(), stroke.modifiers.shift)
+            {
+                self.keyboard.focus(&next, window);
+            }
+        } else if !stroke.modifiers.shift {
+            let Some(current) = self.keyboard.focused(window) else {
+                return;
+            };
+            if let Some(next) = self.keyboard.review_neighbor(&current, &stroke.key) {
+                self.keyboard.focus(&next, window);
+            } else if let Control::Tab(tab) = current {
+                let tabs = [Tab::Reviews, Tab::Repositories, Tab::Settings];
+                let index = tabs.iter().position(|item| *item == tab).unwrap();
+                let next = match stroke.key.as_str() {
+                    "left" => tabs[(index + 2) % 3],
+                    "right" => tabs[(index + 1) % 3],
+                    _ => return,
+                };
+                self.tab = next;
+                self.snooze_picker = None;
+                self.keyboard.scroll.set_offset(gpui::point(px(0.), px(0.)));
+                self.keyboard.focus(&Control::Tab(next), window);
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+        self.keyboard.request_reveal();
+        cx.stop_propagation();
+        cx.notify();
+    }
+
     fn new(cx: &mut Context<Self>) -> Self {
         let startup_and_updates = cx.spawn(async move |this, cx| {
             // Ask without blocking the UI, before any background notification
@@ -190,7 +320,12 @@ impl Octowatcher {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
         };
+        let keyboard = Keyboard::new(cx);
+        let focus_handle = keyboard.root.clone();
         Self {
+            keyboard,
+            #[cfg(test)]
+            persist: true,
             store,
             repos: None,
             tab: Tab::Reviews,
@@ -205,7 +340,7 @@ impl Octowatcher {
             review_scroll: ListState::new(0, ListAlignment::Top, px(0.)),
             review_list_items: Vec::new(),
             snooze_picker: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             _search_subscription: search_subscription,
             #[cfg(test)]
             review_filter_passes: 0,
@@ -303,7 +438,9 @@ impl Octowatcher {
         minutes: u64,
         cx: &mut Context<Self>,
     ) {
-        self.snooze_picker = None;
+        if self.snooze_picker.as_ref() == Some(&key) {
+            self.snooze_picker = None;
+        }
         if self.store.snooze(&key, minutes, Local::now().timestamp()) {
             self.snoozes_changed(cx);
         } else {
@@ -988,6 +1125,10 @@ impl Octowatcher {
     }
 
     fn save(&mut self) {
+        #[cfg(test)]
+        if !self.persist {
+            return;
+        }
         self.save_error = self
             .store
             .save()
@@ -1047,9 +1188,31 @@ fn pr_list(prs: &[PendingReview]) -> String {
 
 impl Render for Octowatcher {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let list_changed = if self.tab == Tab::Reviews {
+            let changed = self.prepare_review_list();
+            self.keyboard
+                .register_search(self.review_search.focus_handle(cx));
+            changed
+        } else {
+            false
+        };
+        self.keyboard.reconcile(self.controls(), window, cx);
+        if list_changed {
+            let offset = self.review_scroll.logical_scroll_top();
+            self.review_scroll.splice_focusable(
+                0..self.review_list_items.len(),
+                self.review_list_items
+                    .iter()
+                    .map(|item| Some(self.keyboard.handle(&Control::Review(item.key.clone())))),
+            );
+            self.review_scroll.scroll_to(offset);
+        }
+        cx.defer_in(window, |this, window, cx| this.reveal_keyboard(window, cx));
         let theme = self.store.appearance.palette(window.appearance());
+        self.keyboard.set_palette(theme);
         self.review_search
             .update(cx, |input, cx| input.set_palette(theme, cx));
+        self.review_control_focus.borrow_mut().clear();
         let content = match self.tab {
             Tab::Reviews => self.render_reviews(theme, cx).into_any_element(),
             Tab::Repositories => self.render_repositories(theme, cx).into_any_element(),
@@ -1061,27 +1224,16 @@ impl Render for Octowatcher {
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::focus_review_search))
             .on_action(cx.listener(|this, _: &ResetReviewFilters, window, cx| {
-                if this.tab == Tab::Reviews {
+                if let Some(key) = this.snooze_picker.take() {
+                    this.keyboard.focus(&Control::Snooze(key), window);
+                    this.keyboard.request_reveal();
+                    cx.notify();
+                } else if this.tab == Tab::Reviews {
                     this.reset_review_filters_and_focus(window, cx);
                 }
             }))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
-                let modifiers = event.keystroke.modifiers;
-                if this.tab == Tab::Reviews
-                    && event.keystroke.key == "tab"
-                    && !modifiers.control
-                    && !modifiers.alt
-                    && !modifiers.platform
-                {
-                    if event.keystroke.modifiers.shift {
-                        window.focus_prev();
-                    } else {
-                        window.focus_next();
-                    }
-                    this.scroll_focused_review_control(window, cx);
-                    cx.stop_propagation();
-                }
-            }))
+            .tab_group()
+            .on_key_down(cx.listener(Self::navigate))
             .flex()
             .flex_col()
             .size_full()
@@ -1094,7 +1246,9 @@ impl Render for Octowatcher {
                     .id("content")
                     .flex_1()
                     .min_h_0()
-                    .when(self.tab != Tab::Reviews, |s| s.overflow_y_scroll())
+                    .when(self.tab != Tab::Reviews, |s| {
+                        s.overflow_y_scroll().track_scroll(&self.keyboard.scroll)
+                    })
                     .when(self.tab == Tab::Reviews, |s| {
                         s.flex().flex_col().overflow_hidden()
                     })
@@ -1148,7 +1302,7 @@ impl Octowatcher {
                                     .text_color(rgb(theme.muted_text))
                                     .child(status),
                             )
-                            .child(button("refresh", "Refresh", theme).on_click(
+                            .child(self.button(Control::Refresh, "Refresh", theme).on_click(
                                 cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx)),
                             )),
                     ),
@@ -1192,7 +1346,7 @@ impl Octowatcher {
             match self.update.as_ref()? {
                 Update::Available(release) => (
                     format!("Octowatcher {} is available.", release.version),
-                    Some(button("install-update", "Update", theme).on_click(
+                    Some(self.button(Control::Update, "Update", theme).on_click(
                         cx.listener(|this, _: &ClickEvent, _, cx| this.install_update(cx)),
                     )),
                 ),
@@ -1200,7 +1354,7 @@ impl Octowatcher {
                 Update::Ready(version) => (
                     format!("Octowatcher {version} is installed."),
                     Some(
-                        button("restart", "Restart", theme)
+                        self.button(Control::Update, "Restart", theme)
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.restart())),
                     ),
                 ),
@@ -1208,7 +1362,7 @@ impl Octowatcher {
                     let url = release.url.clone();
                     (
                         format!("Octowatcher {} is available.", release.version),
-                        Some(button("download-update", "Download", theme).on_click(
+                        Some(self.button(Control::Update, "Download", theme).on_click(
                             cx.listener(move |_, _: &ClickEvent, _, cx| cx.open_url(&url)),
                         )),
                     )
@@ -1237,13 +1391,8 @@ impl Octowatcher {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active = self.tab == tab;
-        let id = match tab {
-            Tab::Reviews => "tab-reviews",
-            Tab::Repositories => "tab-repositories",
-            Tab::Settings => "tab-settings",
-        };
-        div()
-            .id(id)
+        self.keyboard
+            .control(Control::Tab(tab))
             .px_3()
             .py_1()
             .rounded_md()
@@ -1258,6 +1407,7 @@ impl Octowatcher {
             .child(label)
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                 this.tab = tab;
+                this.keyboard.scroll.set_offset(gpui::point(px(0.), px(0.)));
                 this.snooze_picker = None;
                 cx.notify();
             }))
@@ -1296,6 +1446,84 @@ impl Octowatcher {
         window.focus(&self.review_search.focus_handle(cx));
     }
 
+    fn reveal_keyboard(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab != Tab::Reviews {
+            self.keyboard.reveal(window);
+            return;
+        }
+        if !self.keyboard.take_reveal_request() {
+            return;
+        }
+        match self.keyboard.focused(window) {
+            Some(Control::Search | Control::Filter(_)) => {
+                self.scroll_focused_review_control(window, cx);
+            }
+            Some(
+                control @ (Control::Review(_)
+                | Control::Snooze(_)
+                | Control::SnoozeDuration(_, _)
+                | Control::CancelSnooze(_)),
+            ) => {
+                let key = match &control {
+                    Control::Review(key)
+                    | Control::Snooze(key)
+                    | Control::SnoozeDuration(key, _)
+                    | Control::CancelSnooze(key) => key,
+                    _ => unreachable!(),
+                };
+                let Some(ix) = self
+                    .review_list_items
+                    .iter()
+                    .position(|item| &item.key == key)
+                else {
+                    return;
+                };
+                let Some(viewport) = self.keyboard.review_viewport.get() else {
+                    return;
+                };
+                if viewport.size.height <= px(0.) {
+                    return;
+                }
+                if self.review_scroll.bounds_for_item(ix).is_none_or(|row| {
+                    row.bottom() <= viewport.top() || row.top() >= viewport.bottom()
+                }) {
+                    self.review_scroll.scroll_to(ListOffset {
+                        item_ix: ix,
+                        offset_in_item: px(0.),
+                    });
+                    self.keyboard.request_reveal();
+                    window.refresh();
+                    return;
+                }
+                let Some(bounds) = self.keyboard.bounds(&control) else {
+                    // Virtual rows join the render tree before their focus can
+                    // be activated. Retry the reveal after that row is laid out.
+                    self.review_scroll.scroll_to(ListOffset {
+                        item_ix: ix,
+                        offset_in_item: px(0.),
+                    });
+                    self.keyboard.request_reveal();
+                    window.refresh();
+                    return;
+                };
+                let adjustment =
+                    if bounds.top() < viewport.top() || bounds.size.height > viewport.size.height {
+                        bounds.top() - viewport.top()
+                    } else if bounds.bottom() > viewport.bottom() {
+                        bounds.bottom() - viewport.bottom()
+                    } else {
+                        px(0.)
+                    };
+                if adjustment != px(0.) {
+                    self.review_scroll.scroll_by(adjustment);
+                    self.keyboard.request_reveal();
+                    window.refresh();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn scroll_focused_review_control(&self, window: &mut Window, cx: &mut Context<Self>) {
         if self.review_search.focus_handle(cx).is_focused(window) {
             self.review_filter_scroll.set_offset(point(px(0.), px(0.)));
@@ -1314,8 +1542,8 @@ impl Octowatcher {
         cx.notify();
     }
 
-    /// Filter controls alone join the focus order; this doesn't add app-wide
-    /// keyboard navigation to the existing repository/settings controls.
+    /// Filter controls share the app focus order while retaining their
+    /// key-down activation. Key-up cannot activate the same choice again.
     fn review_control(
         &self,
         id: impl Into<gpui::ElementId>,
@@ -1328,21 +1556,18 @@ impl Octowatcher {
         let theme = self.review_search.read(cx).palette();
         let click_pick = pick.clone();
         let id = id.into();
-        let focus = {
-            let mut controls = self.review_control_focus.borrow_mut();
-            let entry = controls
-                .entry(id.clone())
-                .or_insert_with(|| (cx.focus_handle().tab_stop(true), scroll_row));
-            entry.1 = scroll_row;
-            entry.0.clone()
-        };
+        self.review_control_focus.borrow_mut().insert(
+            id.clone(),
+            (
+                self.keyboard.handle(&Control::Filter(id.clone())),
+                scroll_row,
+            ),
+        );
         let label = label.into();
         let selector = format!("review-filter-{label}");
-        div()
-            .id(id)
+        self.keyboard
+            .control(Control::Filter(id))
             .debug_selector(move || selector)
-            .track_focus(&focus)
-            .tab_stop(true)
             .px_2()
             .py_1()
             .rounded_md()
@@ -1359,7 +1584,15 @@ impl Octowatcher {
                 theme.secondary_text
             }))
             .hover(|s| s.border_color(rgb(theme.accent)))
-            .focus(|s| s.border_color(rgb(theme.focus)))
+            .focus(|s| s.border_color(rgb(if active { theme.on_accent } else { theme.focus })))
+            .capture_key_up(|event, window, cx| {
+                if matches!(event.keystroke.key.as_str(), "enter" | "space")
+                    && !event.keystroke.modifiers.modified()
+                {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            })
             .child(div().truncate().child(label))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 let picker_open = this.repository_picker_open;
@@ -1589,7 +1822,8 @@ impl Octowatcher {
             )
     }
 
-    fn render_reviews(&mut self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+    fn prepare_review_list(&mut self) -> bool {
+        let mut changed = false;
         let recomputed = self
             .review_filter_cache
             .refresh(&self.store, &self.review_filters);
@@ -1613,6 +1847,7 @@ impl Octowatcher {
                 })
                 .collect();
             if items != self.review_list_items {
+                changed = true;
                 let old_offset = self.review_scroll.logical_scroll_top();
                 let old_anchor = self.review_list_items.get(old_offset.item_ix);
                 let anchor =
@@ -1628,8 +1863,14 @@ impl Octowatcher {
             }
             self.rendered_snooze_picker = self.snooze_picker.clone();
         }
+        changed
+    }
+
+    fn render_reviews(&mut self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
+        let indices = self.review_filter_cache.visible_indices();
         let count = indices.len();
         let view = cx.entity();
+        let viewport = self.keyboard.review_viewport.clone();
         div()
             .flex()
             .flex_col()
@@ -1682,19 +1923,35 @@ impl Octowatcher {
             })
             .when(count > 0, |s| {
                 s.child(
-                    list(self.review_scroll.clone(), move |ix, _, cx| {
-                        view.update(cx, |this, cx| {
-                            let pending_ix = indices[ix];
-                            div()
-                                .min_h(px(120.))
-                                .pb_2()
-                                .debug_selector(move || format!("review-{pending_ix}"))
-                                .child(this.render_review(pending_ix, theme, cx))
-                                .into_any_element()
-                        })
-                    })
-                    .flex_1()
-                    .min_h_0(),
+                    div()
+                        .relative()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .child(
+                            gpui::canvas(
+                                move |bounds, _, _| viewport.set(Some(bounds)),
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                        .child(
+                            list(self.review_scroll.clone(), move |ix, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    let pending_ix = indices[ix];
+                                    div()
+                                        .min_h(px(120.))
+                                        .pb_2()
+                                        .debug_selector(move || format!("review-{pending_ix}"))
+                                        .child(this.render_review(pending_ix, theme, cx))
+                                        .into_any_element()
+                                })
+                            })
+                            .flex_1()
+                            .min_h_0(),
+                        ),
                 )
             })
     }
@@ -1715,15 +1972,14 @@ impl Octowatcher {
                 .unwrap_or_default()
         });
         let action = if snoozed_until.is_some() {
-            button(("unsnooze", ix), "Unsnooze", theme).on_click(cx.listener(
-                move |this, _: &ClickEvent, _, cx| {
+            self.button(Control::Snooze(pr.key()), "Unsnooze", theme)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     // The card behind the button opens the PR.
                     cx.stop_propagation();
                     this.unsnooze(key.clone(), cx);
-                },
-            ))
+                }))
         } else {
-            button(("snooze", ix), "Snooze…", theme)
+            self.button(Control::Snooze(pr.key()), "Snooze…", theme)
                 .debug_selector(move || format!("snooze-{ix}"))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     cx.stop_propagation();
@@ -1736,12 +1992,8 @@ impl Octowatcher {
         } else {
             None
         };
-        div()
-            .id(SharedString::from(format!(
-                "review:{}#{}",
-                pr.repository(),
-                pr.number
-            )))
+        self.keyboard
+            .control(Control::Review(pr.key()))
             .debug_selector(|| format!("review:{}#{}", pr.repository(), pr.number))
             .flex()
             .flex_col()
@@ -1800,6 +2052,8 @@ impl Octowatcher {
                 card.child(snooze_picker(
                     ix,
                     self.store.snooze_minutes,
+                    &self.keyboard,
+                    key.clone(),
                     theme,
                     cx,
                     move |this, minutes, cx| {
@@ -1821,7 +2075,7 @@ impl Octowatcher {
             .flex_col()
             .gap_2()
             .child(section_title("Watched folders", theme))
-            .children(self.store.roots.iter().enumerate().map(|(ix, root)| {
+            .children(self.store.roots.iter().map(|root| {
                 let root_for_click = root.clone();
                 div()
                     .flex()
@@ -1833,11 +2087,10 @@ impl Octowatcher {
                     .bg(rgb(theme.surface))
                     .child(display_path(root))
                     .child(
-                        button(("remove-root", ix), "Remove", theme).on_click(cx.listener(
-                            move |this, _: &ClickEvent, _, cx| {
+                        self.button(Control::RemoveRoot(root.clone()), "Remove", theme)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                                 this.remove_root(&root_for_click, cx)
-                            },
-                        )),
+                            })),
                     )
             }))
             .child(
@@ -1845,11 +2098,11 @@ impl Octowatcher {
                     .flex()
                     .gap_2()
                     .child(
-                        button("add-root", "Add folder…", theme)
+                        self.button(Control::AddRoot, "Add folder…", theme)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.add_root(cx))),
                     )
                     .child(
-                        button("rescan", "Rescan", theme)
+                        self.button(Control::Rescan, "Rescan", theme)
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.rescan(cx))),
                     ),
             );
@@ -1875,7 +2128,7 @@ impl Octowatcher {
                         .child("No GitHub clones in these folders."),
                 )
             })
-            .children(repos.iter().enumerate().map(|(ix, repo)| {
+            .children(repos.iter().map(|repo| {
                 let enabled = self.store.is_enabled(&repo.id);
                 let id = repo.id.clone();
                 let paths = repo
@@ -1884,8 +2137,8 @@ impl Octowatcher {
                     .map(|p| display_path(p))
                     .collect::<Vec<_>>()
                     .join(", ");
-                div()
-                    .id(("repo", ix))
+                self.keyboard
+                    .control(Control::Repository(repo.id.clone()))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -1936,20 +2189,23 @@ impl Octowatcher {
                     .gap_2()
                     .child(section_title("Appearance", theme))
                     .child(
-                        div().flex().gap_2().children(
-                            Appearance::CHOICES
-                                .into_iter()
-                                .enumerate()
-                                .map(|(ix, appearance)| {
-                                    let active = self.store.appearance == appearance;
-                                    choice(("appearance", ix), appearance.label(), active, theme)
-                                        .on_click(cx.listener(
-                                            move |this, _: &ClickEvent, _, cx| {
-                                                this.set_appearance(appearance, cx);
-                                            },
-                                        ))
-                                }),
-                        ),
+                        div()
+                            .flex()
+                            .gap_2()
+                            .children(Appearance::CHOICES.into_iter().map(|appearance| {
+                                let active = self.store.appearance == appearance;
+                                choice(
+                                    self.keyboard.control(Control::Appearance(appearance)),
+                                    appearance.label(),
+                                    active,
+                                    theme,
+                                )
+                                .on_click(cx.listener(
+                                    move |this, _: &ClickEvent, _, cx| {
+                                        this.set_appearance(appearance, cx);
+                                    },
+                                ))
+                            })),
                     )
                     .child(
                         div()
@@ -1958,19 +2214,17 @@ impl Octowatcher {
                             .child("System follows your desktop’s light or dark appearance."),
                     ),
             )
-            .child(Self::render_choices(
+            .child(self.render_choices(
                 theme,
-                "Check GitHub for review requests every",
-                "poll",
+                ("Check GitHub for review requests every", Control::Poll),
                 &POLL_CHOICES,
                 self.store.poll_minutes,
                 Self::set_poll_minutes,
                 cx,
             ))
-            .child(Self::render_choices(
+            .child(self.render_choices(
                 theme,
-                "Default snooze length",
-                "snooze-minutes",
+                ("Default snooze length", Control::SnoozeMinutes),
                 &SNOOZE_CHOICES,
                 self.store.snooze_minutes,
                 Self::set_snooze_minutes,
@@ -1988,8 +2242,8 @@ impl Octowatcher {
                             .items_center()
                             .gap_3()
                             .child(
-                                button(
-                                    "mute-notifications",
+                                self.button(
+                                    Control::MuteNotifications,
                                     if self.store.notifications_muted {
                                         "Resume review notifications"
                                     } else {
@@ -2014,8 +2268,8 @@ impl Octowatcher {
                             ),
                     )
                     .child(
-                        button(
-                            "notify-drafts",
+                        self.button(
+                            Control::NotifyDrafts,
                             if self.store.notify_drafts {
                                 "Notify about drafts: On"
                             } else {
@@ -2036,7 +2290,7 @@ impl Octowatcher {
                     )
                     .child(
                         div().flex().child(
-                            button("test-notification", "Send test notification", theme)
+                            self.button(Control::TestNotification, "Send test notification", theme)
                                 .debug_selector(|| "test-notification".to_string())
                                 .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                     this.send_test_notification(cx)
@@ -2048,9 +2302,9 @@ impl Octowatcher {
 
     /// A row of minute lengths to pick one from.
     fn render_choices(
+        &self,
         theme: Palette,
-        title: &'static str,
-        id: &'static str,
+        (title, control): (&'static str, fn(u64) -> Control),
         choices: &[u64],
         current: u64,
         pick: fn(&mut Self, u64, &mut Context<Self>),
@@ -2069,11 +2323,26 @@ impl Octowatcher {
                     .children(choices.iter().map(|&minutes| {
                         let active = minutes == current;
                         let label = minutes_label(minutes);
-                        choice((id, minutes as usize), label, active, theme).on_click(
+                        choice(
+                            self.keyboard.control(control(minutes)),
+                            label,
+                            active,
+                            theme,
+                        )
+                        .on_click(
                             cx.listener(move |this, _: &ClickEvent, _, cx| pick(this, minutes, cx)),
                         )
                     })),
             )
+    }
+
+    fn button(
+        &self,
+        key: Control,
+        label: impl Into<SharedString>,
+        theme: Palette,
+    ) -> gpui::Stateful<gpui::Div> {
+        button(self.keyboard.control(key), label, theme)
     }
 }
 
@@ -2081,14 +2350,14 @@ impl Octowatcher {
 fn snooze_picker<T: 'static>(
     ix: usize,
     default_minutes: u64,
+    keyboard: &Keyboard,
+    key: (RepositoryId, u64),
     theme: Palette,
     cx: &mut Context<T>,
     pick: impl Fn(&mut T, Option<u64>, &mut Context<T>) + Clone + 'static,
 ) -> gpui::Stateful<gpui::Div> {
     // Keep a default saved by an older build available even if it isn't a preset.
-    let choices = SNOOZE_CHOICES
-        .into_iter()
-        .chain((!SNOOZE_CHOICES.contains(&default_minutes)).then_some(default_minutes));
+    let choices = snooze_duration_choices(default_minutes);
     div()
         .id(("snooze-picker", ix))
         .debug_selector(move || format!("snooze-picker-{ix}"))
@@ -2111,24 +2380,42 @@ fn snooze_picker<T: 'static>(
                     } else {
                         minutes_label(minutes)
                     };
-                    button(("snooze-duration", minutes as usize), label, theme)
-                        .debug_selector(move || format!("snooze-duration-{ix}-{minutes}"))
-                        .when(is_default, |s| s.border_1().border_color(rgb(theme.accent)))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    button(
+                        keyboard.control(Control::SnoozeDuration(key.clone(), minutes)),
+                        label,
+                        theme,
+                    )
+                    .debug_selector(move || format!("snooze-duration-{ix}-{minutes}"))
+                    .when(is_default, |s| s.border_1().border_color(rgb(theme.accent)))
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
                             pick(this, Some(minutes), cx);
-                        }))
+                        },
+                    ))
                 }))
                 .child(
-                    button("cancel-snooze", "Cancel", theme)
-                        .debug_selector(move || format!("cancel-snooze-{ix}"))
-                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    button(
+                        keyboard.control(Control::CancelSnooze(key.clone())),
+                        "Cancel",
+                        theme,
+                    )
+                    .debug_selector(move || format!("cancel-snooze-{ix}"))
+                    .on_click(cx.listener(
+                        move |this, _: &ClickEvent, _, cx| {
                             cx.stop_propagation();
                             pick(this, None, cx);
-                        })),
+                        },
+                    )),
                 ),
         )
         .on_click(|_: &ClickEvent, _, cx| cx.stop_propagation())
+}
+
+fn snooze_duration_choices(default_minutes: u64) -> impl Iterator<Item = u64> {
+    SNOOZE_CHOICES
+        .into_iter()
+        .chain((!SNOOZE_CHOICES.contains(&default_minutes)).then_some(default_minutes))
 }
 
 fn minutes_label(minutes: u64) -> String {
@@ -2140,13 +2427,13 @@ fn minutes_label(minutes: u64) -> String {
 }
 
 fn choice(
-    id: impl Into<gpui::ElementId>,
+    element: gpui::Stateful<gpui::Div>,
     label: impl Into<SharedString>,
     active: bool,
     theme: Palette,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
+    let label = label.into();
+    element
         .px_3()
         .py_1()
         .rounded_md()
@@ -2161,19 +2448,28 @@ fn choice(
                 .hover(|s| s.bg(rgb(theme.surface_hover)))
         })
         .focus(|s| {
-            s.border_1()
-                .border_color(rgb(if active { theme.on_accent } else { theme.focus }))
+            let s =
+                s.border_1()
+                    .border_color(rgb(if active { theme.on_accent } else { theme.focus }));
+            if active {
+                s.bg(rgb(theme.accent)).text_color(rgb(theme.on_accent))
+            } else {
+                s
+            }
         })
-        .child(label.into())
+        .child(if active {
+            SharedString::from(format!("{label} ✓"))
+        } else {
+            label
+        })
 }
 
 fn button(
-    id: impl Into<gpui::ElementId>,
+    element: gpui::Stateful<gpui::Div>,
     label: impl Into<SharedString>,
     theme: Palette,
 ) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
+    element
         .px_3()
         .py_1()
         .rounded_md()
@@ -2212,6 +2508,18 @@ fn display_path(path: &std::path::Path) -> String {
     }
 }
 
+/// Use the host platform's primary shortcut modifier.
+fn bind_keys(cx: &mut App) {
+    #[cfg(target_os = "macos")]
+    let modifier = "cmd";
+    #[cfg(not(target_os = "macos"))]
+    let modifier = "ctrl";
+    cx.bind_keys([
+        KeyBinding::new(&format!("{modifier}-q"), Quit, None),
+        KeyBinding::new(&format!("{modifier}-r"), Refresh, None),
+    ]);
+}
+
 fn bind_review_keys(cx: &mut App) {
     SearchInput::bind_keys(cx);
     let search_key = if cfg!(target_os = "macos") {
@@ -2233,10 +2541,7 @@ fn main() {
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.on_action(|_: &Refresh, cx| refresh(cx));
         bind_review_keys(cx);
-        cx.bind_keys([
-            KeyBinding::new("cmd-q", Quit, None),
-            KeyBinding::new("cmd-r", Refresh, None),
-        ]);
+        bind_keys(cx);
         cx.set_menus(vec![gpui::Menu {
             name: "Octowatcher".into(),
             items: vec![
@@ -2369,7 +2674,11 @@ mod review_view_tests {
                 this.review_filters_changed(cx);
             },
         );
+        let keyboard = Keyboard::new(cx);
+        let focus_handle = keyboard.root.clone();
         Octowatcher {
+            keyboard,
+            persist: false,
             store: Store {
                 pending: (1..=count)
                     .rev()
@@ -2400,7 +2709,7 @@ mod review_view_tests {
             review_scroll: ListState::new(0, ListAlignment::Top, px(0.)),
             review_list_items: Vec::new(),
             snooze_picker: None,
-            focus_handle: cx.focus_handle(),
+            focus_handle,
             _search_subscription: subscription,
             review_filter_passes: 0,
             last_checked: None,
@@ -3551,12 +3860,20 @@ mod snooze_tests {
     }
 
     struct PickerHarness {
+        keyboard: Keyboard,
         store: Store,
         picked: Vec<Option<u64>>,
     }
 
     impl Render for PickerHarness {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let mut controls: Vec<_> = snooze_duration_choices(self.store.snooze_minutes)
+                .map(|minutes| Control::SnoozeDuration(review(1).key(), minutes))
+                .collect();
+            controls.push(Control::CancelSnooze(review(1).key()));
+            self.keyboard
+                .set_palette(self.store.appearance.palette(window.appearance()));
+            self.keyboard.reconcile(controls, window, cx);
             div()
                 .id("card")
                 .w(px(360.))
@@ -3565,6 +3882,8 @@ mod snooze_tests {
                 .child(snooze_picker(
                     0,
                     self.store.snooze_minutes,
+                    &self.keyboard,
+                    review(1).key(),
                     self.store.appearance.palette(window.appearance()),
                     cx,
                     |this, minutes, _| {
@@ -3580,7 +3899,8 @@ mod snooze_tests {
 
     #[gpui::test]
     fn every_duration_and_picker_background_stop_click_propagation(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, _| PickerHarness {
+        let (view, cx) = cx.add_window_view(|_, cx| PickerHarness {
+            keyboard: Keyboard::new(cx),
             store: Store {
                 pending: vec![review(1)],
                 snooze_minutes: 15,
