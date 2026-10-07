@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_appearance_preserves_the_rest_of_the_store() {
+    fn invalid_appearance_preserves_the_rest_of_the_store() {
         let original = Store {
             roots: vec!["/projects".into()],
             disabled: ["o/off".into()].into(),
@@ -284,17 +284,28 @@ mod tests {
             snooze_minutes: 30,
             ..Store::default()
         };
-        let mut future = serde_json::to_value(&original).unwrap();
-        future["appearance"] = "high_contrast".into();
-        let restored: Store =
-            serde_json::from_slice(&serde_json::to_vec(&future).unwrap()).unwrap();
-        assert_eq!(restored.appearance, Appearance::System);
-        // The next save must retain all existing data, normalizing only the
-        // unsupported preference to the safe default.
-        assert_eq!(
-            serde_json::to_value(&restored).unwrap(),
-            serde_json::to_value(&original).unwrap()
-        );
+        for appearance in [
+            serde_json::json!("high_contrast"),
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::json!(2.5),
+            serde_json::json!([]),
+            serde_json::json!(["dark"]),
+            serde_json::json!({"light": null}),
+        ] {
+            let mut saved = serde_json::to_value(&original).unwrap();
+            saved["appearance"] = appearance.clone();
+            let restored: Store = serde_json::from_slice(&serde_json::to_vec(&saved).unwrap())
+                .unwrap_or_else(|error| panic!("appearance {appearance}: {error}"));
+            assert_eq!(restored.appearance, Appearance::System);
+            // The next save must retain all existing data, normalizing only the
+            // unsupported preference to the safe default.
+            assert_eq!(
+                serde_json::to_value(&restored).unwrap(),
+                serde_json::to_value(&original).unwrap()
+            );
+        }
     }
 
     fn pr(repo: &str, number: u64, requested_at: Option<&str>) -> PendingReview {
