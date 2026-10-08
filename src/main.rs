@@ -192,11 +192,6 @@ impl Octowatcher {
                 }
                 let indices = self.review_filter_cache.visible_indices();
                 if indices.is_empty() {
-                    if !self.store.pending.iter().any(|pr| self.store.visible(pr))
-                        && self.needs_health()
-                    {
-                        controls.extend(self.health_controls());
-                    }
                     controls.push(Control::Filter("no-results-reset".into()));
                 }
                 for &ix in indices.iter() {
@@ -2646,11 +2641,6 @@ impl Octowatcher {
                         .gap_2()
                         .pt_2()
                         .text_color(rgb(theme.muted_text))
-                        .when(
-                            !self.store.pending.iter().any(|pr| self.store.visible(pr))
-                                && needs_health,
-                            |s| s.child(self.render_health(theme, cx)),
-                        )
                         .child(
                             if !self.store.pending.iter().any(|pr| self.store.visible(pr)) {
                                 status.empty_message()
@@ -3835,7 +3825,7 @@ mod review_view_tests {
     }
 
     #[gpui::test]
-    fn empty_loading_and_offline_views_keep_setup_details_and_keyboard_reset(
+    fn empty_loading_and_offline_views_keep_health_in_settings_and_keyboard_reset(
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(bind_review_keys);
@@ -3848,9 +3838,10 @@ mod review_view_tests {
             view
         });
         cx.simulate_resize(size(px(560.), px(680.)));
-        assert!(cx.debug_bounds("setup-health-panel").is_some());
+        assert!(cx.debug_bounds("setup-health-panel").is_none());
         view.read_with(cx, |view, _| {
-            assert_eq!(view.review_status(), ReviewsStatus::Loading)
+            assert_eq!(view.review_status(), ReviewsStatus::Loading);
+            assert!(!view.controls().contains(&Control::HealthRefresh));
         });
         view.update(cx, |view, cx| {
             view.repos = Some(vec![LocalRepo {
@@ -3863,15 +3854,15 @@ mod review_view_tests {
             cx.notify();
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("setup-health-panel").is_some());
+        assert!(cx.debug_bounds("setup-health-panel").is_none());
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_status(), ReviewsStatus::Offline);
             assert_eq!(view.store.last_successful_sync, None);
+            assert!(!view.controls().contains(&Control::HealthRefresh));
         });
         cx.simulate_keystrokes(find_key());
         cx.simulate_input("no-match");
-        let health_controls = view.read_with(cx, |view, _| view.health_controls().len());
-        for _ in 0..12 + health_controls {
+        for _ in 0..12 {
             cx.simulate_keystrokes("tab");
         }
         let reset = cx.debug_bounds("no-results-reset").unwrap();
@@ -3880,6 +3871,13 @@ mod review_view_tests {
         cx.simulate_keystrokes("enter");
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_filters, ReviewFilters::default())
+        });
+        let health = cx.debug_bounds("health-details").unwrap();
+        cx.simulate_click(health.center(), gpui::Modifiers::none());
+        assert!(cx.debug_bounds("setup-health-panel").is_some());
+        view.read_with(cx, |view, _| {
+            assert!(view.tab == Tab::Settings);
+            assert!(view.controls().contains(&Control::HealthRefresh));
         });
     }
 
@@ -5046,7 +5044,7 @@ mod snooze_tests {
     }
 
     #[gpui::test]
-    fn all_hidden_cached_accounts_show_health_instead_of_a_successful_empty_state(
+    fn all_hidden_cached_accounts_stay_unavailable_with_health_in_settings(
         cx: &mut TestAppContext,
     ) {
         let (view, cx) = cx.add_window_view(|_, cx| {
@@ -5059,10 +5057,16 @@ mod snooze_tests {
             app
         });
         cx.run_until_parked();
-        assert!(cx.debug_bounds("setup-health-panel").is_some());
+        assert!(cx.debug_bounds("setup-health-panel").is_none());
         view.read_with(cx, |app, _| {
             assert_eq!(app.store.pending.len(), 2);
             assert_eq!(app.review_status(), ReviewsStatus::Unavailable);
+            assert!(!app.controls().contains(&Control::CopyLogin));
+        });
+        click(cx, "health-details");
+        assert!(cx.debug_bounds("setup-health-panel").is_some());
+        view.read_with(cx, |app, _| {
+            assert!(app.tab == Tab::Settings);
             assert!(app.controls().contains(&Control::CopyLogin));
         });
     }

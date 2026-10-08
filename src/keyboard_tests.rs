@@ -829,7 +829,7 @@ fn health_shortcut_and_recovery_actions_are_keyboard_reachable(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn first_run_health_actions_scroll_into_view_and_keep_reset_reachable(cx: &mut TestAppContext) {
+fn first_run_keeps_reset_reachable_without_health_actions(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut view = fixture(window, cx);
         view.store.pending.clear();
@@ -840,20 +840,8 @@ fn first_run_health_actions_scroll_into_view_and_keep_reset_reachable(cx: &mut T
         view
     });
     cx.simulate_resize(size(px(560.), px(300.)));
+    assert!(cx.debug_bounds("setup-health-panel").is_none());
     focus(&view, Control::Filter(("snooze-filter", 2usize).into()), cx);
-    let health = view.read_with(cx, |view, _| view.health_controls());
-    for control in health {
-        press(cx, "tab");
-        assert_eq!(focused(&view, cx), Some(control.clone()));
-        view.read_with(cx, |view, _| {
-            let bounds = view.keyboard.bounds(&control).unwrap();
-            let viewport = view.review_no_results_scroll.bounds();
-            assert!(
-                bounds.top() >= viewport.top() && bounds.bottom() <= viewport.bottom(),
-                "{control:?}: {bounds:?}, {viewport:?}"
-            );
-        });
-    }
     press(cx, "tab");
     assert_eq!(
         focused(&view, cx),
