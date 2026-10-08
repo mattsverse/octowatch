@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/mattsverse/octowatch/compare/v0.5.0...v0.6.0) (2026-10-08)
+
+
+### Features
+
+* keep setup and health in settings ([646eb6d](https://github.com/mattsverse/octowatch/commit/646eb6d43e0757ec7a6deeca3fcf1a4fab325376))
+* simplify review search and header controls ([4e7a64e](https://github.com/mattsverse/octowatch/commit/4e7a64e09629b3025f6d6698d9b83b48f8afc8b4))
+
 ## [0.5.0](https://github.com/mattsverse/octowatch/compare/v0.4.3...v0.5.0) (2026-10-07)
 
 
