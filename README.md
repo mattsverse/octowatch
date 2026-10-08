@@ -40,6 +40,19 @@ Download the latest build from the [releases page](https://github.com/mattsverse
 
 ### macOS
 
+Install through the [Mattsverse Homebrew tap](https://github.com/mattsverse/homebrew-tap):
+
+```sh
+brew install --cask mattsverse/tap/octowatcher
+```
+
+This also installs GitHub CLI. Run `gh auth login --hostname github.com`, then
+open **Octowatcher** from Applications. To upgrade through Homebrew, quit the
+app and run `brew update` followed by
+`brew upgrade --cask --greedy mattsverse/tap/octowatcher`.
+
+Or install the DMG manually:
+
 1. Open the `.dmg` and drag **Octowatcher** into **Applications**.
 2. Open **Octowatcher** from Applications.
 
@@ -288,6 +301,10 @@ Native desktop checks still need a signed macOS `.app` or a Linux desktop with a
 - Dismiss alerts, use macOS **Clear All**, and leave alerts untouched past their action lifetime. Verify observer/connection counts remain bounded and new queued alerts can be delivered.
 
 ## Releasing
+
+Homebrew setup, credentials, initial rollout, and retry instructions are in the
+[Homebrew distribution guide](packaging/homebrew/README.md). After each stable
+release is published, its publisher updates the cask in `mattsverse/homebrew-tap`.
 
 Merging the release-please pull request creates the `v*` tag and a draft
 GitHub release with its notes. The tag starts the Release workflow. It builds
