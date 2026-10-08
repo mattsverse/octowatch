@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.5.0](https://github.com/mattsverse/octowatch/compare/v0.4.3...v0.5.0) (2026-10-07)
+
+
+### Features
+
+* add keyboard access to the core workflow ([4348f73](https://github.com/mattsverse/octowatch/commit/4348f73f3910952d563e951a69355e64c67a331e))
+* add opt-in background startup and single-instance launches ([40cb67d](https://github.com/mattsverse/octowatch/commit/40cb67da69993847ee537fd610468dc74d42da45))
+* add system and light appearance themes ([920d909](https://github.com/mattsverse/octowatch/commit/920d909b00f5965b0a50ee136b7610fe44abd0dc))
+* choose snooze duration for individual pull requests ([d5e6762](https://github.com/mattsverse/octowatch/commit/d5e6762aa898dd186d270195a457b4cf4d90b9d5))
+* choose snooze duration for individual pull requests ([15ced40](https://github.com/mattsverse/octowatch/commit/15ced4040b6b29934d49e5bdf4c6f3278b521e7d))
+* finish review notification controls and delivery ([b19f51f](https://github.com/mattsverse/octowatch/commit/b19f51f2a6e0d65261e9feec90494a866acec03e))
+* monitor multiple GitHub accounts independently ([1776e10](https://github.com/mattsverse/octowatch/commit/1776e107df33c781ba0a24bda5d91d6f99839b2f))
+* refresh watched repository discovery automatically ([056334d](https://github.com/mattsverse/octowatch/commit/056334df8d6f3d0d32ef201406913cf5461433e4))
+* search and filter pending reviews ([fb422a1](https://github.com/mattsverse/octowatch/commit/fb422a1984d967e5a8fc419cb60b2f3bc81f26c9))
+* show setup readiness and sync health ([4a5dafd](https://github.com/mattsverse/octowatch/commit/4a5dafd9d979c878d5d0639c6d20f61a0b545e8d))
+* support GitHub Enterprise hosts ([8f37317](https://github.com/mattsverse/octowatch/commit/8f37317b26be89242d16fcf9424739980f4a18e5))
+
+
+### Bug Fixes
+
+* adapt Linux notification contract test to host routing ([f5fbd8f](https://github.com/mattsverse/octowatch/commit/f5fbd8f42305552d8f5737c873dcf30577e8b30f))
+* address background startup review findings ([5ce865f](https://github.com/mattsverse/octowatch/commit/5ce865ff3a12b86d655f8b7716b7412af5132a7b))
+* bound GitHub CLI pipe reads by request deadline ([c446520](https://github.com/mattsverse/octowatch/commit/c446520f22b30afd5d64abeac604f147d7446588))
+* bound streamed Git config lines ([5386387](https://github.com/mattsverse/octowatch/commit/5386387ae418aaddb63e11eb84c1e81bfdd26976))
+* confirm saved reviews before launch delivery ([ddb383d](https://github.com/mattsverse/octowatch/commit/ddb383dca1d5f2c9b376497ab997653b044bb95f))
+* continue cached repository checks when discovery fails ([a0790f0](https://github.com/mattsverse/octowatch/commit/a0790f052d7477d233c321aa688d849daf2c2f53))
+* defer notification window reopening until view updates finish ([d452e69](https://github.com/mattsverse/octowatch/commit/d452e69707b8feffbebc94d4f1ea664d3d9e4915))
+* discover GitHub SSH-over-443 clones ([8a3e432](https://github.com/mattsverse/octowatch/commit/8a3e4329dc2e510cc320c66bbfb01735e7593681))
+* exclude Git config line terminators from size limit ([19e6c62](https://github.com/mattsverse/octowatch/commit/19e6c62523575e8e507f3669ff0902c7fc42845e))
+* fetch the complete watched repository review queue ([6bf6932](https://github.com/mattsverse/octowatch/commit/6bf69326dbbc368f50731fcaf9956b986bfb6851))
+* keep instance ownership independent of launch environment ([2145c7e](https://github.com/mattsverse/octowatch/commit/2145c7ebf5575665dfd83a85eda824da8466a191))
+* keep review controls reachable and cache filtering ([a27a199](https://github.com/mattsverse/octowatch/commit/a27a19935cfb549054a481df7368aae723d8e82e))
+* preserve account preferences and unavailable repository state ([55709d8](https://github.com/mattsverse/octowatch/commit/55709d8484f03da1d9cb2835e12e19549ee3977f))
+* preserve control type when recovering keyboard focus ([d65c510](https://github.com/mattsverse/octowatch/commit/d65c5103886ed386c0bdec88dae7a192731d7b95))
+* preserve queued refreshes and unavailable checkout state ([c18e0ba](https://github.com/mattsverse/octowatch/commit/c18e0ba45447f11c016cf334a6c3634f83b85eec))
+* preserve saved state for invalid appearance values ([89c9d84](https://github.com/mattsverse/octowatch/commit/89c9d84711b34edd9c5227003053d5f2d50efd6b))
+* preserve saved state for unknown appearance names ([3881f69](https://github.com/mattsverse/octowatch/commit/3881f693c46e4812185d5d787d87ec9537f89467))
+* preserve stale tray reviews and snooze reminders ([9557af9](https://github.com/mattsverse/octowatch/commit/9557af907d06974d7aa2098673ed964bbd489ecd))
+* resolve omitted review request events before reconciling snoozes ([83d0ff0](https://github.com/mattsverse/octowatch/commit/83d0ff0c265f0a0368a3056b6cfd4cadae3e0be3))
+* retain confirmed requests and queue overlapping refreshes ([6ea67bc](https://github.com/mattsverse/octowatch/commit/6ea67bc5f81c29d5f9f0ce5f6bafa6917b31e9b7))
+* retain undelivered reviews and drain successful sends ([025b844](https://github.com/mattsverse/octowatch/commit/025b844de2a45e02542b75fe21b51546cb054237))
+* update Linux notification fixture for account identity ([60ded1f](https://github.com/mattsverse/octowatch/commit/60ded1f404398c8d909cb4a61d86c91a314f2e80))
+
 ## [0.4.3](https://github.com/mattsverse/octowatch/compare/v0.4.2...v0.4.3) (2026-10-07)
 
 
