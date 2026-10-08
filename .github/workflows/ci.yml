@@ -11,6 +11,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  homebrew:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s packaging/homebrew -p 'test_*.py'
+
   # Linux only: behavioral tests plus an isolated native D-Bus contract test.
   # Live desktop rendering still requires a macOS/Linux desktop check.
   test:
