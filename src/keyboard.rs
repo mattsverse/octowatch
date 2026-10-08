@@ -22,7 +22,6 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Control {
     Refresh,
-    HealthDetails,
     InstallGh,
     CopyLogin,
     HealthFolders,
@@ -253,10 +252,7 @@ impl Keyboard {
         let Some(key) = self.focused(window) else {
             return;
         };
-        if matches!(
-            key,
-            Control::Refresh | Control::HealthDetails | Control::Update | Control::Tab(_)
-        ) {
+        if matches!(key, Control::Refresh | Control::Update | Control::Tab(_)) {
             return;
         }
         let Some(bounds) = self.targets[&key].bounds.get() else {

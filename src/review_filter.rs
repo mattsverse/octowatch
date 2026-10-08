@@ -218,14 +218,28 @@ impl ReviewFilterCache {
     }
 }
 
-#[cfg(test)]
 impl ReviewFilters {
+    pub fn active_count(&self) -> usize {
+        [
+            !self.query.trim().is_empty(),
+            self.repository.is_some(),
+            self.draft != DraftFilter::All,
+            self.review != ReviewFilter::All,
+            self.snooze != SnoozeFilter::All,
+        ]
+        .into_iter()
+        .filter(|active| *active)
+        .count()
+    }
+
+    #[cfg(test)]
     pub fn visible_indices(&self, store: &Store) -> Vec<usize> {
         let mut cache = ReviewFilterCache::default();
         cache.refresh(store, self);
         cache.visible_indices().as_ref().clone()
     }
 
+    #[cfg(test)]
     fn repositories(&self, store: &Store) -> Vec<String> {
         let mut cache = ReviewFilterCache::default();
         cache.refresh(store, self);

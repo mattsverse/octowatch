@@ -102,6 +102,7 @@ struct Octowatcher {
     review_control_focus: RefCell<HashMap<gpui::ElementId, (FocusHandle, Option<usize>)>>,
     rendered_snooze_picker: Option<ReviewKey>,
     review_search: Entity<SearchInput>,
+    review_filters_open: bool,
     repository_picker_open: bool,
     review_scroll: ListState,
     review_list_items: Vec<ReviewListItem>,
@@ -159,7 +160,7 @@ struct DiscoveryChanges {
 
 impl Octowatcher {
     fn controls(&self) -> Vec<Control> {
-        let mut controls = vec![Control::Refresh, Control::HealthDetails];
+        let mut controls = vec![Control::Refresh];
         if matches!(
             self.update,
             Some(Update::Available(_) | Update::Ready(_) | Update::Manual(_))
@@ -169,29 +170,32 @@ impl Octowatcher {
         controls.extend([Tab::Reviews, Tab::Repositories, Tab::Settings].map(Control::Tab));
         match self.tab {
             Tab::Reviews => {
-                controls.push(Control::Search);
-                controls.extend(
-                    ["review-repository", "reset-review-filters"]
-                        .map(|id| Control::Filter(id.into())),
-                );
-                if self.repository_picker_open {
-                    controls.push(Control::Filter("review-repository-all".into()));
+                controls.push(Control::Filter("toggle-review-filters".into()));
+                if self.review_filters_open {
+                    controls.push(Control::Search);
                     controls.extend(
-                        self.review_filter_cache
-                            .repositories(&self.review_filters)
-                            .into_iter()
-                            .map(|(repo, _)| {
-                                Control::Filter(
-                                    SharedString::from(format!("repo-filter:{repo}")).into(),
-                                )
-                            }),
+                        ["review-repository", "reset-review-filters"]
+                            .map(|id| Control::Filter(id.into())),
                     );
-                }
-                for group in ["draft-filter", "request-filter", "snooze-filter"] {
-                    controls.extend((0usize..3).map(|ix| Control::Filter((group, ix).into())));
+                    if self.repository_picker_open {
+                        controls.push(Control::Filter("review-repository-all".into()));
+                        controls.extend(
+                            self.review_filter_cache
+                                .repositories(&self.review_filters)
+                                .into_iter()
+                                .map(|(repo, _)| {
+                                    Control::Filter(
+                                        SharedString::from(format!("repo-filter:{repo}")).into(),
+                                    )
+                                }),
+                        );
+                    }
+                    for group in ["draft-filter", "request-filter", "snooze-filter"] {
+                        controls.extend((0usize..3).map(|ix| Control::Filter((group, ix).into())));
+                    }
                 }
                 let indices = self.review_filter_cache.visible_indices();
-                if indices.is_empty() {
+                if indices.is_empty() && self.review_filters.active_count() > 0 {
                     controls.push(Control::Filter("no-results-reset".into()));
                 }
                 for &ix in indices.iter() {
@@ -416,6 +420,7 @@ impl Octowatcher {
             review_control_focus: RefCell::default(),
             rendered_snooze_picker: None,
             review_search,
+            review_filters_open: false,
             repository_picker_open: false,
             review_scroll: ListState::new(0, ListAlignment::Top, px(0.)),
             review_list_items: Vec::new(),
@@ -1974,30 +1979,13 @@ impl Octowatcher {
             )
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(theme.secondary_text))
-                            .child(self.last_sync_text()),
-                    )
-                    .child(
-                        self.button(Control::HealthDetails, "Setup & health", theme)
-                            .debug_selector(|| "health-details".to_string())
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.tab = Tab::Settings;
-                                this.keyboard.scroll.set_offset(point(px(0.), px(0.)));
-                                this.snooze_picker = None;
-                                cx.notify();
-                            })),
-                    ),
+                    .text_xs()
+                    .text_color(rgb(theme.secondary_text))
+                    .child(self.last_sync_text()),
             )
             .when(!self.errors().is_empty(), |s| {
                 s.child(div().text_xs().text_color(rgb(theme.error)).child(format!(
-                    "{} issue(s) need attention — see Setup & health",
+                    "{} issue(s) need attention — see Settings",
                     self.errors().len()
                 )))
             })
@@ -2089,6 +2077,7 @@ impl Octowatcher {
         let active = self.tab == tab;
         self.keyboard
             .control(Control::Tab(tab))
+            .debug_selector(move || format!("tab-{tab:?}"))
             .px_3()
             .py_1()
             .rounded_md()
@@ -2116,6 +2105,7 @@ impl Octowatcher {
         cx: &mut Context<Self>,
     ) {
         self.tab = Tab::Reviews;
+        self.review_filters_open = true;
         self.review_filter_scroll.set_offset(point(px(0.), px(0.)));
         window.focus(&self.review_search.focus_handle(cx));
         cx.notify();
@@ -2139,7 +2129,12 @@ impl Octowatcher {
 
     fn reset_review_filters_and_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reset_review_filters(cx);
-        window.focus(&self.review_search.focus_handle(cx));
+        if self.review_filters_open {
+            window.focus(&self.review_search.focus_handle(cx));
+        } else {
+            self.keyboard
+                .focus(&Control::Filter("toggle-review-filters".into()), window);
+        }
     }
 
     fn reveal_keyboard(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2240,6 +2235,9 @@ impl Octowatcher {
     }
 
     fn scroll_focused_review_control(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.keyboard.focused(window) == Some(Control::Filter("toggle-review-filters".into())) {
+            return;
+        }
         if self.review_search.focus_handle(cx).is_focused(window) {
             self.review_filter_scroll.set_offset(point(px(0.), px(0.)));
         } else if let Some((_, row)) = self
@@ -2312,7 +2310,7 @@ impl Octowatcher {
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 let picker_open = this.repository_picker_open;
                 click_pick(this, window, cx);
-                if picker_open && !this.repository_picker_open {
+                if picker_open && !this.repository_picker_open && this.review_filters_open {
                     window.focus(&this.review_search.focus_handle(cx));
                 }
             }))
@@ -2323,7 +2321,7 @@ impl Octowatcher {
                     {
                         let picker_open = this.repository_picker_open;
                         pick(this, window, cx);
-                        if picker_open && !this.repository_picker_open {
+                        if picker_open && !this.repository_picker_open && this.review_filters_open {
                             window.focus(&this.review_search.focus_handle(cx));
                         }
                         cx.stop_propagation();
@@ -2354,6 +2352,7 @@ impl Octowatcher {
         };
         div()
             .id("review-filter-controls")
+            .debug_selector(|| "review-filter-controls".into())
             .max_h(relative(0.35))
             .overflow_y_scroll()
             .track_scroll(&self.review_filter_scroll)
@@ -2586,6 +2585,23 @@ impl Octowatcher {
         let needs_health = self.needs_health();
         let indices = self.review_filter_cache.visible_indices();
         let count = indices.len();
+        let total = self
+            .store
+            .pending
+            .iter()
+            .filter(|pr| self.store.visible(pr))
+            .count();
+        let active_filters = self.review_filters.active_count();
+        let arrow = if self.review_filters_open {
+            "▴"
+        } else {
+            "▾"
+        };
+        let filter_label = if active_filters > 0 {
+            format!("Search & filters ({active_filters} active) {arrow}")
+        } else {
+            format!("Search & filters {arrow}")
+        };
         let view = cx.entity();
         let viewport = self.keyboard.review_viewport.clone();
         div()
@@ -2594,7 +2610,44 @@ impl Octowatcher {
             .h_full()
             .min_h_0()
             .gap_2()
-            .child(self.render_review_filters(cx))
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .flex_shrink_0()
+                    .child(
+                        self.review_control(
+                            "toggle-review-filters",
+                            filter_label,
+                            active_filters > 0,
+                            None,
+                            |this, window, cx| {
+                                this.review_filters_open = !this.review_filters_open;
+                                this.repository_picker_open = false;
+                                this.review_filter_scroll.set_offset(point(px(0.), px(0.)));
+                                this.keyboard.focus(
+                                    &Control::Filter("toggle-review-filters".into()),
+                                    window,
+                                );
+                                cx.notify();
+                            },
+                            cx,
+                        )
+                        .debug_selector(|| "toggle-review-filters".into()),
+                    )
+                    .child(div().text_xs().text_color(rgb(theme.secondary_text)).child(
+                        if active_filters > 0 {
+                            format!("{count} of {total} reviews")
+                        } else {
+                            format!("{total} reviews")
+                        },
+                    )),
+            )
+            .when(self.review_filters_open, |s| {
+                s.child(self.render_review_filters(cx))
+            })
             .when(
                 needs_health && self.store.pending.iter().any(|pr| self.store.visible(pr)),
                 |s| {
@@ -2605,26 +2658,12 @@ impl Octowatcher {
                             .text_color(rgb(theme.warning))
                             .debug_selector(|| "review-health-warning".into())
                             .child(if status != ReviewsStatus::Ready {
-                                "Last known reviews · may be stale. See Setup & health."
+                                "Last known reviews · may be stale. See Settings."
                             } else {
-                                "Setup & health needs attention."
+                                "Setup needs attention. See Settings."
                             }),
                     )
                 },
-            )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .text_xs()
-                    .text_color(rgb(theme.secondary_text))
-                    .child(format!(
-                        "{count} of {} reviews · filters only affect this list",
-                        self.store
-                            .pending
-                            .iter()
-                            .filter(|pr| self.store.visible(pr))
-                            .count()
-                    )),
             )
             .when(count == 0, |s| {
                 s.child(
@@ -2648,17 +2687,19 @@ impl Octowatcher {
                                 "No reviews match your search and filters."
                             },
                         )
-                        .child(
-                            self.review_control(
-                                "no-results-reset",
-                                "Reset search and filters",
-                                false,
-                                None,
-                                Self::reset_review_filters_and_focus,
-                                cx,
+                        .when(active_filters > 0, |s| {
+                            s.child(
+                                self.review_control(
+                                    "no-results-reset",
+                                    "Reset search and filters",
+                                    false,
+                                    None,
+                                    Self::reset_review_filters_and_focus,
+                                    cx,
+                                )
+                                .debug_selector(|| "no-results-reset".into()),
                             )
-                            .debug_selector(|| "no-results-reset".into()),
-                        ),
+                        }),
                 )
             })
             .when(count > 0, |s| {
@@ -3742,6 +3783,7 @@ mod review_view_tests {
             review_control_focus: RefCell::default(),
             rendered_snooze_picker: None,
             review_search,
+            review_filters_open: false,
             repository_picker_open: false,
             review_scroll: ListState::new(0, ListAlignment::Top, px(0.)),
             review_list_items: Vec::new(),
@@ -3791,6 +3833,90 @@ mod review_view_tests {
     }
 
     #[gpui::test]
+    fn dropdown_hides_controls_preserves_filters_and_resets_while_closed(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(bind_review_keys);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let view = fixture(cx, 10);
+            window.focus(&view.focus_handle);
+            view
+        });
+        cx.simulate_resize(size(px(560.), px(680.)));
+        assert!(cx.debug_bounds("review-filter-controls").is_none());
+        assert!(cx.debug_bounds("review:github.com/acme/api#10").is_some());
+        let list_height = view.read_with(cx, |view, _| {
+            view.keyboard.review_viewport.get().unwrap().size.height
+        });
+        let toggle = cx.debug_bounds("toggle-review-filters").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("review-filter-controls").is_some());
+        view.read_with(cx, |view, _| {
+            assert!(view.keyboard.review_viewport.get().unwrap().size.height < list_height);
+        });
+
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_input("#3");
+        cx.simulate_keystrokes("tab tab tab tab enter"); // Ready.
+        let filters = view.read_with(cx, |view, _| {
+            assert_eq!(view.review_scroll.item_count(), 1);
+            assert_eq!(view.review_filters.active_count(), 2);
+            view.review_filters.clone()
+        });
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_keystrokes("tab enter"); // Open the repository picker.
+        let toggle = cx.debug_bounds("toggle-review-filters").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.review_filters_open);
+            assert!(!view.repository_picker_open);
+            assert_eq!(view.review_filters, filters);
+            assert_eq!(view.review_scroll.item_count(), 1);
+            assert_eq!(view.store.awake().len(), 10);
+            assert!(!view.controls().contains(&Control::Search));
+            assert_eq!(
+                view.keyboard.review_viewport.get().unwrap().size.height,
+                list_height
+            );
+        });
+        cx.simulate_keystrokes("tab");
+        cx.update(|window, cx| {
+            assert_eq!(
+                view.read(cx).keyboard.focused(window),
+                Some(Control::Review(view.read(cx).store.pending[7].key()))
+            );
+        });
+
+        // Find reopens the dropdown and focuses the retained query.
+        cx.simulate_keystrokes(find_key());
+        cx.simulate_input("no-match");
+        let toggle = cx.debug_bounds("toggle-review-filters").unwrap();
+        cx.simulate_click(toggle.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        let reset = cx.debug_bounds("no-results-reset").unwrap();
+        cx.simulate_click(reset.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(!view.review_filters_open);
+            assert!(
+                !view
+                    .controls()
+                    .contains(&Control::Filter("no-results-reset".into()))
+            );
+            assert_eq!(view.review_filters, ReviewFilters::default());
+            assert_eq!(view.review_scroll.item_count(), 10);
+        });
+        cx.update(|window, cx| {
+            assert_eq!(
+                view.read(cx).keyboard.focused(window),
+                Some(Control::Filter("toggle-review-filters".into()))
+            );
+        });
+    }
+
+    #[gpui::test]
     fn filtered_cached_reviews_keep_the_offline_warning_and_health_navigation(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -3815,8 +3941,8 @@ mod review_view_tests {
             assert_eq!(view.store.awake().len(), 2);
             assert_eq!(view.store.last_successful_sync, last_success);
         });
-        let health = cx.debug_bounds("health-details").unwrap();
-        cx.simulate_click(health.center(), gpui::Modifiers::none());
+        let settings = cx.debug_bounds("tab-Settings").unwrap();
+        cx.simulate_click(settings.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("setup-health-panel").is_some());
         view.read_with(cx, |view, _| {
             assert!(view.tab == Tab::Settings);
@@ -3872,8 +3998,8 @@ mod review_view_tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_filters, ReviewFilters::default())
         });
-        let health = cx.debug_bounds("health-details").unwrap();
-        cx.simulate_click(health.center(), gpui::Modifiers::none());
+        let settings = cx.debug_bounds("tab-Settings").unwrap();
+        cx.simulate_click(settings.center(), gpui::Modifiers::none());
         assert!(cx.debug_bounds("setup-health-panel").is_some());
         view.read_with(cx, |view, _| {
             assert!(view.tab == Tab::Settings);
@@ -4133,7 +4259,7 @@ mod review_view_tests {
             );
             assert!(
                 viewport.bottom() < px(260.),
-                "filters must leave room for reviews"
+                "filters must leave room for reviews: {viewport:?}"
             );
             assert_eq!(view.review_scroll.item_count(), 2);
         });
@@ -5063,7 +5189,7 @@ mod snooze_tests {
             assert_eq!(app.review_status(), ReviewsStatus::Unavailable);
             assert!(!app.controls().contains(&Control::CopyLogin));
         });
-        click(cx, "health-details");
+        click(cx, "tab-Settings");
         assert!(cx.debug_bounds("setup-health-panel").is_some());
         view.read_with(cx, |app, _| {
             assert!(app.tab == Tab::Settings);
@@ -5159,7 +5285,7 @@ mod snooze_tests {
             cx.run_until_parked();
             click(cx, "snooze-0");
             assert!(view.read_with(cx, |v, _| v.snooze_picker.is_some()));
-            click(cx, "health-details");
+            click(cx, "tab-Settings");
             assert!(view.read_with(cx, |v, _| v.tab == Tab::Settings
                 && v.snooze_picker.is_none()));
             assert_eq!(cx.opened_url(), None);

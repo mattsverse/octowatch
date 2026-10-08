@@ -69,17 +69,11 @@ fn tab_traversal_and_tab_arrows(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(fixture);
     let mut expected = vec![
         Control::Refresh,
-        Control::HealthDetails,
         Control::Tab(Tab::Reviews),
         Control::Tab(Tab::Repositories),
         Control::Tab(Tab::Settings),
-        Control::Search,
-        Control::Filter("review-repository".into()),
-        Control::Filter("reset-review-filters".into()),
+        Control::Filter("toggle-review-filters".into()),
     ];
-    for group in ["draft-filter", "request-filter", "snooze-filter"] {
-        expected.extend((0usize..3).map(|ix| Control::Filter((group, ix).into())));
-    }
     expected.extend([
         Control::Review(key(1)),
         Control::Snooze(key(1)),
@@ -122,6 +116,8 @@ fn filtered_virtual_reviews_keep_traversal_activation_and_escape_behavior(cx: &m
     });
     cx.run_until_parked();
 
+    focus(&view, Control::Filter("toggle-review-filters".into()), cx);
+    press(cx, "space");
     // A physical press includes key-up: opening must happen exactly once.
     focus(&view, Control::Filter("review-repository".into()), cx);
     press(cx, "enter");
@@ -511,12 +507,11 @@ fn focus_survives_reordering_and_recovers_from_removed_reviews(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(
         focused(&view, cx),
-        Some(Control::Filter("no-results-reset".into()))
+        Some(Control::Filter("toggle-review-filters".into()))
     );
     // Header navigation works with no reviews while a check/scan is pending.
     for expected in [
         Control::Refresh,
-        Control::HealthDetails,
         Control::Tab(Tab::Reviews),
         Control::Tab(Tab::Repositories),
         Control::Tab(Tab::Settings),
@@ -559,7 +554,7 @@ fn folder_focus_and_window_reopening(cx: &mut TestAppContext) {
     let mut reopened = VisualTestContext::from_window(window, &cx.cx);
     press(&mut reopened, "tab");
     assert_eq!(focused(&view, &mut reopened), Some(Control::Refresh));
-    press(&mut reopened, "tab tab tab tab tab");
+    press(&mut reopened, "tab tab tab tab");
     assert_eq!(focused(&view, &mut reopened), Some(Control::AddRoot));
 }
 
@@ -786,7 +781,7 @@ fn launch_at_login_follows_appearance_and_supports_keyboard_activation(cx: &mut 
 }
 
 #[gpui::test]
-fn health_shortcut_and_recovery_actions_are_keyboard_reachable(cx: &mut TestAppContext) {
+fn settings_tab_and_health_recovery_actions_are_keyboard_reachable(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut view = fixture(window, cx);
         view.tab = Tab::Reviews;
@@ -795,8 +790,8 @@ fn health_shortcut_and_recovery_actions_are_keyboard_reachable(cx: &mut TestAppC
         view
     });
     cx.simulate_resize(size(px(560.), px(300.)));
-    press(cx, "tab tab");
-    assert_eq!(focused(&view, cx), Some(Control::HealthDetails));
+    press(cx, "tab tab tab tab");
+    assert_eq!(focused(&view, cx), Some(Control::Tab(Tab::Settings)));
     press(cx, "space");
     view.read_with(cx, |view, _| assert_eq!(view.tab, Tab::Settings));
     focus(&view, Control::Tab(Tab::Settings), cx);
@@ -829,7 +824,7 @@ fn health_shortcut_and_recovery_actions_are_keyboard_reachable(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn first_run_keeps_reset_reachable_without_health_actions(cx: &mut TestAppContext) {
+fn first_run_keeps_search_optional_and_keyboard_reachable(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut view = fixture(window, cx);
         view.store.pending.clear();
@@ -841,19 +836,12 @@ fn first_run_keeps_reset_reachable_without_health_actions(cx: &mut TestAppContex
     });
     cx.simulate_resize(size(px(560.), px(300.)));
     assert!(cx.debug_bounds("setup-health-panel").is_none());
-    focus(&view, Control::Filter(("snooze-filter", 2usize).into()), cx);
-    press(cx, "tab");
-    assert_eq!(
-        focused(&view, cx),
-        Some(Control::Filter("no-results-reset".into()))
-    );
-    let reset = cx.debug_bounds("no-results-reset").unwrap();
-    view.read_with(cx, |view, _| {
-        let viewport = view.review_no_results_scroll.bounds();
-        assert!(reset.top() >= viewport.top() && reset.bottom() <= viewport.bottom());
-    });
-    press(cx, "enter");
+    assert!(cx.debug_bounds("no-results-reset").is_none());
+    assert!(cx.debug_bounds("review-filter-controls").is_none());
+    focus(&view, Control::Tab(Tab::Settings), cx);
+    press(cx, "tab enter tab");
     assert_eq!(focused(&view, cx), Some(Control::Search));
+    view.read_with(cx, |view, _| assert!(view.review_filters_open));
     assert_eq!(cx.opened_url(), None);
 }
 
