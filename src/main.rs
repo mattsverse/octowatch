@@ -813,6 +813,7 @@ impl Octowatcher {
                     ..Default::default()
                 });
                 this.reconcile(poll, enterprise, error, cx);
+                this.deliver_reviews(cx);
                 cx.notify();
             })
             .ok();
