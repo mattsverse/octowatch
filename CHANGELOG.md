@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.1](https://github.com/mattsverse/octowatch/compare/v0.6.0...v0.6.1) (2026-10-09)
+
+
+### Bug Fixes
+
+* deliver notifications ([06698a1](https://github.com/mattsverse/octowatch/commit/06698a137c5c1c6fa9e922d7d70eae8e08392728))
+
 ## [0.6.0](https://github.com/mattsverse/octowatch/compare/v0.5.0...v0.6.0) (2026-10-08)
 
 
