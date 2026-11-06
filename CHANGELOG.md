@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/mattsverse/octowatch/compare/v0.6.1...v0.7.0) (2026-11-06)
+
+
+### Features
+
+* rebuild the window on Rune instead of gpui ([95c39a5](https://github.com/mattsverse/octowatch/commit/95c39a513379287d697e38e75ea2c2c8d962d5de))
+
+
+### Bug Fixes
+
+* bump Cargo.lock entries in release PRs ([ce8487d](https://github.com/mattsverse/octowatch/commit/ce8487dde4e48ac0c895ca64ec6229c4d322b558))
+
 ## [0.6.1](https://github.com/mattsverse/octowatch/compare/v0.6.0...v0.6.1) (2026-10-09)
 
 
