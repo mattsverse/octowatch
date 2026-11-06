@@ -8,6 +8,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     rc::Rc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -123,6 +124,12 @@ pub enum Job {
     },
     CheckUpdate,
     Install(Release),
+    /// Writes a snapshot of the store to disk.
+    Save {
+        store: Box<Store>,
+        generation: u64,
+        gate: Arc<SaveGate>,
+    },
 }
 
 /// Identifies a running job. Starting a job replaces (and cancels) any
@@ -137,6 +144,7 @@ pub enum JobKey {
     Notification(usize),
     UpdateCheck,
     Install,
+    Save,
 }
 
 /// A timer the shell provides, so jobs can time out on its executor.
@@ -162,6 +170,7 @@ pub enum Done {
         enterprise: anyhow::Result<github::FetchedReviews>,
     },
     UpdateChecked(anyhow::Result<Option<Release>>),
+    Saved(anyhow::Result<()>),
     Installed {
         release: Release,
         result: anyhow::Result<PathBuf>,
@@ -290,6 +299,12 @@ pub struct Engine {
     fetching: bool,
     checking_permission: bool,
     checking_update: bool,
+    /// Bumped by every change that should reach disk.
+    save_generation: u64,
+    saving: bool,
+    /// Changes arrived while a save was running; save again when it ends.
+    save_pending: bool,
+    save_gate: Arc<SaveGate>,
     /// Whether the running update check answers in a dialog.
     manual_update_check: bool,
     effects: Vec<Effect>,
@@ -354,6 +369,10 @@ impl Engine {
             fetching: false,
             checking_permission: false,
             checking_update: false,
+            save_generation: 0,
+            saving: false,
+            save_pending: false,
+            save_gate: Arc::default(),
             manual_update_check: false,
             effects: Vec::new(),
         }
@@ -535,6 +554,7 @@ impl Engine {
             Done::Fetched { public, enterprise } => self.fetched(public, enterprise),
             Done::UpdateChecked(checked) => self.update_checked(checked),
             Done::Installed { release, result } => self.installed(release, result),
+            Done::Saved(result) => self.saved(result),
         }
     }
 
@@ -1293,15 +1313,79 @@ impl Engine {
         }
     }
 
+    /// Saves off the UI thread. One save runs at a time; changes made
+    /// meanwhile coalesce into one follow-up with the latest state.
     fn save(&mut self) {
         if !self.persist {
             return;
         }
-        self.save_error = self
-            .store
-            .save()
+        self.save_generation += 1;
+        if self.saving {
+            self.save_pending = true;
+        } else {
+            self.start_save();
+        }
+    }
+
+    fn start_save(&mut self) {
+        self.saving = true;
+        self.spawn(Job::Save {
+            store: Box::new(self.store.clone()),
+            generation: self.save_generation,
+            gate: self.save_gate.clone(),
+        });
+    }
+
+    fn saved(&mut self, result: anyhow::Result<()>) {
+        self.saving = false;
+        self.save_error = result
             .err()
             .map(|err| format!("could not save state: {err:#}"));
+        if std::mem::take(&mut self.save_pending) {
+            self.start_save();
+        }
+    }
+
+    /// Writes any unsaved state now, on this thread, for when the app is about
+    /// to exit and a background save might not finish.
+    pub fn flush(&mut self) {
+        if !self.persist || self.save_gate.written() >= self.save_generation {
+            return;
+        }
+        let result = self
+            .save_gate
+            .write(self.save_generation, || self.store.save());
+        self.save_error = result
+            .err()
+            .map(|err| format!("could not save state: {err:#}"));
+    }
+}
+
+/// Serializes writes of the state file and keeps an older snapshot from
+/// replacing a newer one, whichever thread gets there first.
+#[derive(Default)]
+pub struct SaveGate {
+    written: Mutex<u64>,
+}
+
+impl SaveGate {
+    fn written(&self) -> u64 {
+        *self.written.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Runs `write` for `generation` unless a newer one is already on disk.
+    fn write(
+        &self,
+        generation: u64,
+        write: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let mut written = self.written.lock().unwrap_or_else(|err| err.into_inner());
+        if generation <= *written {
+            return Ok(());
+        }
+        write()?;
+        *written = generation;
+        Ok(())
     }
 }
 
@@ -1475,6 +1559,7 @@ impl Job {
             }
             Self::CheckUpdate => JobKey::UpdateCheck,
             Self::Install(_) => JobKey::Install,
+            Self::Save { .. } => JobKey::Save,
         }
     }
 
@@ -1560,6 +1645,13 @@ impl Job {
                 Event::NotificationResponse { slot, response }
             })),
             Self::CheckUpdate => Work::Blocking(Box::new(|| Done::UpdateChecked(updater::check()))),
+            Self::Save {
+                store,
+                generation,
+                gate,
+            } => Work::Blocking(Box::new(move || {
+                Done::Saved(gate.write(generation, || store.save()))
+            })),
             Self::Install(release) => Work::Blocking(Box::new(move || {
                 let result = updater::install(&release);
                 Done::Installed { release, result }

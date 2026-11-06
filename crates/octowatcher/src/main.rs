@@ -94,6 +94,8 @@ struct Octowatcher {
     restart_path: Option<PathBuf>,
     /// Reattached when a closed window is opened again.
     appearance_subscription: Option<Subscription>,
+    /// Writes unsaved state before exit, which a background save can miss.
+    _flush_on_quit: Subscription,
 }
 
 impl Octowatcher {
@@ -279,6 +281,10 @@ impl Octowatcher {
         };
         let keyboard = Keyboard::new(cx);
         let focus_handle = keyboard.root.clone();
+        let flush_on_quit = cx.on_app_quit(|this, _| {
+            this.engine.flush();
+            async {}
+        });
         Self {
             keyboard,
             engine,
@@ -310,6 +316,7 @@ impl Octowatcher {
             #[cfg(target_os = "linux")]
             restart_path: None,
             appearance_subscription: None,
+            _flush_on_quit: flush_on_quit,
         }
     }
 
@@ -2738,6 +2745,7 @@ mod review_view_tests {
         );
         let keyboard = Keyboard::new(cx);
         let focus_handle = keyboard.root.clone();
+        let flush_on_quit = cx.on_app_quit(|_, _| async {});
         let mut engine = Engine::settled(Store {
             pending: (1..=count)
                 .rev()
@@ -2803,6 +2811,7 @@ mod review_view_tests {
             #[cfg(target_os = "linux")]
             restart_path: None,
             appearance_subscription: None,
+            _flush_on_quit: flush_on_quit,
         }
     }
 

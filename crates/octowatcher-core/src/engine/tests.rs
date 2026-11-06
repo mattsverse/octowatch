@@ -779,3 +779,86 @@ fn manual_update_checks_answer_in_a_dialog_and_scheduled_ones_stay_quiet() {
             .any(|effect| matches!(effect, Effect::Prompt(_)))
     );
 }
+
+/// Snapshots of each started save.
+fn saves(effects: &[Effect]) -> Vec<&Store> {
+    effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::Start(Job::Save { store, .. }) => Some(&**store),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn saves_run_one_at_a_time_and_coalesce_changes_made_meanwhile() {
+    let mut app = engine();
+    app.persist = true;
+    let effects = app.handle(Command::SetPollMinutes(5));
+    assert_eq!(saves(&effects).len(), 1, "the first change saves at once");
+    let effects = app.handle(Command::SetSnoozeMinutes(30));
+    assert!(saves(&effects).is_empty());
+    let effects = app.handle(Command::SetAppearance(Appearance::Dark));
+    assert!(saves(&effects).is_empty());
+    let effects = app.handle(Done::Saved(Ok(())));
+    let follow_up = saves(&effects);
+    assert_eq!(follow_up.len(), 1, "changes during a save coalesce");
+    assert_eq!(follow_up[0].snooze_minutes, 30);
+    assert_eq!(follow_up[0].appearance, Appearance::Dark);
+    let effects = app.handle(Done::Saved(Ok(())));
+    assert!(saves(&effects).is_empty(), "nothing left to save");
+}
+
+#[test]
+fn save_errors_are_reported_until_a_later_save_succeeds() {
+    let mut app = engine();
+    app.persist = true;
+    app.handle(Command::SetPollMinutes(5));
+    app.handle(Done::Saved(Err(anyhow::anyhow!("disk full"))));
+    assert!(
+        app.errors(None)
+            .contains(&"could not save state: disk full")
+    );
+    app.handle(Command::SetPollMinutes(10));
+    app.handle(Done::Saved(Ok(())));
+    assert!(app.errors(None).iter().all(|error| !error.contains("save")));
+}
+
+#[test]
+fn an_older_snapshot_never_replaces_a_newer_one() {
+    let gate = SaveGate::default();
+    let mut writes = Vec::new();
+    gate.write(2, || {
+        writes.push(2);
+        Ok(())
+    })
+    .unwrap();
+    gate.write(1, || {
+        writes.push(1);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(writes, vec![2]);
+    // A failed write doesn't count as written.
+    assert!(gate.write(3, || Err(anyhow::anyhow!("disk full"))).is_err());
+    assert_eq!(gate.written(), 2);
+}
+
+#[test]
+fn flush_writes_unsaved_state_and_skips_when_up_to_date() {
+    let mut app = engine();
+    app.persist = true;
+    // Already on disk: nothing to write.
+    app.flush();
+    assert!(app.errors(None).iter().all(|error| !error.contains("save")));
+    // A pending change is written now. The fixture blocks real writes, so
+    // the attempt shows up as an error instead of touching the user's state.
+    app.handle(Command::SetPollMinutes(5));
+    app.flush();
+    assert!(
+        app.errors(None)
+            .iter()
+            .any(|error| error.contains("could not save state"))
+    );
+}
