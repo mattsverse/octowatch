@@ -180,25 +180,48 @@ pub fn running_executable() -> Result<PathBuf> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(target_os = "macos")]
+pub fn running_executable() -> Result<PathBuf> {
+    Ok(std::env::current_exe()?.canonicalize()?)
+}
+
+/// Starts the copy at `path` once this process exits. On macOS an executable inside an app
+/// bundle relaunches the bundle through Launch Services, as opening it from Finder does.
 pub fn relaunch(path: &Path) -> Result<()> {
-    restart_command(path, std::process::id())
+    restart_command(&launch_target(path), std::process::id())
         .spawn()
         .context("could not start relaunch helper")?;
     Ok(())
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "macos")]
+fn launch_target(path: &Path) -> PathBuf {
+    path.ancestors()
+        .find(|ancestor| ancestor.extension().is_some_and(|ext| ext == "app"))
+        .unwrap_or(path)
+        .to_path_buf()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn launch_target(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
 fn restart_command(path: &Path, pid: u32) -> std::process::Command {
     use std::os::unix::process::CommandExt as _;
 
-    // Preserve GPUI's wait-for-exit handoff, passing the PID and path as
-    // arguments. Its Linux restart implementation interpolates the path into
-    // shell text, which fails for AppImages with spaces or shell metacharacters.
+    // Wait for this process to exit (it owns the single-instance lock), then start the new
+    // copy. The PID and path are arguments, never shell text, so AppImage paths with spaces
+    // or shell metacharacters survive.
+    let script = if path.extension().is_some_and(|ext| ext == "app") {
+        "while kill -0 \"$1\" 2>/dev/null; do sleep 0.1; done; exec /usr/bin/open -n \"$2\""
+    } else {
+        "while kill -0 \"$1\" 2>/dev/null; do sleep 0.1; done; exec \"$2\""
+    };
     let mut command = std::process::Command::new("/bin/sh");
     command
         .arg("-c")
-        .arg("while kill -0 \"$1\" 2>/dev/null; do sleep 0.1; done; exec \"$2\"")
+        .arg(script)
         .arg("octowatcher-restart")
         .arg(pid.to_string())
         .arg(path)
