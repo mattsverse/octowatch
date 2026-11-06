@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "octowatcher"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2545,7 +2545,7 @@ dependencies = [
 
 [[package]]
 name = "octowatcher-core"
-version = "0.6.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-channel",
