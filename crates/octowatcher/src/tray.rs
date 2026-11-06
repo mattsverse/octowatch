@@ -6,7 +6,7 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
 };
 
-use crate::store::PendingReview;
+use octowatcher_core::store::PendingReview;
 
 const SHOW_ID: &str = "show";
 const QUIT_ID: &str = "quit";
@@ -238,7 +238,7 @@ fn tray_icon() -> Icon {
 }
 
 fn tray_pixels() -> (Vec<u8>, u32, u32) {
-    const PNG: &[u8] = include_bytes!("../assets/tray.png");
+    const PNG: &[u8] = include_bytes!("../../../assets/tray.png");
     let mut decoder = png::Decoder::new(std::io::Cursor::new(PNG));
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder

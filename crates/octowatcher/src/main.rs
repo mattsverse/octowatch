@@ -1,21 +1,14 @@
-mod discovery;
-mod github;
-mod health;
-mod instance;
+use octowatcher_core::{
+    appearance::Appearance, discovery, github, health, instance, login, notifications,
+    refresh_queue, repository, review_filter, review_notifications, store, updater,
+};
+
 mod keyboard;
 #[cfg(test)]
 mod keyboard_tests;
-mod login;
-mod notifications;
-mod refresh_queue;
-mod repository;
-mod review_filter;
-mod review_notifications;
 mod search_input;
-mod store;
 mod theme;
 mod tray;
-mod updater;
 
 use std::{
     cell::RefCell,
@@ -43,7 +36,7 @@ use review_filter::{DraftFilter, ReviewFilter, ReviewFilterCache, ReviewFilters,
 use review_notifications::{Batch, Delivery, ReviewAction, Target};
 use search_input::SearchInput;
 use store::{PendingReview, ReviewKey, Store};
-use theme::{Appearance, Palette};
+use theme::Palette;
 use tray::{Tray, UpdateItem};
 use updater::Release;
 
@@ -1666,7 +1659,7 @@ impl Render for Octowatcher {
             self.review_scroll.scroll_to(offset);
         }
         cx.defer_in(window, |this, window, cx| this.reveal_keyboard(window, cx));
-        let theme = self.store.appearance.palette(window.appearance());
+        let theme = theme::palette(self.store.appearance, window.appearance());
         self.keyboard.set_palette(theme);
         self.review_search
             .update(cx, |input, cx| input.set_palette(theme, cx));
@@ -5697,7 +5690,7 @@ mod snooze_tests {
                 .collect();
             controls.push(Control::CancelSnooze(review(1).key()));
             self.keyboard
-                .set_palette(self.store.appearance.palette(window.appearance()));
+                .set_palette(theme::palette(self.store.appearance, window.appearance()));
             self.keyboard.reconcile(controls, window, cx);
             div()
                 .id("card")
@@ -5709,7 +5702,7 @@ mod snooze_tests {
                     self.store.snooze_minutes,
                     &self.keyboard,
                     review(1).key(),
-                    self.store.appearance.palette(window.appearance()),
+                    theme::palette(self.store.appearance, window.appearance()),
                     cx,
                     |this, minutes, _| {
                         this.picked.push(minutes);
@@ -5786,7 +5779,7 @@ mod tests {
     #[test]
     fn review_notifications_label_receiving_accounts_for_single_and_grouped_requests() {
         let store = Store::from_json(include_str!(
-            "../tests/fixtures/multiple-account-state.json"
+            "../../octowatcher-core/tests/fixtures/multiple-account-state.json"
         ))
         .unwrap();
         let (_, single) = notification_text(&store.pending[..1]);

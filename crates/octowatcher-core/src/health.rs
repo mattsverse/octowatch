@@ -1,9 +1,9 @@
 //! Presentation policy shared by setup, the header, and review empty states.
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::github::Check;
 use crate::github::{FetchedReviews, Readiness};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::store::PendingReview;
 use crate::store::Store;
 use std::collections::{BTreeMap, BTreeSet};
@@ -268,7 +268,7 @@ impl SyncHealth {
     /// Only a complete review result advances success. Account invalidation
     /// happens before the result, so a failed query cannot leave another
     /// account's cache (or snoozes) active.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn apply(
         &mut self,
         check: Check,

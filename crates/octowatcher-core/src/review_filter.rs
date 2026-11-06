@@ -232,7 +232,7 @@ impl ReviewFilters {
         .count()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn visible_indices(&self, store: &Store) -> Vec<usize> {
         let mut cache = ReviewFilterCache::default();
         cache.refresh(store, self);

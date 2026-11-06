@@ -40,4 +40,4 @@ if [ "$notification_ready" -ne 1 ]; then
     exit 1
 fi
 
-timeout 60s cargo test --locked notifications::tests::linux_notification_service_contract -- --ignored --exact
+timeout 60s cargo test --locked -p octowatcher-core notifications::tests::linux_notification_service_contract -- --ignored --exact

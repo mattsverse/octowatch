@@ -28,7 +28,7 @@ runs:
         IFS=, read -ra targets <<< "$TARGETS"
         args=()
         for target in "${targets[@]}"; do args+=(-t "$target"); done
-        cargo bundle --release --format osx "${args[@]}"
+        cargo bundle --release -p octowatcher --format osx "${args[@]}"
         if (( ${#targets[@]} > 1 )); then
           echo "bundle-dir=target/universal/release/bundle" >> "$GITHUB_OUTPUT"
         else

@@ -4150,18 +4150,32 @@ dependencies = [
  "futures-lite 2.6.1",
  "gpui",
  "gtk",
+ "octowatcher-core",
+ "png 0.18.1",
+ "semver",
+ "serde_json",
+ "tray-icon",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "octowatcher-core"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "chrono",
+ "dirs 7.0.0",
+ "futures-lite 2.6.1",
  "libc",
  "mac-usernotifications",
  "notify-rust",
  "objc2",
  "objc2-foundation",
- "png 0.18.1",
  "semver",
  "serde",
  "serde_json",
  "tempfile",
- "tray-icon",
- "unicode-segmentation",
 ]
 
 [[package]]

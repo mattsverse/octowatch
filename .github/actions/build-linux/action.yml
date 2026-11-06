@@ -20,9 +20,9 @@ runs:
     - shell: bash
       run: |
         for format in deb appimage; do
-          cargo bundle --release --format "$format" --binary-path target/release/octowatcher
+          cargo bundle --release -p octowatcher --format "$format" --binary-path target/release/octowatcher
         done
     # cargo-bundle's rpm format is still a stub.
     - if: inputs.rpm == 'true'
       shell: bash
-      run: cargo generate-rpm
+      run: cargo generate-rpm -p crates/octowatcher

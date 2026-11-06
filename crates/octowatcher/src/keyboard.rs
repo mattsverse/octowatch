@@ -12,12 +12,9 @@ use gpui::{
     px, rgb,
 };
 
-use crate::{
-    Tab,
-    repository::RepositoryId,
-    store::ReviewKey,
-    theme::{Appearance, Palette},
-};
+use octowatcher_core::{appearance::Appearance, repository::RepositoryId, store::ReviewKey};
+
+use crate::{Tab, theme::Palette};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Control {
