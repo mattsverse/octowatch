@@ -1,5 +1,6 @@
 //! Exercise the real render tree and click handlers without native tray startup,
 //! network fetches, notifications, or writes to the user's persisted state.
+use super::test_prelude::*;
 use super::*;
 use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
@@ -24,17 +25,20 @@ fn fixture(window: &mut Window, cx: &mut Context<Octowatcher>) -> Octowatcher {
     bind_review_keys(cx);
     let mut view = review_view_tests::fixture(cx, 0);
     window.focus(&view.keyboard.root);
-    view.store.pending = vec![review(1), review(2)];
-    view.store.roots = vec!["/test/root".into()];
-    view.repos = Some(vec![LocalRepo {
+    view.engine.store_mut().pending = vec![review(1), review(2)];
+    view.engine.store_mut().roots = vec!["/test/root".into()];
+    view.engine.set_repos(Some(vec![LocalRepo {
         id: RepositoryId::new("github.com", "owner/repo"),
         paths: vec!["/test/repo".into()],
-    }]);
-    view.announced_launch = true;
-    view.store.local_repos.insert("owner/repo".into());
+    }]));
+    view.engine.set_announced_launch(true);
+    view.engine
+        .store_mut()
+        .local_repos
+        .insert("owner/repo".into());
     // Occupied to prevent the enable-repository test from starting a fetch.
-    view.fetch_task = Some(Task::ready(()));
-    view.scan_task = Some(Task::ready(()));
+    view.engine.set_fetching(true);
+    view.engine.set_scanning(true);
     view
 }
 
@@ -105,7 +109,7 @@ fn filtered_virtual_reviews_keep_traversal_activation_and_escape_behavior(cx: &m
     let (view, cx) = cx.add_window_view(fixture);
     cx.simulate_resize(size(px(560.), px(680.)));
     view.update(cx, |view, cx| {
-        view.store.pending = (1..=200)
+        view.engine.store_mut().pending = (1..=200)
             .map(|number| PendingReview {
                 is_draft: number % 2 == 0,
                 ..review(number)
@@ -144,7 +148,7 @@ fn filtered_virtual_reviews_keep_traversal_activation_and_escape_behavior(cx: &m
     }
     press(cx, "tab shift-tab enter tab space");
     view.read_with(cx, |view, _| {
-        assert!(view.store.snooze_for(&review(199)).is_some())
+        assert!(view.engine.store().snooze_for(&review(199)).is_some())
     });
     assert_eq!(cx.opened_url(), None);
     assert_eq!(focused(&view, cx), Some(Control::Snooze(key(199))));
@@ -182,11 +186,12 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
     };
     let enterprise_key = enterprise.key();
     view.update(cx, |view, cx| {
-        view.store.pending = vec![public.clone(), enterprise.clone()];
-        view.store
+        view.engine.store_mut().pending = vec![public.clone(), enterprise.clone()];
+        view.engine
+            .store_mut()
             .local_repos
             .insert(enterprise.repository().store_key());
-        view.repos = Some(vec![
+        view.engine.set_repos(Some(vec![
             LocalRepo {
                 id: public.repository(),
                 paths: vec!["/test/public".into()],
@@ -195,7 +200,7 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
                 id: enterprise.repository(),
                 paths: vec!["/test/enterprise".into()],
             },
-        ]);
+        ]));
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -208,7 +213,7 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
         Some(Control::Review(enterprise_key.clone()))
     );
     view.update(cx, |view, cx| {
-        view.store.pending.reverse();
+        view.engine.store_mut().pending.reverse();
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -224,7 +229,7 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
         Some(Control::Snooze(enterprise_key.clone()))
     );
     cx.update(|_, cx| {
-        let store = &view.read(cx).store;
+        let store = &view.read(cx).engine.store();
         assert!(store.snooze_for(&enterprise).is_some());
         assert!(store.snooze_for(&public).is_none());
     });
@@ -252,7 +257,9 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
     let enterprise_repository = Control::Repository(enterprise.repository());
     focus(&view, enterprise_repository.clone(), cx);
     view.update(cx, |view, cx| {
-        view.repos.as_mut().unwrap().reverse();
+        let mut repos = view.engine.repos().unwrap().to_vec();
+        repos.reverse();
+        view.engine.set_repos(Some(repos));
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -261,7 +268,7 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
     assert_eq!(focused(&view, cx), Some(enterprise_repository));
     press(cx, "space");
     cx.update(|_, cx| {
-        let store = &view.read(cx).store;
+        let store = &view.read(cx).engine.store();
         assert!(!store.is_enabled(&enterprise.repository()));
         assert!(store.is_enabled(&public.repository()));
         assert_eq!(store.pending, vec![public.clone()]);
@@ -270,7 +277,7 @@ fn matching_reviews_and_repositories_on_different_hosts_keep_separate_focus(
     focus(&view, Control::Repository(public.repository()), cx);
     press(cx, "space");
     cx.update(|_, cx| {
-        let store = &view.read(cx).store;
+        let store = &view.read(cx).engine.store();
         assert!(!store.is_enabled(&public.repository()));
         assert!(store.is_enabled(&enterprise.repository()));
     });
@@ -281,13 +288,29 @@ fn snooze_activation_never_opens_parent_card(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(fixture);
     focus(&view, Control::Snooze(key(1)), cx);
     press(cx, "enter tab enter");
-    cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_some()));
+    cx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .engine
+                .store()
+                .snooze_for(&review(1))
+                .is_some()
+        )
+    });
     assert_eq!(cx.opened_url(), None);
     assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
     press(cx, "ctrl-space");
-    cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_some()));
+    cx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .engine
+                .store()
+                .snooze_for(&review(1))
+                .is_some()
+        )
+    });
     press(cx, "space");
-    cx.update(|_, cx| assert!(view.read(cx).store.snoozed.is_empty()));
+    cx.update(|_, cx| assert!(view.read(cx).engine.store().snoozed.is_empty()));
     assert_eq!(cx.opened_url(), None);
     // The nested mouse target retains focus and propagation behavior too.
     let bounds = cx.update(|_, cx| {
@@ -307,7 +330,15 @@ fn snooze_activation_never_opens_parent_card(cx: &mut TestAppContext) {
     });
     cx.simulate_mouse_move(duration.center(), None, Modifiers::none());
     cx.simulate_click(duration.center(), Modifiers::none());
-    cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_some()));
+    cx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .engine
+                .store()
+                .snooze_for(&review(1))
+                .is_some()
+        )
+    });
     assert_eq!(cx.opened_url(), None);
     assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
     focus(&view, Control::Review(key(1)), cx);
@@ -337,9 +368,9 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
         Some(Control::Repository(review(1).repository()))
     );
     press(cx, "space");
-    cx.update(|_, cx| assert!(!view.read(cx).store.is_enabled(&key(1).1)));
+    cx.update(|_, cx| assert!(!view.read(cx).engine.store().is_enabled(&key(1).1)));
     press(cx, "enter");
-    cx.update(|_, cx| assert!(view.read(cx).store.is_enabled(&key(1).1)));
+    cx.update(|_, cx| assert!(view.read(cx).engine.store().is_enabled(&key(1).1)));
     focus(&view, Control::Tab(Tab::Settings), cx);
     press(cx, "space");
     let health = view.read_with(cx, |view, _| view.health_controls());
@@ -352,7 +383,7 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(focused(&view, cx), Some(Control::Poll(1)));
     press(cx, "enter");
-    cx.update(|_, cx| assert_eq!(view.read(cx).store.poll_minutes, 1));
+    cx.update(|_, cx| assert_eq!(view.read(cx).engine.store().poll_minutes, 1));
     for minutes in POLL_CHOICES.into_iter().skip(1) {
         press(cx, "tab");
         assert_eq!(focused(&view, cx), Some(Control::Poll(minutes)));
@@ -362,18 +393,18 @@ fn repository_and_settings_activation(cx: &mut TestAppContext) {
         assert_eq!(focused(&view, cx), Some(Control::SnoozeMinutes(minutes)));
     }
     press(cx, "space");
-    cx.update(|_, cx| assert_eq!(view.read(cx).store.snooze_minutes, 120));
+    cx.update(|_, cx| assert_eq!(view.read(cx).engine.store().snooze_minutes, 120));
     press(cx, "tab");
     assert_eq!(focused(&view, cx), Some(Control::MuteNotifications));
     press(cx, "space");
-    cx.update(|_, cx| assert!(view.read(cx).store.notifications_muted));
+    cx.update(|_, cx| assert!(view.read(cx).engine.store().notifications_muted));
     press(cx, "enter");
-    cx.update(|_, cx| assert!(!view.read(cx).store.notifications_muted));
+    cx.update(|_, cx| assert!(!view.read(cx).engine.store().notifications_muted));
     press(cx, "tab space");
     assert_eq!(focused(&view, cx), Some(Control::NotifyDrafts));
-    cx.update(|_, cx| assert!(!view.read(cx).store.notify_drafts));
+    cx.update(|_, cx| assert!(!view.read(cx).engine.store().notify_drafts));
     press(cx, "enter");
-    cx.update(|_, cx| assert!(view.read(cx).store.notify_drafts));
+    cx.update(|_, cx| assert!(view.read(cx).engine.store().notify_drafts));
     press(cx, "tab");
     assert_eq!(focused(&view, cx), Some(Control::TestNotification));
     cx.update(|_, cx| {
@@ -404,7 +435,7 @@ fn appearance_choices_preserve_focus_and_review_activation(cx: &mut TestAppConte
         press(cx, "tab");
         assert_eq!(focused(&view, cx), Some(Control::Appearance(appearance)));
         press(cx, activation);
-        cx.update(|_, cx| assert_eq!(view.read(cx).store.appearance, appearance));
+        cx.update(|_, cx| assert_eq!(view.read(cx).engine.store().appearance, appearance));
         assert_eq!(focused(&view, cx), Some(Control::Appearance(appearance)));
 
         // The same nested controls still work after each palette change.
@@ -413,10 +444,18 @@ fn appearance_choices_preserve_focus_and_review_activation(cx: &mut TestAppConte
         focus(&view, Control::Snooze(key(1)), cx);
         press(cx, "enter tab space");
         assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
-        cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_some()));
+        cx.update(|_, cx| {
+            assert!(
+                view.read(cx)
+                    .engine
+                    .store()
+                    .snooze_for(&review(1))
+                    .is_some()
+            )
+        });
         assert_eq!(cx.opened_url(), None);
         press(cx, "enter");
-        cx.update(|_, cx| assert!(view.read(cx).store.snoozed.is_empty()));
+        cx.update(|_, cx| assert!(view.read(cx).engine.store().snoozed.is_empty()));
         focus(&view, Control::Tab(Tab::Settings), cx);
         press(cx, "enter");
         focus(&view, Control::Appearance(appearance), cx);
@@ -426,7 +465,7 @@ fn appearance_choices_preserve_focus_and_review_activation(cx: &mut TestAppConte
         focused(&view, cx),
         Some(Control::Appearance(Appearance::System))
     );
-    cx.update(|_, cx| assert_eq!(view.read(cx).store.appearance, Appearance::System));
+    cx.update(|_, cx| assert_eq!(view.read(cx).engine.store().appearance, Appearance::System));
 }
 
 #[gpui::test]
@@ -434,7 +473,7 @@ fn review_navigation_scrolls_and_preserves_snooze_column(cx: &mut TestAppContext
     let (view, cx) = cx.add_window_view(fixture);
     cx.simulate_resize(size(px(560.), px(680.)));
     view.update(cx, |view, cx| {
-        view.store.pending = (1..=40).map(review).collect();
+        view.engine.store_mut().pending = (1..=40).map(review).collect();
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -483,7 +522,7 @@ fn focus_survives_reordering_and_recovers_from_removed_reviews(cx: &mut TestAppC
     let (view, cx) = cx.add_window_view(fixture);
     focus(&view, Control::Review(key(2)), cx);
     view.update(cx, |view, cx| {
-        view.store.pending.reverse();
+        view.engine.store_mut().pending.reverse();
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -491,7 +530,7 @@ fn focus_survives_reordering_and_recovers_from_removed_reviews(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(focused(&view, cx), Some(Control::Review(key(2))));
     view.update(cx, |view, cx| {
-        view.store.pending.retain(|pr| pr.number != 2);
+        view.engine.store_mut().pending.retain(|pr| pr.number != 2);
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -499,7 +538,7 @@ fn focus_survives_reordering_and_recovers_from_removed_reviews(cx: &mut TestAppC
     cx.run_until_parked();
     assert_eq!(focused(&view, cx), Some(Control::Review(key(1))));
     view.update(cx, |view, cx| {
-        view.store.pending.clear();
+        view.engine.store_mut().pending.clear();
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -520,8 +559,8 @@ fn focus_survives_reordering_and_recovers_from_removed_reviews(cx: &mut TestAppC
         assert_eq!(focused(&view, cx), Some(expected));
     }
     view.update(cx, |view, cx| {
-        view.repos = None;
-        view.scan_task = Some(Task::ready(()));
+        view.engine.set_repos(None);
+        view.engine.set_scanning(true);
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -539,7 +578,7 @@ fn folder_focus_and_window_reopening(cx: &mut TestAppContext) {
     focus(&view, Control::RemoveRoot("/test/root".into()), cx);
     // Simulate removal by another source; recovery must select Add folder.
     view.update(cx, |view, cx| {
-        view.store.roots.clear();
+        view.engine.store_mut().roots.clear();
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -589,7 +628,7 @@ fn bulk_removed_reviews_keep_activation_kind(cx: &mut TestAppContext) {
     for snooze in [true, false] {
         let (view, visual) = cx.add_window_view(fixture);
         view.update(visual, |view, cx| {
-            view.store.pending = (1..=4).map(review).collect();
+            view.engine.store_mut().pending = (1..=4).map(review).collect();
             view.review_filter_cache.invalidate_reviews();
             view.review_filter_cache.invalidate_snoozes();
             cx.notify();
@@ -604,7 +643,7 @@ fn bulk_removed_reviews_keep_activation_kind(cx: &mut TestAppContext) {
         // Removing rows before and at the focused row used to clamp a card's
         // old absolute index to the surviving row's Snooze button.
         view.update(visual, |view, cx| {
-            view.store.pending.retain(|pr| pr.number == 3);
+            view.engine.store_mut().pending.retain(|pr| pr.number == 3);
             view.review_filter_cache.invalidate_reviews();
             view.review_filter_cache.invalidate_snoozes();
             cx.notify();
@@ -619,10 +658,18 @@ fn bulk_removed_reviews_keep_activation_kind(cx: &mut TestAppContext) {
         press(visual, "enter");
         if snooze {
             press(visual, "tab enter");
-            visual.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(3)).is_some()));
+            visual.update(|_, cx| {
+                assert!(
+                    view.read(cx)
+                        .engine
+                        .store()
+                        .snooze_for(&review(3))
+                        .is_some()
+                )
+            });
             assert_eq!(visual.opened_url(), None);
         } else {
-            visual.update(|_, cx| assert!(view.read(cx).store.snoozed.is_empty()));
+            visual.update(|_, cx| assert!(view.read(cx).engine.store().snoozed.is_empty()));
             assert_eq!(visual.opened_url(), Some(review(3).url));
         }
         visual.update(|window, _| window.remove_window());
@@ -645,9 +692,9 @@ fn notification_snooze_preserves_unrelated_picker_and_focus(cx: &mut TestAppCont
         cx.update(|_, cx| {
             let view = view.read(cx);
             assert_eq!(view.snooze_picker, Some(key(1)));
-            assert!(view.store.snooze_for(&review(1)).is_none());
-            assert!(view.store.snooze_for(&review(2)).is_some());
-            assert_eq!(view.store.snoozed.len(), 1);
+            assert!(view.engine.store().snooze_for(&review(1)).is_none());
+            assert!(view.engine.store().snooze_for(&review(2)).is_some());
+            assert_eq!(view.engine.store().snoozed.len(), 1);
         });
     }
     let before = Local::now().timestamp();
@@ -657,9 +704,9 @@ fn notification_snooze_preserves_unrelated_picker_and_focus(cx: &mut TestAppCont
     cx.update(|_, cx| {
         let view = view.read(cx);
         assert!(view.snooze_picker.is_none());
-        let until = view.store.snooze_for(&review(1)).unwrap().until;
+        let until = view.engine.store().snooze_for(&review(1)).unwrap().until;
         assert!((before + 10 * 60..=after + 10 * 60).contains(&until));
-        assert_eq!(view.store.snoozed.len(), 2);
+        assert_eq!(view.engine.store().snoozed.len(), 2);
     });
     assert_eq!(cx.opened_url(), None);
 
@@ -672,7 +719,15 @@ fn notification_snooze_preserves_unrelated_picker_and_focus(cx: &mut TestAppCont
     assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
     cx.update(|_, cx| assert!(view.read(cx).snooze_picker.is_none()));
     press(cx, "space");
-    cx.update(|_, cx| assert!(view.read(cx).store.snooze_for(&review(1)).is_none()));
+    cx.update(|_, cx| {
+        assert!(
+            view.read(cx)
+                .engine
+                .store()
+                .snooze_for(&review(1))
+                .is_none()
+        )
+    });
     assert_eq!(cx.opened_url(), None);
 }
 
@@ -682,7 +737,7 @@ fn picker_keyboard_choices_cancel_escape_and_focus_return(cx: &mut TestAppContex
     cx.simulate_resize(size(px(560.), px(300.)));
     view.update(cx, |view, cx| {
         // Preserve access to an older saved default outside the usual presets.
-        view.store.snooze_minutes = 7;
+        view.engine.store_mut().snooze_minutes = 7;
         view.review_filter_cache.invalidate_reviews();
         view.review_filter_cache.invalidate_snoozes();
         cx.notify();
@@ -692,7 +747,7 @@ fn picker_keyboard_choices_cancel_escape_and_focus_return(cx: &mut TestAppContex
     press(cx, "enter");
     cx.update(|_, cx| {
         assert_eq!(view.read(cx).snooze_picker, Some(key(1)));
-        assert!(view.read(cx).store.snoozed.is_empty());
+        assert!(view.read(cx).engine.store().snoozed.is_empty());
     });
     for minutes in SNOOZE_CHOICES.into_iter().chain([7]) {
         press(cx, "tab");
@@ -726,9 +781,9 @@ fn picker_keyboard_choices_cancel_escape_and_focus_return(cx: &mut TestAppContex
     assert_eq!(focused(&view, cx), Some(Control::Snooze(key(1))));
     cx.update(|_, cx| {
         let view = view.read(cx);
-        let until = view.store.snooze_for(&review(1)).unwrap().until;
+        let until = view.engine.store().snooze_for(&review(1)).unwrap().until;
         assert!((before + 15 * 60..=after + 15 * 60).contains(&until));
-        assert_eq!(view.store.snooze_minutes, 7);
+        assert_eq!(view.engine.store().snooze_minutes, 7);
         assert!(view.snooze_picker.is_none());
     });
     assert_eq!(cx.opened_url(), None);
@@ -747,7 +802,7 @@ fn launch_at_login_follows_appearance_and_supports_keyboard_activation(cx: &mut 
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut view = fixture(window, cx);
         view.tab = Tab::Settings;
-        view.login_state = login::State::Off;
+        view.engine.set_login(login::State::Off, None);
         view
     });
     focus(&view, Control::Appearance(Appearance::Dark), cx);
@@ -759,21 +814,23 @@ fn launch_at_login_follows_appearance_and_supports_keyboard_activation(cx: &mut 
     cx.update(|_, cx| {
         assert!(
             view.read(cx)
-                .login_error
-                .as_ref()
+                .engine
+                .login_error()
                 .unwrap()
                 .contains("could not change launch at login")
         );
-        assert!(!view.read(cx).store.launch_at_login);
+        assert!(!view.read(cx).engine.store().launch_at_login);
     });
     assert_eq!(focused(&view, cx), Some(Control::LaunchAtLogin));
-    view.update(cx, |view, _| view.login_error = None);
+    view.update(cx, |view, _| view.engine.set_login(login::State::Off, None));
     press(cx, "space");
-    cx.update(|_, cx| assert!(view.read(cx).login_error.is_some()));
+    cx.update(|_, cx| assert!(view.read(cx).engine.login_error().is_some()));
     press(cx, "tab");
     assert_eq!(focused(&view, cx), Some(Control::Poll(1)));
     view.update(cx, |view, cx| {
-        view.login_state = login::State::Unavailable("Test build".into());
+        let error = view.engine.login_error().map(str::to_owned);
+        view.engine
+            .set_login(login::State::Unavailable("Test build".into()), error);
         cx.notify();
     });
     cx.run_until_parked();
@@ -785,8 +842,8 @@ fn settings_tab_and_health_recovery_actions_are_keyboard_reachable(cx: &mut Test
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut view = fixture(window, cx);
         view.tab = Tab::Reviews;
-        view.health.readiness = github::Readiness::Missing;
-        view.health.verified = false;
+        view.engine.health_mut().readiness = github::Readiness::Missing;
+        view.engine.health_mut().verified = false;
         view
     });
     cx.simulate_resize(size(px(560.), px(300.)));
@@ -827,11 +884,11 @@ fn settings_tab_and_health_recovery_actions_are_keyboard_reachable(cx: &mut Test
 fn first_run_keeps_search_optional_and_keyboard_reachable(cx: &mut TestAppContext) {
     let (view, cx) = cx.add_window_view(|window, cx| {
         let mut view = fixture(window, cx);
-        view.store.pending.clear();
-        view.health.readiness = github::Readiness::SignedOut;
-        view.health.verified = false;
-        view.scan_task = None;
-        view.repos = Some(Vec::new());
+        view.engine.store_mut().pending.clear();
+        view.engine.health_mut().readiness = github::Readiness::SignedOut;
+        view.engine.health_mut().verified = false;
+        view.engine.set_scanning(false);
+        view.engine.set_repos(Some(Vec::new()));
         view
     });
     cx.simulate_resize(size(px(560.), px(300.)));
@@ -855,10 +912,13 @@ fn matching_requests_for_two_accounts_keep_independent_keyboard_actions(cx: &mut
         ..alice.clone()
     };
     view.update(cx, |view, cx| {
-        view.store.record_account("alice", 1);
-        view.store.record_account("bob", 2);
-        view.store.available_accounts.insert("bob".into());
-        view.store.pending = vec![alice.clone(), bob.clone()];
+        view.engine.store_mut().record_account("alice", 1);
+        view.engine.store_mut().record_account("bob", 2);
+        view.engine
+            .store_mut()
+            .available_accounts
+            .insert("bob".into());
+        view.engine.store_mut().pending = vec![alice.clone(), bob.clone()];
         view.review_filter_cache.invalidate_reviews();
         cx.notify();
     });
@@ -868,12 +928,12 @@ fn matching_requests_for_two_accounts_keep_independent_keyboard_actions(cx: &mut
     assert_eq!(focused(&view, cx), Some(Control::Review(bob.key())));
     press(cx, "tab enter tab space");
     view.read_with(cx, |view, _| {
-        assert!(view.store.snooze_for(&bob).is_some());
-        assert!(view.store.snooze_for(&alice).is_none());
+        assert!(view.engine.store().snooze_for(&bob).is_some());
+        assert!(view.engine.store().snooze_for(&alice).is_none());
     });
     assert_eq!(cx.opened_url(), None);
     view.update(cx, |view, cx| {
-        view.store.pending.reverse();
+        view.engine.store_mut().pending.reverse();
         view.review_filter_cache.invalidate_reviews();
         cx.notify();
     });
@@ -887,9 +947,12 @@ fn keyboard_account_controls_retain_cache_and_do_not_toggle_the_repository(
 ) {
     let (view, cx) = cx.add_window_view(fixture);
     view.update(cx, |view, cx| {
-        view.store.record_account("alice", 1);
-        view.store.record_account("bob", 2);
-        view.store.available_accounts.insert("bob".into());
+        view.engine.store_mut().record_account("alice", 1);
+        view.engine.store_mut().record_account("bob", 2);
+        view.engine
+            .store_mut()
+            .available_accounts
+            .insert("bob".into());
         cx.notify();
     });
     cx.run_until_parked();
@@ -904,10 +967,10 @@ fn keyboard_account_controls_retain_cache_and_do_not_toggle_the_repository(
     assert_eq!(focused(&view, cx), Some(Control::Account("alice".into())));
     press(cx, "space");
     view.read_with(cx, |view, _| {
-        assert!(!view.store.account_enabled("alice"));
-        assert!(view.store.account_enabled("bob"));
-        assert_eq!(view.store.pending.len(), 2);
-        assert!(view.store.awake().is_empty());
+        assert!(!view.engine.store().account_enabled("alice"));
+        assert!(view.engine.store().account_enabled("bob"));
+        assert_eq!(view.engine.store().pending.len(), 2);
+        assert!(view.engine.store().awake().is_empty());
     });
     press(cx, "enter");
     focus(&view, Control::Tab(Tab::Repositories), cx);
@@ -919,10 +982,19 @@ fn keyboard_account_controls_retain_cache_and_do_not_toggle_the_repository(
     );
     press(cx, "space");
     view.read_with(cx, |view, _| {
-        assert!(view.store.is_enabled("owner/repo"));
-        assert!(!view.store.repo_account_selected("owner/repo", "alice"));
-        assert!(view.store.repo_account_selected("owner/repo", "bob"));
-        assert_eq!(view.store.pending.len(), 2);
+        assert!(view.engine.store().is_enabled("owner/repo"));
+        assert!(
+            !view
+                .engine
+                .store()
+                .repo_account_selected("owner/repo", "alice")
+        );
+        assert!(
+            view.engine
+                .store()
+                .repo_account_selected("owner/repo", "bob")
+        );
+        assert_eq!(view.engine.store().pending.len(), 2);
     });
     focus(
         &view,
@@ -931,16 +1003,21 @@ fn keyboard_account_controls_retain_cache_and_do_not_toggle_the_repository(
     );
     press(cx, "enter");
     view.read_with(cx, |view, _| {
-        assert!(view.store.all_repo_accounts("owner/repo"));
-        assert_eq!(view.store.pending.len(), 2);
+        assert!(view.engine.store().all_repo_accounts("owner/repo"));
+        assert_eq!(view.engine.store().pending.len(), 2);
         // Re-enabling an account waits for a successful check before showing it.
-        assert!(view.store.awake().is_empty());
+        assert!(view.engine.store().awake().is_empty());
     });
     view.update(cx, |view, cx| {
-        view.store.available_accounts.insert("alice".into());
+        view.engine
+            .store_mut()
+            .available_accounts
+            .insert("alice".into());
         view.review_filter_cache.invalidate_reviews();
         cx.notify();
     });
-    view.read_with(cx, |view, _| assert_eq!(view.store.awake().len(), 2));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.engine.store().awake().len(), 2)
+    });
     assert_eq!(cx.opened_url(), None);
 }

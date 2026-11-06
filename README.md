@@ -255,6 +255,8 @@ The workspace has two crates:
 - `crates/octowatcher-core`: everything except the UI. It covers repository discovery, GitHub sync through `gh`, persisted state, notification decisions, and the platform integrations (notifications, launch at login, single instance, self-update). It doesn't link gpui.
 - `crates/octowatcher`: the gpui window and tray that render the core, built as the `octowatcher` binary.
 
+The core's `engine` makes every decision without awaiting anything. It turns each user command, finished job or timer into state changes and a list of effects. The app runs the jobs on gpui's executors, feeds their results back in, and handles the effects only a UI can, like opening a URL, a window or a dialog. Engine tests drive it with plain events, with no window or async runtime.
+
 ```sh
 cargo run --release
 ```

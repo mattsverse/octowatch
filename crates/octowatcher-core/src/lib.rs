@@ -5,6 +5,7 @@
 
 pub mod appearance;
 pub mod discovery;
+pub mod engine;
 pub mod github;
 pub mod health;
 pub mod instance;
