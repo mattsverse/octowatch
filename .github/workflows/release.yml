@@ -61,7 +61,7 @@ jobs:
         with:
           path: dist
           merge-multiple: true
-      # The self-updater looks for these names (src/updater.rs).
+      # The self-updater looks for these names (crates/octowatcher-core/src/updater.rs).
       - name: Check self-update downloads
         working-directory: dist
         run: |

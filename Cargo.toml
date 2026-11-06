@@ -1,13 +1,17 @@
-[package]
-name = "octowatcher"
+[workspace]
+resolver = "3"
+members = ["crates/octowatcher-core", "crates/octowatcher"]
+
+# release-please bumps this version and both crates' Cargo.lock entries together.
+[workspace.package]
 version = "0.6.1"
 edition = "2024"
-description = "Watches your local GitHub repositories for pull requests waiting on your review"
 license = "MIT"
 repository = "https://github.com/mattsverse/octowatch"
 authors = ["Matteo Gassend"]
 
-[dependencies]
+[workspace.dependencies]
+octowatcher-core = { path = "crates/octowatcher-core" }
 anyhow = "1.0.104"
 async-channel = "2.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
@@ -22,57 +26,3 @@ serde_json = "1.0.151"
 tempfile = "3.27"
 tray-icon = "0.26"
 unicode-segmentation = "1.13"
-
-[dev-dependencies]
-gpui = { version = "0.2.2", features = ["test-support"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-mac-usernotifications = "0.3.1"
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventManager", "NSAppleEventDescriptor", "NSError", "NSProcessInfo", "NSString"] }
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-notify-rust = "4.18"
-
-[target.'cfg(target_os = "linux")'.dependencies]
-gtk = "0.18"
-
-[package.metadata.bundle]
-name = "Octowatcher"
-identifier = "com.matteogassend.octowatcher"
-icon = [
-    "assets/icons/32x32.png",
-    "assets/icons/32x32@2x.png",
-    "assets/icons/128x128.png",
-    "assets/icons/128x128@2x.png",
-    "assets/icons/256x256.png",
-    "assets/icons/256x256@2x.png",
-    "assets/icons/512x512.png",
-    "assets/icons/512x512@2x.png",
-]
-category = "Developer Tool"
-copyright = "Copyright (c) Matteo Gassend 2026"
-# Runtime libraries gpui (X11/Wayland, Vulkan) and the tray (GTK, AppIndicator) link against.
-deb_depends = [
-    "libxkbcommon0",
-    "libxkbcommon-x11-0",
-    "libwayland-client0",
-    "libvulkan1",
-    "libgtk-3-0",
-    "libayatana-appindicator3-1",
-    "libxdo3",
-]
-
-[package.metadata.bundle.linux]
-startup_wm_class = "octowatcher"
-
-# cargo-bundle cannot build rpms yet, so cargo-generate-rpm does. Library
-# requirements are worked out from the binary.
-[package.metadata.generate-rpm]
-assets = [
-    { source = "target/release/octowatcher", dest = "/usr/bin/octowatcher", mode = "755" },
-    { source = "packaging/linux/octowatcher.desktop", dest = "/usr/share/applications/octowatcher.desktop", mode = "644" },
-    { source = "assets/icons/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/octowatcher.png", mode = "644" },
-    { source = "assets/icons/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/octowatcher.png", mode = "644" },
-    { source = "assets/icons/512x512.png", dest = "/usr/share/icons/hicolor/512x512/apps/octowatcher.png", mode = "644" },
-]

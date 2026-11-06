@@ -81,7 +81,7 @@ pub enum Readiness {
     Ready(String),
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub struct Check {
     pub readiness: Readiness,
     pub reviews: Result<Vec<PendingReview>>,

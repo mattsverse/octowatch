@@ -9,8 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::LocalRepo;
 use crate::{
+    appearance::Appearance,
     repository::{PUBLIC_HOST, RepositoryId, default_host},
-    theme::Appearance,
 };
 
 /// Everything that survives a restart, saved as JSON in the platform config dir.
@@ -41,7 +41,7 @@ pub struct Store {
     pub last_successful_sync: Option<i64>,
     /// Prevent replacement of a state file that couldn't be read or preserved.
     #[serde(skip)]
-    pub(crate) recovery_blocked: Option<String>,
+    pub recovery_blocked: Option<String>,
     /// Saved gh accounts seen before, including accounts since signed out.
     pub known_accounts: BTreeSet<String>,
     /// Verified login aliases used to migrate older name-based preferences.
@@ -567,7 +567,7 @@ impl Store {
                     && self.monitors(&pr.account, &pr.repo)))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn visible_pending(&self) -> Vec<PendingReview> {
         self.pending
             .iter()
@@ -748,7 +748,7 @@ impl Store {
     /// Replaces the pending list with what GitHub reports now, newest first.
     /// A PR that drops out (reviewed, request removed, closed) is gone, and
     /// so is its snooze.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reconcile(
         &mut self,
         fetched: Vec<PendingReview>,
@@ -773,7 +773,7 @@ impl Store {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn reconcile_scopes(
         &mut self,
         fetched: Vec<PendingReview>,
@@ -958,9 +958,9 @@ fn default_roots() -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{PendingReview, Snooze, Store};
+    use crate::appearance::Appearance;
     use crate::repository::RepositoryId;
     use crate::repository::default_host;
-    use crate::theme::Appearance;
     use std::collections::HashSet;
 
     #[test]

@@ -1,0 +1,33 @@
+[package]
+name = "octowatcher-core"
+description = "Octowatcher's review watching, GitHub sync, persistence and platform integration, with no UI"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+futures-lite.workspace = true
+libc.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+mac-usernotifications = "0.3.1"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSAppleEventManager", "NSAppleEventDescriptor", "NSError", "NSProcessInfo", "NSString"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify-rust = "4.18"
+
+[features]
+# Fixture helpers the app's view tests build state with.
+test-support = []

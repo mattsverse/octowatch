@@ -1,28 +1,21 @@
-mod discovery;
-mod github;
-mod health;
-mod instance;
+use octowatcher_core::{
+    appearance::Appearance,
+    engine::{self, Command, Effect, Engine, Job, JobKey, Prompt, Update, Work},
+    github, health, instance, login, notifications, repository, review_filter, store, updater,
+};
+
 mod keyboard;
 #[cfg(test)]
 mod keyboard_tests;
-mod login;
-mod notifications;
-mod refresh_queue;
-mod repository;
-mod review_filter;
-mod review_notifications;
 mod search_input;
-mod store;
 mod theme;
 mod tray;
-mod updater;
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
-    future::Future,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
-    time::Duration,
+    rc::Rc,
 };
 
 use chrono::{DateTime, Local};
@@ -30,45 +23,28 @@ use gpui::{
     App, Application, AsyncApp, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable,
     FontWeight, Global, KeyBinding, KeyDownEvent, ListAlignment, ListOffset, ListState,
     PathPromptOptions, PromptButton, PromptLevel, ScrollHandle, SharedString, Subscription, Task,
-    Window, WindowBounds, WindowOptions, actions, div, list, point, prelude::*, px, relative, rgb,
-    size,
+    WeakEntity, Window, WindowBounds, WindowOptions, actions, div, list, point, prelude::*, px,
+    relative, rgb, size,
 };
 
-use discovery::LocalRepo;
-use health::{ReviewsStatus, SyncHealth};
+use health::ReviewsStatus;
 use keyboard::{Control, Keyboard};
-use notifications::Response;
 use repository::{PUBLIC_HOST, RepositoryId};
 use review_filter::{DraftFilter, ReviewFilter, ReviewFilterCache, ReviewFilters, SnoozeFilter};
-use review_notifications::{Batch, Delivery, ReviewAction, Target};
 use search_input::SearchInput;
-use store::{PendingReview, ReviewKey, Store};
-use theme::{Appearance, Palette};
+use store::ReviewKey;
+use theme::Palette;
 use tray::{Tray, UpdateItem};
-use updater::Release;
 
 /// Choices offered in Settings for minutes between GitHub checks.
 const POLL_CHOICES: [u64; 7] = [1, 2, 5, 10, 15, 30, 60];
 /// Choices offered in Settings and for an individual review's snooze.
 const SNOOZE_CHOICES: [u64; 6] = [5, 10, 15, 30, 60, 120];
-const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
 actions!(
     octowatcher,
     [Quit, Refresh, FocusReviewSearch, ResetReviewFilters]
 );
-
-#[derive(Clone)]
-enum Update {
-    /// Newer than the running build, and installable in place.
-    Available(Release),
-    /// Being swapped in for the running copy.
-    Installing(semver::Version),
-    /// Installed over the running copy; a restart switches to it.
-    Ready(semver::Version),
-    /// Couldn't be installed in place; the release page has it.
-    Manual(Release),
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Tab {
@@ -85,16 +61,16 @@ struct ReviewListItem {
 
 struct Octowatcher {
     keyboard: Keyboard,
+    engine: Engine,
+    /// Running engine jobs, each with the id it was started under.
+    jobs: HashMap<JobKey, (u64, Task<()>)>,
+    next_job: u64,
+    /// Tests record started jobs instead of running gh, timers or notifications.
     #[cfg(test)]
-    persist: bool,
-    store: Store,
-    /// `None` until the first scan of the roots finishes.
-    repos: Option<Vec<LocalRepo>>,
+    run_jobs: bool,
+    #[cfg(test)]
+    started: Vec<JobKey>,
     tab: Tab,
-    health: SyncHealth,
-    scan_issues: Vec<discovery::ScanIssue>,
-    load_warning: Option<String>,
-    permission: notifications::Permission,
     review_filters: ReviewFilters,
     review_filter_cache: ReviewFilterCache,
     review_filter_scroll: ScrollHandle,
@@ -112,57 +88,21 @@ struct Octowatcher {
     _search_subscription: Subscription,
     #[cfg(test)]
     review_filter_passes: usize,
-    /// Each source keeps its own error, so a successful GitHub check doesn't
-    /// hide a tray, save, permission or delivery error.
     tray_error: Option<String>,
-    save_error: Option<String>,
-    notification_error: Option<String>,
-    login_state: login::State,
-    login_error: Option<String>,
-    notifications_ready: bool,
-    scan_error: Option<String>,
-    account_errors: BTreeMap<String, String>,
-    repo_errors: BTreeMap<(String, String), String>,
-    access_cache: github::AccessCache,
-    /// Whether any request or complete repository check has been confirmed.
-    announced_launch: bool,
-    /// Retained until the launch batch is accepted, including after failures.
-    launch_summary: bool,
-    review_delivery: Delivery,
-    /// Old-account delivery and action callbacks cannot affect a new session.
-    review_account_generation: u64,
-    review_account_changes: BTreeMap<String, u64>,
-    notification_tasks: HashMap<usize, Task<()>>,
     tray: Option<Tray>,
-    update: Option<Update>,
     #[cfg(target_os = "linux")]
     restart_path: Option<PathBuf>,
-    scan_task: Option<Task<()>>,
-    refresh_queue: refresh_queue::RefreshQueue,
-    fetch_task: Option<Task<()>>,
-    poll_task: Option<Task<()>>,
-    /// Fires when the earliest snooze runs out.
-    wake_task: Option<Task<()>>,
-    update_check: Option<Task<()>>,
-    permission_task: Option<Task<()>>,
-    _health_clock: Task<()>,
-    /// Requests notification permission, starts polling, then schedules updates.
-    _startup_and_updates: Task<()>,
     /// Reattached when a closed window is opened again.
     appearance_subscription: Option<Subscription>,
-}
-
-struct DiscoveryChanges {
-    cache_changed: bool,
-    reviews: store::Reconciled,
-    start_fetch: bool,
+    /// Writes unsaved state before exit, which a background save can miss.
+    _flush_on_quit: Subscription,
 }
 
 impl Octowatcher {
     fn controls(&self) -> Vec<Control> {
         let mut controls = vec![Control::Refresh];
         if matches!(
-            self.update,
+            self.engine.update(),
             Some(Update::Available(_) | Update::Ready(_) | Update::Manual(_))
         ) {
             controls.push(Control::Update);
@@ -199,13 +139,13 @@ impl Octowatcher {
                     controls.push(Control::Filter("no-results-reset".into()));
                 }
                 for &ix in indices.iter() {
-                    let pr = &self.store.pending[ix];
+                    let pr = &self.engine.store().pending[ix];
                     controls.extend([Control::Review(pr.key()), Control::Snooze(pr.key())]);
                     if self.snooze_picker.as_ref() == Some(&pr.key())
-                        && self.store.snooze_for(pr).is_none()
+                        && self.engine.store().snooze_for(pr).is_none()
                     {
                         controls.extend(
-                            snooze_duration_choices(self.store.snooze_minutes)
+                            snooze_duration_choices(self.engine.store().snooze_minutes)
                                 .map(|minutes| Control::SnoozeDuration(pr.key(), minutes)),
                         );
                         controls.push(Control::CancelSnooze(pr.key()));
@@ -213,13 +153,21 @@ impl Octowatcher {
                 }
             }
             Tab::Repositories => {
-                controls.extend(self.store.roots.iter().cloned().map(Control::RemoveRoot));
+                controls.extend(
+                    self.engine
+                        .store()
+                        .roots
+                        .iter()
+                        .cloned()
+                        .map(Control::RemoveRoot),
+                );
                 controls.extend([Control::AddRoot, Control::Rescan]);
-                for repo in self.repos.iter().flatten() {
+                for repo in self.engine.repos().into_iter().flatten() {
                     controls.push(Control::Repository(repo.id.clone()));
-                    if repo.id.host == PUBLIC_HOST && !self.store.known_accounts.is_empty() {
+                    if repo.id.host == PUBLIC_HOST && !self.engine.store().known_accounts.is_empty()
+                    {
                         controls.push(Control::AllRepositoryAccounts(repo.id.slug.clone()));
-                        controls.extend(self.store.known_accounts.iter().map(|account| {
+                        controls.extend(self.engine.store().known_accounts.iter().map(|account| {
                             Control::RepositoryAccount(repo.id.slug.clone(), account.clone())
                         }));
                     }
@@ -228,14 +176,15 @@ impl Octowatcher {
             Tab::Settings => {
                 controls.extend(self.health_controls());
                 controls.extend(
-                    self.store
+                    self.engine
+                        .store()
                         .known_accounts
                         .iter()
                         .cloned()
                         .map(Control::Account),
                 );
                 controls.extend(Appearance::CHOICES.map(Control::Appearance));
-                if !matches!(self.login_state, login::State::Unavailable(_)) {
+                if !matches!(self.engine.login_state(), login::State::Unavailable(_)) {
                     controls.push(Control::LaunchAtLogin);
                 }
                 controls.extend(POLL_CHOICES.map(Control::Poll));
@@ -299,71 +248,17 @@ impl Octowatcher {
     }
 
     fn new(cx: &mut Context<Self>) -> Self {
-        let startup_and_updates = cx.spawn(async move |this, cx| {
-            // Discovery and sync do not depend on answering the OS prompt.
-            if this
-                .update(cx, |this, cx| {
-                    this.schedule_poll(cx);
-                    this.rescan(cx);
-                    this.check_permission(cx);
-                })
-                .is_err()
-            {
-                return;
-            }
-            // Ask without blocking the UI, before any background notification
-            // can be sent. macOS only prompts when permission is undecided.
-            #[cfg(target_os = "macos")]
-            let _authorization = futures_lite::future::race(notifications::request_auth(), async {
-                cx.background_executor()
-                    .timer(Duration::from_secs(30))
-                    .await;
-                Err(
-                    "Notification permission request timed out; check System Settings and Refresh"
-                        .into(),
-                )
+        // Discovery and sync do not depend on answering the OS prompt.
+        cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                let effects = this.engine.start();
+                this.apply(effects, cx);
+                cx.notify();
             })
-            .await;
-            if this
-                .update(cx, |this, cx| {
-                    this.notifications_ready = true;
-                    this.deliver_reviews(cx);
-                    this.schedule_wake(cx);
-                    this.check_permission(cx);
-                })
-                .is_err()
-            {
-                return;
-            }
-
-            // A dev build would overwrite its own target dir with a release.
-            if cfg!(debug_assertions) {
-                return;
-            }
-            loop {
-                if this
-                    .update(cx, |this, cx| this.check_for_updates(false, cx))
-                    .is_err()
-                {
-                    break;
-                }
-                cx.background_executor().timer(UPDATE_INTERVAL).await;
-            }
-        });
-        let (mut store, load_warning) = Store::load();
-        let (login_state, login_error) = match login::status() {
-            Ok(state) => {
-                if !matches!(state, login::State::Unavailable(_)) {
-                    store.launch_at_login = state.requested();
-                }
-                (state, None)
-            }
-            Err(err) => (
-                login::State::Off,
-                Some(format!("could not read launch at login: {err:#}")),
-            ),
-        };
-        let review_delivery = Delivery::for_launch(&store);
+            .ok();
+        })
+        .detach();
+        let engine = Engine::load();
         let review_search = cx.new(SearchInput::new);
         let search_subscription = cx.subscribe(
             &review_search,
@@ -377,42 +272,29 @@ impl Octowatcher {
         // Retain cached links/counts while the status makes their freshness
         // explicit. A confirmed account change clears them in `apply`.
         let (tray, tray_error) = match Tray::new(
-            &store.awake(),
+            &engine.tray_reviews(),
             ReviewsStatus::Loading.tray_message(),
-            store.notifications_muted,
+            engine.store().notifications_muted,
         ) {
             Ok(tray) => (Some(tray), None),
             Err(err) => (None, Some(format!("could not create tray icon: {err:#}"))),
         };
-        let health_clock = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_secs(30))
-                    .await;
-                if this
-                    .update(cx, |this, cx| {
-                        this.sync_tray();
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
         let keyboard = Keyboard::new(cx);
         let focus_handle = keyboard.root.clone();
+        let flush_on_quit = cx.on_app_quit(|this, _| {
+            this.engine.flush();
+            async {}
+        });
         Self {
             keyboard,
+            engine,
+            jobs: HashMap::new(),
+            next_job: 0,
             #[cfg(test)]
-            persist: true,
-            store,
-            repos: None,
+            run_jobs: true,
+            #[cfg(test)]
+            started: Vec::new(),
             tab: Tab::Reviews,
-            health: SyncHealth::default(),
-            scan_issues: Vec::new(),
-            load_warning,
-            permission: notifications::Permission::default(),
             review_filters: ReviewFilters::default(),
             review_filter_cache: ReviewFilterCache::default(),
             review_filter_scroll: ScrollHandle::default(),
@@ -430,868 +312,198 @@ impl Octowatcher {
             #[cfg(test)]
             review_filter_passes: 0,
             tray_error,
-            save_error: None,
-            notification_error: None,
-            login_state,
-            login_error,
-            notifications_ready: !cfg!(target_os = "macos"),
-            scan_error: None,
-            account_errors: BTreeMap::new(),
-            repo_errors: BTreeMap::new(),
-            access_cache: github::AccessCache::default(),
-            announced_launch: false,
-            launch_summary: true,
-            review_delivery,
-            review_account_generation: 0,
-            review_account_changes: BTreeMap::new(),
-            notification_tasks: HashMap::new(),
             tray,
-            update: None,
             #[cfg(target_os = "linux")]
             restart_path: None,
-            scan_task: None,
-            refresh_queue: refresh_queue::RefreshQueue::default(),
-            fetch_task: None,
-            poll_task: None,
-            wake_task: None,
-            update_check: None,
-            permission_task: None,
-            _health_clock: health_clock,
-            _startup_and_updates: startup_and_updates,
             appearance_subscription: None,
+            _flush_on_quit: flush_on_quit,
         }
     }
 
-    /// Restarts the countdown to the next check, so a new interval applies now.
-    /// The scan at startup does the first check.
-    fn schedule_poll(&mut self, cx: &mut Context<Self>) {
-        let interval = Duration::from_secs(self.store.poll_minutes.max(1) * 60);
-        self.poll_task = Some(cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(interval).await;
-                if this.update(cx, |this, cx| this.refresh(cx)).is_err() {
-                    break;
+    /// Hands an event to the engine and carries out what it asks for.
+    fn dispatch(&mut self, event: impl Into<engine::Event>, cx: &mut Context<Self>) {
+        let effects = self.engine.handle(event);
+        self.apply(effects, cx);
+        cx.notify();
+    }
+
+    fn apply(&mut self, effects: Vec<Effect>, cx: &mut Context<Self>) {
+        for effect in effects {
+            match effect {
+                Effect::Start(job) => self.run_job(job, cx),
+                // Dropping a task cancels it.
+                Effect::Cancel(key) => drop(self.jobs.remove(&key)),
+                Effect::SyncTray => self.sync_tray(),
+                Effect::ReviewsChanged => self.review_filter_cache.invalidate_reviews(),
+                Effect::SnoozesChanged => self.review_filter_cache.invalidate_snoozes(),
+                Effect::OpenUrl(url) => cx.open_url(&url),
+                Effect::ShowReviews => {
+                    self.tab = Tab::Reviews;
+                    // This runs inside an entity update; opening a new window
+                    // reads this view and must wait for it to be returned.
+                    cx.defer(show_window);
+                }
+                Effect::ShowWindow => cx.defer(show_window),
+                Effect::Prompt(prompt) => cx
+                    .spawn(async move |this, cx| answer_prompt(prompt, this, cx).await)
+                    .detach(),
+                Effect::SetRestartPath(path) => {
+                    cx.set_restart_path(path.clone());
+                    #[cfg(target_os = "linux")]
+                    {
+                        self.restart_path = Some(path);
+                    }
                 }
             }
-        }));
+        }
+        self.dismiss_stale_snooze_picker();
+    }
+
+    /// Runs a job on gpui's executors, replacing any running job with its key.
+    fn run_job(&mut self, job: Job, cx: &mut Context<Self>) {
+        let key = job.key();
+        #[cfg(test)]
+        if !self.run_jobs {
+            self.started.push(key);
+            return;
+        }
+        let id = self.next_job;
+        self.next_job += 1;
+        let executor = cx.background_executor().clone();
+        let sleep: engine::Sleep = Rc::new(move |duration| Box::pin(executor.timer(duration)));
+        let work = job.run(sleep);
+        let task = cx.spawn(async move |this, cx| {
+            let event = match work {
+                Work::Blocking(work) => cx
+                    .background_executor()
+                    .spawn(async move { work() })
+                    .await
+                    .into(),
+                Work::Async(work) => work.await,
+            };
+            this.update(cx, |this, cx| {
+                // This task is finishing: let go of it without cancelling it.
+                if this.jobs.get(&key).is_some_and(|(job, _)| *job == id) {
+                    this.jobs.remove(&key).unwrap().1.detach();
+                }
+                this.dispatch(event, cx);
+            })
+            .ok();
+        });
+        self.jobs.insert(key, (id, task));
+    }
+
+    fn command(&mut self, command: Command, cx: &mut Context<Self>) {
+        self.dispatch(command, cx);
     }
 
     fn set_poll_minutes(&mut self, minutes: u64, cx: &mut Context<Self>) {
-        if self.store.poll_minutes == minutes {
-            return;
-        }
-        self.store.poll_minutes = minutes;
-        self.save();
-        self.schedule_poll(cx);
-        cx.notify();
+        self.command(Command::SetPollMinutes(minutes), cx);
     }
 
     fn set_snooze_minutes(&mut self, minutes: u64, cx: &mut Context<Self>) {
-        if self.store.snooze_minutes == minutes {
-            return;
-        }
-        self.store.snooze_minutes = minutes;
-        self.save();
-        cx.notify();
+        self.command(Command::SetSnoozeMinutes(minutes), cx);
     }
 
     fn refresh_login_status(&mut self, cx: &mut Context<Self>) {
-        match login::status() {
-            Ok(state) => {
-                if !matches!(state, login::State::Unavailable(_))
-                    && self.store.launch_at_login != state.requested()
-                {
-                    self.store.launch_at_login = state.requested();
-                    self.save();
-                }
-                self.login_state = state;
-                self.login_error = None;
-            }
-            Err(err) => self.login_error = Some(format!("could not read launch at login: {err:#}")),
-        }
-        cx.notify();
+        self.command(Command::RefreshLoginStatus, cx);
     }
 
     fn toggle_login(&mut self, cx: &mut Context<Self>) {
-        // Refresh first in case the OS setting changed while our window was
-        // closed. A failed operation never records the requested change as done.
-        let changed = login::status().and_then(|state| login::set_enabled(!state.requested()));
-        match changed {
-            Ok(state) => {
-                self.store.launch_at_login = state.requested();
-                self.login_state = state;
-                self.login_error = None;
-                self.save();
-            }
-            Err(err) => {
-                self.login_error = Some(format!("could not change launch at login: {err:#}"))
-            }
-        }
-        cx.notify();
+        self.command(Command::ToggleLogin, cx);
     }
 
     fn toggle_notifications_muted(&mut self, cx: &mut Context<Self>) {
-        self.store.notifications_muted = !self.store.notifications_muted;
-        self.save();
-        self.sync_tray();
-        if !self.store.notifications_muted {
-            self.deliver_reviews(cx);
-        }
-        cx.notify();
+        self.command(Command::ToggleNotificationsMuted, cx);
     }
 
     fn toggle_notify_drafts(&mut self, cx: &mut Context<Self>) {
-        self.store.notify_drafts = !self.store.notify_drafts;
-        self.save();
-        self.deliver_reviews(cx);
-        cx.notify();
+        self.command(Command::ToggleNotifyDrafts, cx);
     }
 
     fn set_appearance(&mut self, appearance: Appearance, cx: &mut Context<Self>) {
-        if self.store.appearance == appearance {
-            return;
-        }
-        self.store.appearance = appearance;
-        self.save();
-        cx.notify();
-    }
-
-    /// Notification actions keep using the global default.
-    fn snooze(&mut self, key: ReviewKey, cx: &mut Context<Self>) {
-        self.snooze_for_minutes(key, self.store.snooze_minutes, cx);
+        self.command(Command::SetAppearance(appearance), cx);
     }
 
     fn snooze_for_minutes(&mut self, key: ReviewKey, minutes: u64, cx: &mut Context<Self>) {
         if self.snooze_picker.as_ref() == Some(&key) {
             self.snooze_picker = None;
         }
-        if self.store.snooze(&key, minutes, Local::now().timestamp()) {
-            self.snoozes_changed(cx);
-        } else {
-            cx.notify();
+        self.command(Command::SnoozeFor(key, minutes), cx);
+    }
+
+    /// Snoozes for the default duration, as a notification action does.
+    #[cfg(test)]
+    fn snooze(&mut self, key: ReviewKey, cx: &mut Context<Self>) {
+        if self.snooze_picker.as_ref() == Some(&key) {
+            self.snooze_picker = None;
         }
+        self.command(Command::Snooze(key), cx);
     }
 
     fn unsnooze(&mut self, key: ReviewKey, cx: &mut Context<Self>) {
-        self.store.unsnooze(&key);
-        self.snoozes_changed(cx);
+        self.command(Command::Unsnooze(key), cx);
     }
 
-    fn snoozes_changed(&mut self, cx: &mut Context<Self>) {
-        self.review_filter_cache.invalidate_snoozes();
-        self.dismiss_stale_snooze_picker();
-        self.save();
-        self.sync_tray();
-        self.schedule_wake(cx);
-        cx.notify();
-    }
-
-    /// Sets a timer for the earliest snooze to run out.
-    fn schedule_wake(&mut self, cx: &mut Context<Self>) {
-        let Some(until) = self.store.next_snooze_until() else {
-            self.wake_task = None;
-            return;
-        };
-        let wait = (until - Local::now().timestamp()).max(0) as u64;
-        self.wake_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_secs(wait))
-                .await;
-            this.update(cx, |this, cx| {
-                this.wake(cx);
-                this.deliver_reviews(cx);
-            })
-            .ok();
-        }));
-    }
-
-    /// Brings back expired reviews and returns the reminders to deliver.
-    fn wake(&mut self, cx: &mut Context<Self>) -> Vec<PendingReview> {
-        if !self.notifications_ready {
-            // Startup schedules the next wake after the permission wait. Keep
-            // the deadlines intact so no reminder is consumed in the meantime.
-            self.wake_task = None;
-            return Vec::new();
-        }
-        let woken = self.store.take_expired(Local::now().timestamp());
-        self.snoozes_changed(cx);
-        // Scanning or failing to refresh changes freshness, not the user's
-        // saved deadline. A confirmed account change already cleared snoozes.
-        woken
-    }
-
-    /// Rediscovers local checkouts off the UI thread, then checks GitHub.
-    /// Requests received during a scan coalesce into one follow-up snapshot.
     fn rescan(&mut self, cx: &mut Context<Self>) {
-        if !self.refresh_queue.request_scan(self.scan_task.is_some()) {
-            return;
-        }
-        self.health.verified = false;
-        let roots = self.store.roots.clone();
-        let previous = self.store.discovered.clone();
-        self.scan_task = Some(cx.spawn(async move |this, cx| {
-            let scan_roots = roots.clone();
-            let scan = cx
-                .background_executor()
-                .spawn(async move {
-                    github::known_hosts().map(|hosts| {
-                        let mut scan = discovery::discover(&scan_roots, &hosts);
-                        let previous = discovery::within_roots(&previous, &scan_roots);
-                        scan.retain_unavailable(&previous);
-                        scan
-                    })
-                })
-                .await;
-            this.update(cx, |this, cx| {
-                this.scan_task = None;
-                if this.refresh_queue.scan_finished(roots != this.store.roots) {
-                    this.rescan(cx);
-                    return;
-                }
-                if let Some(changes) = this.apply_discovery(scan) {
-                    if changes.reviews.snoozes_changed {
-                        this.snoozes_changed(cx);
-                    } else if changes.cache_changed
-                        || changes.reviews.pending_changed
-                        || changes.reviews.notifications_changed
-                    {
-                        this.save();
-                        this.sync_tray();
-                    }
-                    // A later scan queues a fresh check for its current hosts.
-                    // Do not cancel and overlap synchronous gh subprocesses.
-                    if changes.start_fetch {
-                        this.fetch_reviews(cx);
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        self.sync_tray();
-        cx.notify();
-    }
-
-    /// Apply discovery independently of UI/save/fetch side effects. Failed host
-    /// lookup keeps the known snapshot, still respecting explicitly removed roots.
-    fn apply_discovery(
-        &mut self,
-        result: anyhow::Result<discovery::ScanResult>,
-    ) -> Option<DiscoveryChanges> {
-        let repos = match result {
-            Ok(scan) => {
-                self.scan_error = None;
-                self.scan_issues = scan.issues;
-                scan.repos
-            }
-            Err(err) => {
-                self.health.readiness = github::classify_failure(&err);
-                self.health.hosts.clear();
-                self.health.verified = false;
-                self.scan_error = Some(format!("{err:#}"));
-                self.scan_issues.clear();
-                // Legacy state has no discovery snapshot yet. Unknown local
-                // membership must not erase its saved reviews and snoozes.
-                if self.repos.is_none() && self.store.discovered.is_empty() {
-                    return None;
-                }
-                discovery::within_roots(&self.store.discovered, &self.store.roots)
-            }
-        };
-        let cache_changed = self.store.discovered != repos;
-        self.store.discovered = repos.clone();
-        self.store.local_repos = repos.iter().map(|repo| repo.id.store_key()).collect();
-        self.repos = Some(repos);
-        self.review_filter_cache.invalidate_reviews();
-        let reviews = self
-            .store
-            .retain_watched(&self.watched_repositories().into_iter().collect());
-        if reviews.pending_changed {
-            self.review_filter_cache.invalidate_reviews();
-        }
-        if reviews.snoozes_changed {
-            self.review_filter_cache.invalidate_snoozes();
-        }
-        self.dismiss_stale_snooze_picker();
-        Some(DiscoveryChanges {
-            cache_changed,
-            reviews,
-            // Even a failed host lookup leaves a known, root-filtered snapshot.
-            // Replace any result discarded during scanning and keep cached hosts
-            // refreshing while discovery is unavailable.
-            start_fetch: self.refresh_queue.request_fetch(self.fetch_task.is_some()),
-        })
+        self.command(Command::Rescan, cx);
     }
 
     fn force_refresh(&mut self, cx: &mut Context<Self>) {
-        self.access_cache = github::AccessCache::default();
-        self.refresh(cx);
+        self.command(Command::ForceRefresh, cx);
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.check_permission(cx);
-        self.rescan(cx);
-    }
-
-    fn fetch_reviews(&mut self, cx: &mut Context<Self>) {
-        self.refresh_with(
-            |watched, preferences, cache| async move {
-                let repos = watched
-                    .iter()
-                    .filter(|repo| repo.host == PUBLIC_HOST)
-                    .map(|repo| repo.slug.clone())
-                    .collect::<Vec<_>>();
-                let enterprise_repos: std::collections::HashSet<_> = watched
-                    .into_iter()
-                    .filter(|repo| repo.host != PUBLIC_HOST)
-                    .collect();
-                (
-                    github::poll(&repos, preferences, cache),
-                    if enterprise_repos.is_empty() {
-                        Ok(github::FetchedReviews::default())
-                    } else {
-                        github::fetch_awaiting_reviews(&enterprise_repos)
-                    },
-                )
-            },
-            cx,
-        );
-    }
-
-    fn refresh_with<F, Fut>(&mut self, fetch: F, cx: &mut Context<Self>)
-    where
-        F: Fn(BTreeSet<RepositoryId>, Store, github::AccessCache) -> Fut + Clone + Send + 'static,
-        Fut: Future<
-                Output = (
-                    anyhow::Result<github::Poll>,
-                    anyhow::Result<github::FetchedReviews>,
-                ),
-            > + Send
-            + 'static,
-    {
-        // Scope the API request to enabled local repos after discovery finishes.
-        if self.repos.is_none() || !self.refresh_queue.request_fetch(self.fetch_task.is_some()) {
-            return;
-        }
-        let watched = self.watched_repositories();
-        let preferences = self.store.clone();
-        let cache = self.access_cache.clone();
-        self.fetch_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(fetch(watched, preferences, cache))
-                .await;
-            this.update(cx, |this, cx| {
-                this.fetch_task = None;
-                let fetch_again = this.refresh_queue.fetch_finished(this.scan_task.is_some());
-                if fetch_again {
-                    // Discard the older result, including errors. This requested
-                    // check must run after it, without overlapping subprocesses.
-                    this.refresh_with(fetch.clone(), cx);
-                    return;
-                }
-                // A scan in progress may invalidate the filtering list. Its
-                // completion starts a fresh fetch; do not announce stale repos.
-                if this.scan_task.is_some() {
-                    cx.notify();
-                    return;
-                }
-                let (public, enterprise) = result;
-                let (poll, error) = match public {
-                    Ok(poll) => (poll, None),
-                    Err(err) => (
-                        github::Poll {
-                            accounts: Vec::new(),
-                            checks: Vec::new(),
-                            access_cache: github::AccessCache::default(),
-                        },
-                        Some(format!("{err:#}")),
-                    ),
-                };
-                let enterprise = enterprise.unwrap_or_else(|err| github::FetchedReviews {
-                    errors: vec![format!("{err:#}")],
-                    ..Default::default()
-                });
-                this.reconcile(poll, enterprise, error, cx);
-                this.deliver_reviews(cx);
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    fn check_permission(&mut self, cx: &mut Context<Self>) {
-        if self.permission_task.is_some() {
-            return;
-        }
-        self.permission_task = Some(cx.spawn(async move |this, cx| {
-            let permission = futures_lite::future::race(notifications::permission(), async {
-                cx.background_executor()
-                    .timer(Duration::from_secs(10))
-                    .await;
-                notifications::Permission::Unknown(
-                    "Permission check timed out. Refresh to retry.".into(),
-                )
-            })
-            .await;
-            this.update(cx, |this, cx| {
-                this.permission = permission;
-                this.permission_task = None;
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    /// Apply successful partitions independently. Keep known caches stale
-    /// on unavailable checks; auth failures hide their account and block alerts.
-    fn reconcile(
-        &mut self,
-        poll: github::Poll,
-        enterprise: github::FetchedReviews,
-        public_error: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let watched = self.watched_repositories();
-        for account in &poll.accounts {
-            if let Some(id) = account.account_id {
-                self.store.record_account(&account.login, id);
-            }
-        }
-        let changed = self.health.apply_poll(
-            &poll,
-            public_error.as_deref(),
-            &enterprise,
-            &watched,
-            &mut self.store,
-            Local::now().timestamp(),
-        );
-        if !changed.is_empty() {
-            self.reset_review_accounts(&changed);
-        }
-
-        self.account_errors.clear();
-        self.repo_errors.clear();
-        self.store
-            .stale_accounts
-            .extend(self.store.available_accounts.iter().cloned());
-        if public_error.is_none() {
-            // A successful auth inventory can prove removal. Network failures
-            // retain a known cache; auth and identity failures do not.
-            let stale: BTreeSet<_> = poll
-                .checks
-                .iter()
-                .filter(|check| {
-                    check.reviews.as_ref().err().is_some_and(|error| {
-                        !matches!(
-                            github::classify_failure(error),
-                            github::Readiness::SignedOut
-                        )
-                    })
-                })
-                .map(|check| check.account.to_lowercase())
-                .collect();
-            self.store
-                .stale_accounts
-                .retain(|account| stale.contains(account));
-        }
-        self.store.available_accounts.clear();
-        let failed_ids: BTreeSet<_> = poll
-            .checks
-            .iter()
-            .filter(|check| check.reviews.is_err())
-            .filter_map(|check| {
-                self.store
-                    .account_ids
-                    .get(&check.account.to_lowercase())
-                    .copied()
-            })
-            .collect();
-        self.store
-            .unavailable_repos
-            .retain(|(id, _)| public_error.is_some() || failed_ids.contains(id));
-        self.store.confirmed_requests.clear();
-        self.access_cache = poll.access_cache;
-        let found: BTreeSet<_> = poll
-            .accounts
-            .iter()
-            .map(|a| a.login.to_lowercase())
-            .collect();
-        self.store.known_accounts.extend(found.iter().cloned());
-        for account in self
-            .store
-            .known_accounts
-            .difference(&found)
-            .filter(|account| self.store.account_enabled(account))
-        {
-            self.account_errors.insert(
-                account.clone(),
-                "Not signed in. Run gh auth login --hostname github.com, then Refresh.".into(),
-            );
-        }
-        if self.store.known_accounts.is_empty()
-            && public_error.is_none()
-            && self
-                .watched_repositories()
-                .iter()
-                .any(|repo| repo.host == PUBLIC_HOST)
-        {
-            self.health.error = Some("No saved github.com accounts. Run gh auth login --hostname github.com, then Refresh.".into());
-        }
-        let validated_hosts: BTreeSet<_> = enterprise
-            .pending
-            .iter()
-            .map(|pr| pr.host.clone())
-            .chain(
-                enterprise
-                    .completed_repos
-                    .iter()
-                    .map(|repo| repo.host.clone()),
-            )
-            .collect();
-        self.store
-            .available_hosts
-            .extend(validated_hosts.iter().cloned());
-        let mut completed: BTreeSet<_> = enterprise
-            .completed_repos
-            .iter()
-            .map(|repo| (0, repo.store_key()))
-            .collect();
-        let mut fetched = enterprise.pending;
-        for check in poll.checks {
-            let account = check.account.to_lowercase();
-            for (repo, error) in check.access_errors {
-                self.repo_errors
-                    .insert((account.clone(), repo.to_lowercase()), error);
-            }
-            match check.reviews {
-                Ok(reviews) => {
-                    self.store.unavailable_repos.extend(
-                        reviews
-                            .unavailable_repos
-                            .into_iter()
-                            .map(|repo| (reviews.account_id, repo)),
-                    );
-                    completed.extend(
-                        reviews
-                            .completed_repos
-                            .iter()
-                            .map(|repo| (reviews.account_id, repo.clone())),
-                    );
-                    self.store.available_accounts.insert(account);
-                    fetched.extend(reviews.pending);
-                }
-                Err(err) => {
-                    self.account_errors
-                        .insert(account, format!("@{}: {err:#}", check.account));
-                }
-            }
-        }
-        let watched = self
-            .watched_repositories()
-            .iter()
-            .map(RepositoryId::store_key)
-            .collect();
-        self.store.confirmed_requests.extend(
-            fetched
-                .iter()
-                .filter(|pr| pr.host == PUBLIC_HOST)
-                .map(|pr| (pr.key(), pr.requested_at.clone())),
-        );
-        let confirmed = fetched.clone();
-        self.store
-            .reconcile_partitions(fetched, &completed, &watched);
-        self.review_delivery.confirm(&mut self.store, &confirmed);
-        self.review_filter_cache.invalidate_reviews();
-        self.review_filter_cache.invalidate_snoozes();
-        if public_error.is_some() {
-            for error in self.account_errors.values_mut() {
-                *error = "Account check unavailable; see the error above.".into();
-            }
-        }
-        self.dismiss_stale_snooze_picker();
-        if !confirmed.is_empty() || !completed.is_empty() || watched.is_empty() {
-            self.announced_launch = true;
-        }
-        if self.store.notification_queue.is_empty() {
-            self.launch_summary = false;
-        }
-        // Discovery and availability changes matter even when the cached list is unchanged.
-        self.wake(cx);
-    }
-
-    /// Sends eligible, undelivered review events in one batch. A failed send
-    /// stays persisted and is attempted at the next successful GitHub poll.
-    fn deliver_reviews(&mut self, cx: &mut Context<Self>) {
-        // Validate cached requests against GitHub before any launch delivery.
-        if !self.announced_launch || !self.notifications_ready {
-            return;
-        }
-        let Some(batch) = self.review_delivery.begin(&self.store) else {
-            return;
-        };
-        self.send_review_batch(batch, cx);
-    }
-
-    fn reset_review_accounts(&mut self, changed: &BTreeSet<String>) {
-        self.store
-            .available_hosts
-            .retain(|host| !changed.contains(host));
-        self.launch_summary = true;
-        // Keep any bounded in-flight send's gate: resetting it could duplicate
-        // an unaffected host's alert before OS acceptance is acknowledged.
-        self.review_account_generation = self.review_account_generation.wrapping_add(1);
-        for host in changed {
-            self.review_account_changes
-                .insert(host.clone(), self.review_account_generation);
-        }
-    }
-
-    fn send_review_batch(&mut self, batch: Batch, cx: &mut Context<Self>) {
-        let generation = self.review_account_generation;
-        let target = Target::for_reviews(&batch.reviews);
-        let (summary, body) = if self.launch_summary {
-            waiting_text(&batch.reviews)
-        } else {
-            notification_text(&batch.reviews)
-        };
-        let action = target.action();
-        let started = self.start_notification(
-            summary,
-            body,
-            Some(action),
-            cx,
-            move |this, delivered, cx| {
-                let next = this.complete_review_batch(generation, &batch, delivered);
-                if let Some(next) = next {
-                    this.send_review_batch(next, cx);
-                }
-                cx.notify();
-            },
-            move |this, response, cx| {
-                let action = this.review_action(generation, &target, response);
-                this.respond_to_review_action(action, cx);
-            },
-        );
-        if !started {
-            self.review_delivery.deferred();
-        }
-    }
-
-    fn complete_review_batch(
-        &mut self,
-        generation: u64,
-        batch: &Batch,
-        delivered: bool,
-    ) -> Option<Batch> {
-        // Notice sequences are never reset on account changes. An old batch
-        // can acknowledge unaffected notices, but cannot consume newly queued
-        // events for the changed account. Its gate stayed locked until now.
-        let next = self
-            .review_delivery
-            .complete(&mut self.store, batch, delivered);
-        if delivered {
-            if generation == self.review_account_generation {
-                self.launch_summary = false;
-            }
-            self.save();
-        }
-        next
-    }
-
-    fn review_action(
-        &self,
-        generation: u64,
-        target: &Target,
-        response: Response,
-    ) -> Option<ReviewAction> {
-        let current = match target {
-            Target::Single(pr) => {
-                self.review_account_changes
-                    .get(&pr.host)
-                    .copied()
-                    .unwrap_or(0)
-                    <= generation
-            }
-            Target::Summary => generation == self.review_account_generation,
-        };
-        current
-            .then(|| target.respond(response, &self.store))
-            .flatten()
+        self.command(Command::Refresh, cx);
     }
 
     #[cfg(test)]
-    fn respond_to_review(&mut self, target: &Target, response: Response, cx: &mut Context<Self>) {
-        let action = self.review_action(self.review_account_generation, target, response);
-        self.respond_to_review_action(action, cx);
-    }
-
-    fn respond_to_review_action(&mut self, action: Option<ReviewAction>, cx: &mut Context<Self>) {
-        match action {
-            Some(ReviewAction::OpenPr(url)) => cx.open_url(&url),
-            Some(ReviewAction::OpenReviews) => {
-                self.tab = Tab::Reviews;
-                // The response runs inside an entity update; opening a new
-                // window reads this view and must wait for it to be returned.
-                cx.defer(show_window);
-            }
-            Some(ReviewAction::Snooze(pr)) => self.snooze(pr.key(), cx),
-            None => {}
-        }
+    fn respond_to_review(
+        &mut self,
+        target: &octowatcher_core::review_notifications::Target,
+        response: notifications::Response,
+        cx: &mut Context<Self>,
+    ) {
+        self.command(Command::RespondToReview(target.clone(), response), cx);
     }
 
     fn send_test_notification(&mut self, cx: &mut Context<Self>) {
-        self.show_notification(
-            "Notifications work".into(),
-            "Octowatcher will tell you here when a review is requested.".into(),
-            None,
-            cx,
-            |_, _, _| {},
-        );
-    }
-
-    /// Generic notifications (test/update) use the same bounded sender.
-    fn show_notification(
-        &mut self,
-        summary: String,
-        body: String,
-        action: Option<notifications::Action>,
-        cx: &mut Context<Self>,
-        respond: impl FnOnce(&mut Self, Response, &mut Context<Self>) + 'static,
-    ) {
-        if !self.start_notification(summary, body, action, cx, |_, _, _| {}, respond) {
-            self.notification_error =
-                Some("Too many active notifications. Try again after dismissing one.".into());
-            cx.notify();
-        }
-    }
-
-    /// Reports OS acceptance before waiting for any action. Fixed slots and
-    /// a finite observer lifetime bound tasks and platform response registries.
-    fn start_notification(
-        &mut self,
-        summary: String,
-        body: String,
-        action: Option<notifications::Action>,
-        cx: &mut Context<Self>,
-        delivered: impl FnOnce(&mut Self, bool, &mut Context<Self>) + 'static,
-        respond: impl FnOnce(&mut Self, Response, &mut Context<Self>) + 'static,
-    ) -> bool {
-        let Some(slot) =
-            notifications::free_slot(|slot| self.notification_tasks.contains_key(&slot))
-        else {
-            return false;
-        };
-        let task = cx.spawn(async move |this, cx| {
-            let shown = futures_lite::future::or(
-                notifications::send(slot, &summary, &body, action),
-                async {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(15))
-                        .await;
-                    Err("notification service did not answer within 15 seconds".into())
-                },
-            )
-            .await;
-            let accepted = shown.is_ok();
-            if this
-                .update(cx, |this, cx| {
-                    this.notification_error = shown
-                        .as_ref()
-                        .err()
-                        .map(|err| format!("could not send notification: {err}"));
-                    delivered(this, accepted, cx);
-                    cx.notify();
-                })
-                .is_err()
-            {
-                return;
-            }
-            let response = match shown {
-                Ok(handle) => {
-                    handle
-                        .response(|duration| cx.background_executor().timer(duration))
-                        .await
-                }
-                Err(_) => Response::Dismissed,
-            };
-            this.update(cx, |this, cx| {
-                if accepted {
-                    respond(this, response, cx);
-                }
-                this.notification_tasks.remove(&slot);
-                // Successful observers also free bounded sender capacity.
-                // A failed send waits for a later poll or explicit resume.
-                if accepted {
-                    this.deliver_reviews(cx);
-                }
-                cx.notify();
-            })
-            .ok();
-        });
-        self.notification_tasks.insert(slot, task);
-        true
+        self.command(Command::SendTestNotification, cx);
     }
 
     fn watched_repositories(&self) -> BTreeSet<RepositoryId> {
-        self.repos
-            .iter()
-            .flatten()
-            .filter(|repo| self.store.is_enabled(&repo.id.store_key()))
-            .map(|repo| repo.id.clone())
-            .collect()
-    }
-
-    fn scope_changed(&mut self, cx: &mut Context<Self>) {
-        self.health.verified = false;
-        // Prune disabled repositories immediately; account toggles only hide
-        // their partition until the queued check verifies it again.
-        let watched = self.watched_repositories().into_iter().collect();
-        let changes = self.store.retain_watched(&watched);
-        if changes.snoozes_changed {
-            self.review_filter_cache.invalidate_snoozes();
-        }
-        self.review_filter_cache.invalidate_reviews();
-        self.dismiss_stale_snooze_picker();
-        self.save();
-        self.sync_tray();
-        self.schedule_wake(cx);
-        self.force_refresh(cx);
-        cx.notify();
+        self.engine.watched_repositories()
     }
 
     fn toggle_repo(&mut self, slug: &str, cx: &mut Context<Self>) {
-        let key = slug.to_lowercase();
-        if !self.store.disabled.remove(&key) {
-            self.store.disabled.insert(key);
-        }
-        self.scope_changed(cx);
+        self.command(Command::ToggleRepo(slug.into()), cx);
     }
 
     fn toggle_account(&mut self, account: &str, cx: &mut Context<Self>) {
-        self.store.toggle_account(account);
-        self.store
-            .available_accounts
-            .remove(&account.to_lowercase());
-        self.scope_changed(cx);
+        self.command(Command::ToggleAccount(account.into()), cx);
     }
 
     fn toggle_repo_account(&mut self, repo: &str, account: &str, cx: &mut Context<Self>) {
-        self.store.toggle_repo_account(repo, account);
-        self.scope_changed(cx);
+        self.command(
+            Command::ToggleRepoAccount {
+                repo: repo.into(),
+                account: account.into(),
+            },
+            cx,
+        );
     }
 
     fn all_repo_accounts(&mut self, repo: &str, cx: &mut Context<Self>) {
-        self.store.reset_repo_accounts(repo);
-        self.scope_changed(cx);
+        self.command(Command::AllRepoAccounts(repo.into()), cx);
     }
 
     fn dismiss_stale_snooze_picker(&mut self) {
+        let store = self.engine.store();
         if let Some(key) = &self.snooze_picker
-            && !self.store.pending.iter().any(|pr| {
-                pr.key() == *key && self.store.visible(pr) && self.store.snooze_for(pr).is_none()
-            })
+            && !store
+                .pending
+                .iter()
+                .any(|pr| pr.key() == *key && store.visible(pr) && store.snooze_for(pr).is_none())
         {
             self.snooze_picker = None;
         }
@@ -1308,340 +520,110 @@ impl Octowatcher {
             let Ok(Ok(Some(paths))) = picked.await else {
                 return;
             };
-            this.update(cx, |this, cx| {
-                for path in paths {
-                    if !this.store.roots.contains(&path) {
-                        this.store.roots.push(path);
-                    }
-                }
-                this.save();
-                this.rescan(cx);
-            })
-            .ok();
+            this.update(cx, |this, cx| this.command(Command::AddRoots(paths), cx))
+                .ok();
         })
         .detach();
     }
 
-    fn remove_root(&mut self, root: &PathBuf, cx: &mut Context<Self>) {
-        self.store.roots.retain(|r| r != root);
-        self.save();
-        self.rescan(cx);
+    fn remove_root(&mut self, root: &std::path::Path, cx: &mut Context<Self>) {
+        self.command(Command::RemoveRoot(root.to_path_buf()), cx);
     }
 
-    /// Looks for a newer release. Scheduled checks announce a new one in a
-    /// notification; `manual` checks come from the tray and answer in a dialog.
     fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
-        if self.update_check.is_some() || matches!(self.update, Some(Update::Installing(_))) {
-            return;
-        }
-        self.update_check = Some(cx.spawn(async move |this, cx| {
-            let checked = cx
-                .background_executor()
-                .spawn(async { updater::check() })
-                .await;
-            let Ok(state) = this.update(cx, |this, cx| {
-                this.update_check = None;
-                if let Ok(Some(release)) = &checked
-                    && this.found(release.clone())
-                    && !manual
-                {
-                    this.announce_update(cx);
-                }
-                this.sync_tray();
-                cx.notify();
-                this.update.clone()
-            }) else {
-                return;
-            };
-            let release = match checked {
-                Ok(Some(release)) => release,
-                Ok(None) => {
-                    if manual {
-                        let detail = format!(
-                            "Version {} is the latest release.",
-                            updater::current_version()
-                        );
-                        ask(
-                            cx,
-                            PromptLevel::Info,
-                            "Octowatcher is up to date",
-                            &detail,
-                            &[PromptButton::ok("OK")],
-                        )
-                        .await;
-                    }
-                    return;
-                }
-                Err(err) => {
-                    eprintln!("could not check for updates: {err:#}");
-                    if manual {
-                        ask(
-                            cx,
-                            PromptLevel::Warning,
-                            "Could not check for updates",
-                            &format!("{err:#}"),
-                            &[PromptButton::ok("OK")],
-                        )
-                        .await;
-                    }
-                    return;
-                }
-            };
-            if !manual {
-                return;
-            }
-            match state {
-                Some(Update::Ready(version)) => ask_restart(&version, cx).await,
-                Some(Update::Available(_)) => {
-                    let message = format!("Octowatcher {} is available", release.version);
-                    let detail = format!("You have {}.", updater::current_version());
-                    let answer = ask(
-                        cx,
-                        PromptLevel::Info,
-                        &message,
-                        &detail,
-                        &[PromptButton::ok("Update"), PromptButton::cancel("Later")],
-                    )
-                    .await;
-                    if answer == Some(0) {
-                        this.update(cx, |this, cx| this.install_update(cx)).ok();
-                    }
-                }
-                Some(Update::Manual(release)) => {
-                    let message = format!("Octowatcher {} is available", release.version);
-                    let answer = ask(
-                        cx,
-                        PromptLevel::Info,
-                        &message,
-                        "Download it from the release page.",
-                        &[PromptButton::ok("Download"), PromptButton::cancel("Later")],
-                    )
-                    .await;
-                    if answer == Some(0) {
-                        cx.update(|cx| cx.open_url(&release.url)).ok();
-                    }
-                }
-                Some(Update::Installing(_)) | None => {}
-            }
-        }));
-        self.sync_tray();
+        self.command(Command::CheckForUpdates { manual }, cx);
     }
 
-    /// Records a release newer than the running build. Returns false when
-    /// it, or something newer, was already known.
-    fn found(&mut self, release: Release) -> bool {
-        let known = match &self.update {
-            Some(Update::Available(known) | Update::Manual(known)) => Some(&known.version),
-            Some(Update::Installing(version) | Update::Ready(version)) => Some(version),
-            None => None,
-        };
-        if known.is_some_and(|version| *version >= release.version) {
-            return false;
-        }
-        self.update = Some(if updater::can_install(&release) {
-            Update::Available(release)
-        } else {
-            Update::Manual(release)
-        });
-        true
-    }
-
-    /// Notifies about the update just found, with a button to act on it.
-    fn announce_update(&mut self, cx: &mut Context<Self>) {
-        let (release, body, action) = match &self.update {
-            Some(Update::Available(release)) => (
-                release,
-                "Install it now, or later from the tray menu.",
-                ("update", "Update"),
-            ),
-            Some(Update::Manual(release)) => (
-                release,
-                "Download it from the release page.",
-                ("download", "Download"),
-            ),
-            _ => return,
-        };
-        let summary = format!("Octowatcher {} is available", release.version);
-        let url = release.url.clone();
-        self.show_notification(
-            summary,
-            body.into(),
-            Some(action),
-            cx,
-            move |this, response, cx| this.respond_to_update(response, &url, cx),
-        );
-    }
-
-    fn respond_to_update(&mut self, response: Response, url: &str, cx: &mut Context<Self>) {
-        match response {
-            Response::Action(id) if id == "update" => self.install_update(cx),
-            Response::Action(id) if id == "download" => cx.open_url(url),
-            Response::Clicked => cx.defer(show_window),
-            _ => {}
-        }
-    }
-
-    /// Swaps in the available update, then offers to restart into it.
     fn install_update(&mut self, cx: &mut Context<Self>) {
-        let Some(Update::Available(release)) = self.update.clone() else {
-            return;
-        };
-        self.update = Some(Update::Installing(release.version.clone()));
-        self.sync_tray();
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn({
-                    let release = release.clone();
-                    async move { updater::install(&release) }
-                })
-                .await;
-            let updated = this.update(cx, |this, cx| {
-                this.update = Some(match &result {
-                    Ok(path) => {
-                        // Linux relaunches the executable path, which
-                        // reads as deleted once it was replaced.
-                        cx.set_restart_path(path.clone());
-                        #[cfg(target_os = "linux")]
-                        {
-                            this.restart_path = Some(path.clone());
-                        }
-                        Update::Ready(release.version.clone())
-                    }
-                    Err(err) => {
-                        eprintln!("could not install update: {err:#}");
-                        Update::Manual(release.clone())
-                    }
-                });
-                this.sync_tray();
-                cx.notify();
-            });
-            if updated.is_err() {
-                return;
-            }
-            match result {
-                Ok(_) => ask_restart(&release.version, cx).await,
-                Err(err) => {
-                    let answer = ask(
-                        cx,
-                        PromptLevel::Warning,
-                        "Could not install the update",
-                        &format!("{err:#}"),
-                        &[PromptButton::ok("Download"), PromptButton::cancel("Later")],
-                    )
-                    .await;
-                    if answer == Some(0) {
-                        cx.update(|cx| cx.open_url(&release.url)).ok();
-                    }
-                }
-            }
-        })
-        .detach();
+        self.command(Command::InstallUpdate, cx);
     }
 
     fn sync_tray(&mut self) {
         let Some(tray) = &self.tray else { return };
-        let item = match &self.update {
-            _ if self.update_check.is_some() => UpdateItem::Checking,
+        let item = match self.engine.update() {
+            _ if self.engine.checking_update() => UpdateItem::Checking,
             Some(Update::Available(release)) => UpdateItem::Available(&release.version),
             Some(Update::Installing(version)) => UpdateItem::Installing(version),
             Some(Update::Ready(version)) => UpdateItem::Ready(version),
             Some(Update::Manual(_)) | None => UpdateItem::Check,
         };
-        let awake = self.tray_reviews();
         self.tray_error = tray
             .update(
-                &awake,
+                &self.engine.tray_reviews(),
                 item,
-                self.review_status().tray_message(),
-                self.store.notifications_muted,
+                self.engine.review_status().tray_message(),
+                self.engine.store().notifications_muted,
             )
             .err()
             .map(|err| format!("could not update tray menu: {err:#}"));
     }
 
-    fn save(&mut self) {
-        #[cfg(test)]
-        if !self.persist {
-            return;
-        }
-        self.save_error = self
-            .store
-            .save()
-            .err()
-            .map(|err| format!("could not save state: {err:#}"));
-    }
-
-    fn tray_reviews(&self) -> Vec<PendingReview> {
-        self.store.awake()
-    }
-
     fn errors(&self) -> Vec<&str> {
-        let mut seen = std::collections::HashSet::new();
-        [
-            &self.load_warning,
-            &self.health.error,
-            &self.scan_error,
-            &self.tray_error,
-            &self.save_error,
-            &self.notification_error,
-        ]
-        .into_iter()
-        .filter_map(|error| error.as_deref())
-        .chain(self.account_errors.values().map(String::as_str))
-        .chain(self.repo_errors.values().map(String::as_str))
-        .flat_map(str::lines)
-        .filter(|line| seen.insert(*line))
-        .collect()
+        self.engine.errors(self.tray_error.as_deref())
     }
 
     fn review_status(&self) -> ReviewsStatus {
-        self.health.status(
-            &self.store,
-            Local::now().timestamp(),
-            (self.repos.is_none() && self.scan_error.is_none()) || self.scan_task.is_some(),
-            self.fetch_task.is_some(),
-            self.watched_repositories().len(),
-            !self.scan_issues.is_empty() || self.scan_error.is_some(),
-        )
+        self.engine.review_status()
     }
 }
 
-fn waiting_text(prs: &[PendingReview]) -> (String, String) {
-    let summary = match prs.len() {
-        1 => "You have 1 pending review".to_string(),
-        n => format!("You have {n} pending reviews"),
-    };
-    let body = match prs {
-        [pr] => format!("{}#{}: {}", pr.request_label(), pr.number, pr.title),
-        many => pr_list(many),
-    };
-    (summary, body)
-}
-
-fn notification_text(prs: &[PendingReview]) -> (String, String) {
-    match prs {
-        [pr] => (
-            format!(
-                "{} requested your {}",
-                pr.author,
-                if pr.rereview { "re-review" } else { "review" }
-            ),
-            format!("{}#{}: {}", pr.request_label(), pr.number, pr.title),
+/// Shows a manual update check's dialog and carries out the answer.
+async fn answer_prompt(prompt: Prompt, this: WeakEntity<Octowatcher>, cx: &mut AsyncApp) {
+    let current = updater::current_version();
+    let later = PromptButton::cancel("Later");
+    let (level, message, detail, buttons) = match &prompt {
+        Prompt::UpToDate => (
+            PromptLevel::Info,
+            "Octowatcher is up to date".to_string(),
+            format!("Version {current} is the latest release."),
+            vec![PromptButton::ok("OK")],
         ),
-        many => (
-            format!("{} pull requests need your review", many.len()),
-            pr_list(many),
+        Prompt::CheckFailed(error) => (
+            PromptLevel::Warning,
+            "Could not check for updates".into(),
+            error.clone(),
+            vec![PromptButton::ok("OK")],
         ),
+        Prompt::Available(release) => (
+            PromptLevel::Info,
+            format!("Octowatcher {} is available", release.version),
+            format!("You have {current}."),
+            vec![PromptButton::ok("Update"), later],
+        ),
+        Prompt::Download(release) => (
+            PromptLevel::Info,
+            format!("Octowatcher {} is available", release.version),
+            "Download it from the release page.".into(),
+            vec![PromptButton::ok("Download"), later],
+        ),
+        Prompt::Restart(version) => (
+            PromptLevel::Info,
+            format!("Octowatcher {version} is installed"),
+            "Restart now to start using it?".into(),
+            vec![PromptButton::ok("Restart Now"), later],
+        ),
+        Prompt::InstallFailed { error, .. } => (
+            PromptLevel::Warning,
+            "Could not install the update".into(),
+            error.clone(),
+            vec![PromptButton::ok("Download"), later],
+        ),
+    };
+    if ask(cx, level, &message, &detail, &buttons).await != Some(0) {
+        return;
     }
-}
-
-fn pr_list(prs: &[PendingReview]) -> String {
-    prs.iter()
-        .map(|pr| format!("{}#{}", pr.request_label(), pr.number))
-        .collect::<Vec<_>>()
-        .join(", ")
+    match prompt {
+        Prompt::UpToDate | Prompt::CheckFailed(_) => {}
+        Prompt::Available(_) => {
+            this.update(cx, |this, cx| this.install_update(cx)).ok();
+        }
+        Prompt::Download(release) | Prompt::InstallFailed { release, .. } => {
+            cx.update(|cx| cx.open_url(&release.url)).ok();
+        }
+        Prompt::Restart(_) => {
+            cx.update(restart).ok();
+        }
+    }
 }
 
 impl Render for Octowatcher {
@@ -1666,7 +648,7 @@ impl Render for Octowatcher {
             self.review_scroll.scroll_to(offset);
         }
         cx.defer_in(window, |this, window, cx| this.reveal_keyboard(window, cx));
-        let theme = self.store.appearance.palette(window.appearance());
+        let theme = theme::palette(self.engine.store().appearance, window.appearance());
         self.keyboard.set_palette(theme);
         self.review_search
             .update(cx, |input, cx| input.set_palette(theme, cx));
@@ -1722,7 +704,8 @@ impl Render for Octowatcher {
 impl Octowatcher {
     fn last_sync_text(&self) -> String {
         match self
-            .store
+            .engine
+            .store()
             .last_successful_sync
             .and_then(|at| DateTime::from_timestamp(at, 0))
         {
@@ -1735,9 +718,9 @@ impl Octowatcher {
     }
 
     fn github_readiness_text(&self, host: &str, readiness: &github::Readiness) -> String {
-        let cached = self.store.sync_accounts.get(host).or_else(|| {
+        let cached = self.engine.store().sync_accounts.get(host).or_else(|| {
             (host == "github.com")
-                .then_some(self.store.sync_account.as_ref())
+                .then_some(self.engine.store().sync_account.as_ref())
                 .flatten()
         });
         let previous = cached
@@ -1764,7 +747,7 @@ impl Octowatcher {
             ),
             github::Readiness::Ready(login) => format!(
                 "{host}: GitHub CLI ready · verified account(s) @{login}.{}",
-                if self.health.error.is_some() {
+                if self.engine.health().error.is_some() {
                     " Some review checks failed; cached results may be stale."
                 } else {
                     ""
@@ -1776,17 +759,21 @@ impl Octowatcher {
     fn needs_health(&self) -> bool {
         self.review_status() != ReviewsStatus::Ready
             || !self.errors().is_empty()
-            || matches!(self.permission, notifications::Permission::Denied)
+            || matches!(self.engine.permission(), notifications::Permission::Denied)
             || (cfg!(target_os = "macos")
-                && matches!(self.permission, notifications::Permission::Unknown(_)))
+                && matches!(
+                    self.engine.permission(),
+                    notifications::Permission::Unknown(_)
+                ))
     }
 
     fn needs_login(&self) -> bool {
         matches!(
-            self.health.readiness,
+            self.engine.health().readiness,
             github::Readiness::Missing | github::Readiness::SignedOut
         ) || self
-            .health
+            .engine
+            .health()
             .hosts
             .values()
             .any(|ready| matches!(ready, github::Readiness::SignedOut))
@@ -1794,7 +781,7 @@ impl Octowatcher {
 
     fn health_controls(&self) -> Vec<Control> {
         let mut controls = Vec::new();
-        if matches!(self.health.readiness, github::Readiness::Missing) {
+        if matches!(self.engine.health().readiness, github::Readiness::Missing) {
             controls.push(Control::InstallGh);
         }
         if self.needs_login() {
@@ -1813,10 +800,11 @@ impl Octowatcher {
     }
 
     fn render_health(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let github = if self.health.hosts.is_empty() {
-            self.github_readiness_text("github.com", &self.health.readiness)
+        let github = if self.engine.health().hosts.is_empty() {
+            self.github_readiness_text("github.com", &self.engine.health().readiness)
         } else {
-            self.health
+            self.engine
+                .health()
                 .hosts
                 .iter()
                 .map(|(host, readiness)| self.github_readiness_text(host, readiness))
@@ -1824,19 +812,21 @@ impl Octowatcher {
                 .join("\n")
         };
         let login_host = self
-            .health
+            .engine
+            .health()
             .hosts
             .iter()
             .find(|(_, readiness)| matches!(readiness, github::Readiness::SignedOut))
             .map(|(host, _)| host.as_str())
             .unwrap_or("github.com");
-        let github = if self.health.accounts.is_empty() {
+        let github = if self.engine.health().accounts.is_empty() {
             github
         } else {
             format!(
                 "{}\nSaved github.com accounts: {}\nCLI active account: {}",
                 github,
-                self.health
+                self.engine
+                    .health()
                     .accounts
                     .iter()
                     .map(|(account, ready)| format!(
@@ -1850,7 +840,8 @@ impl Octowatcher {
                     ))
                     .collect::<Vec<_>>()
                     .join("; "),
-                self.health
+                self.engine
+                    .health()
                     .active_public
                     .as_deref()
                     .map(|account| format!("@{account}"))
@@ -1859,18 +850,18 @@ impl Octowatcher {
         };
         let needs_login = self.needs_login();
         let login_command = format!("gh auth login --hostname {login_host}");
-        let folders = if self.scan_error.is_some() {
+        let folders = if self.engine.scan_error().is_some() {
             "Host discovery failed. Fix GitHub CLI setup, then Rescan.".into()
-        } else if self.repos.is_none() || self.scan_task.is_some() {
+        } else if self.engine.repos().is_none() || self.engine.scanning() {
             "Scanning watched folders…".into()
-        } else if self.store.roots.is_empty() {
+        } else if self.engine.store().roots.is_empty() {
             "No watched folders. Add a folder containing GitHub clones.".into()
-        } else if !self.scan_issues.is_empty() {
+        } else if !self.engine.scan_issues().is_empty() {
             format!(
                 "Folder scan incomplete: {} issue(s). Fix the paths or access permissions, then Rescan.",
-                self.scan_issues.len()
+                self.engine.scan_issues().len()
             )
-        } else if self.repos.as_ref().is_some_and(Vec::is_empty) {
+        } else if self.engine.repos().is_some_and(<[_]>::is_empty) {
             "No GitHub clones found. Add a project folder or clone a repository there, then Rescan."
                 .into()
         } else if self.watched_repositories().is_empty() {
@@ -1879,10 +870,10 @@ impl Octowatcher {
             format!(
                 "{} repositories enabled in {} watched folder(s).",
                 self.watched_repositories().len(),
-                self.store.roots.len()
+                self.engine.store().roots.len()
             )
         };
-        let permission = match &self.permission {
+        let permission = match &self.engine.permission() {
             notifications::Permission::Checking => "Checking notification permission…".into(),
             notifications::Permission::Allowed(detail) => detail.clone(),
             notifications::Permission::Denied => "Disabled. Enable Allow Notifications for Octowatcher in System Settings → Notifications, then Refresh.".into(),
@@ -1909,7 +900,7 @@ impl Octowatcher {
         div().w_full().flex_shrink_0().debug_selector(|| "setup-health-panel".into()).flex().flex_col().gap_3().p_3().rounded_lg().bg(rgb(theme.surface))
             .child(section_title("Setup & health", theme))
             .child(health_row("GitHub", github, theme))
-            .when(matches!(self.health.readiness, github::Readiness::Missing), |s| s.child(self.button(Control::InstallGh, "Install GitHub CLI", theme).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.open_url("https://cli.github.com/")))))
+            .when(matches!(self.engine.health().readiness, github::Readiness::Missing), |s| s.child(self.button(Control::InstallGh, "Install GitHub CLI", theme).on_click(cx.listener(|_, _: &ClickEvent, _, cx| cx.open_url("https://cli.github.com/")))))
             .when(needs_login, |s| s.child(self.button(Control::CopyLogin, "Copy login command", theme).on_click(cx.listener(move |_, _: &ClickEvent, _, cx| cx.write_to_clipboard(gpui::ClipboardItem::new_string(login_command.clone()))))))
             .child(health_row("Watched folders", folders, theme))
             .child(div().flex().flex_wrap().gap_2()
@@ -1922,13 +913,13 @@ impl Octowatcher {
                 .child(self.button(Control::HealthTestNotification, "Send test notification", theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.send_test_notification(cx)))))
             .child(health_row("Review sync", format!("{} · {sync}", self.last_sync_text()), theme))
             .child(self.button(Control::HealthRefresh, "Refresh", theme).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.refresh(cx))))
-            .children(self.errors().into_iter().map(str::to_string).chain(self.scan_issues.iter().map(|issue| format!("{}: {}", issue.path.display(), issue.message))).map(|error| div().text_xs().text_color(rgb(theme.error)).child(error)))
+            .children(self.errors().into_iter().map(str::to_string).chain(self.engine.scan_issues().iter().map(|issue| format!("{}: {}", issue.path.display(), issue.message))).map(|error| div().text_xs().text_color(rgb(theme.error)).child(error)))
     }
 
     fn render_header(&self, theme: Palette, cx: &mut Context<Self>) -> impl IntoElement {
-        let status: SharedString = if self.scan_task.is_some() {
+        let status: SharedString = if self.engine.scanning() {
             "Scanning folders…".into()
-        } else if self.fetch_task.is_some() {
+        } else if self.engine.fetching() {
             "Checking GitHub…".into()
         } else {
             match self.review_status() {
@@ -1940,7 +931,7 @@ impl Octowatcher {
                 ReviewsStatus::Ready => "Reviews up to date".into(),
             }
         };
-        let repo_count = self.repos.as_ref().map_or(0, Vec::len);
+        let repo_count = self.engine.repos().map_or(0, <[_]>::len);
 
         div()
             .flex()
@@ -1990,7 +981,7 @@ impl Octowatcher {
                     self.errors().len()
                 )))
             })
-            .when(!self.scan_issues.is_empty(), |s| {
+            .when(!self.engine.scan_issues().is_empty(), |s| {
                 s.child(
                     div()
                         .text_xs()
@@ -2007,10 +998,10 @@ impl Octowatcher {
                         Tab::Reviews,
                         format!(
                                 "Reviews ({})",
-                                self.store
+                                self.engine.store()
                                     .pending
                                     .iter()
-                                    .filter(|pr| self.store.visible(pr))
+                                    .filter(|pr| self.engine.store().visible(pr))
                                     .count()
                             ),
                         theme,
@@ -2028,7 +1019,7 @@ impl Octowatcher {
 
     fn render_update(&self, theme: Palette, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let (message, action) =
-            match self.update.as_ref()? {
+            match self.engine.update().as_ref()? {
                 Update::Available(release) => (
                     format!("Octowatcher {} is available.", release.version),
                     Some(self.button(Control::Update, "Update", theme).on_click(
@@ -2541,7 +1532,7 @@ impl Octowatcher {
         let mut changed = false;
         let recomputed = self
             .review_filter_cache
-            .refresh(&self.store, &self.review_filters);
+            .refresh(self.engine.store(), &self.review_filters);
         #[cfg(test)]
         if recomputed {
             self.review_filter_passes += 1;
@@ -2556,7 +1547,7 @@ impl Octowatcher {
             let items: Vec<_> = indices
                 .iter()
                 .map(|&ix| {
-                    let key = self.store.pending[ix].key();
+                    let key = self.engine.store().pending[ix].key();
                     let picker_open = self.snooze_picker.as_ref() == Some(&key);
                     ReviewListItem { key, picker_open }
                 })
@@ -2587,10 +1578,11 @@ impl Octowatcher {
         let indices = self.review_filter_cache.visible_indices();
         let count = indices.len();
         let total = self
-            .store
+            .engine
+            .store()
             .pending
             .iter()
-            .filter(|pr| self.store.visible(pr))
+            .filter(|pr| self.engine.store().visible(pr))
             .count();
         let active_filters = self.review_filters.active_count();
         let arrow = if self.review_filters_open {
@@ -2650,7 +1642,13 @@ impl Octowatcher {
                 s.child(self.render_review_filters(cx))
             })
             .when(
-                needs_health && self.store.pending.iter().any(|pr| self.store.visible(pr)),
+                needs_health
+                    && self
+                        .engine
+                        .store()
+                        .pending
+                        .iter()
+                        .any(|pr| self.engine.store().visible(pr)),
                 |s| {
                     s.child(
                         div()
@@ -2682,7 +1680,13 @@ impl Octowatcher {
                         .pt_2()
                         .text_color(rgb(theme.muted_text))
                         .child(
-                            if !self.store.pending.iter().any(|pr| self.store.visible(pr)) {
+                            if !self
+                                .engine
+                                .store()
+                                .pending
+                                .iter()
+                                .any(|pr| self.engine.store().visible(pr))
+                            {
                                 status.empty_message()
                             } else {
                                 "No reviews match your search and filters."
@@ -2744,11 +1748,11 @@ impl Octowatcher {
         theme: Palette,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let pr = &self.store.pending[ix];
+        let pr = &self.engine.store().pending[ix];
         let url = pr.url.clone();
         let key = pr.key();
         let picker_open = self.snooze_picker.as_ref() == Some(&key);
-        let snoozed_until = self.store.snooze_for(pr).map(|snooze| {
+        let snoozed_until = self.engine.store().snooze_for(pr).map(|snooze| {
             DateTime::from_timestamp(snooze.until, 0)
                 .map(|at| at.with_timezone(&Local).format("%H:%M").to_string())
                 .unwrap_or_default()
@@ -2833,7 +1837,7 @@ impl Octowatcher {
                 let key = pr.key();
                 card.child(snooze_picker(
                     ix,
-                    self.store.snooze_minutes,
+                    self.engine.store().snooze_minutes,
                     &self.keyboard,
                     key.clone(),
                     theme,
@@ -2857,7 +1861,7 @@ impl Octowatcher {
             .flex_col()
             .gap_2()
             .child(section_title("Watched folders", theme))
-            .children(self.store.roots.iter().map(|root| {
+            .children(self.engine.store().roots.iter().map(|root| {
                 let root_for_click = root.clone();
                 div()
                     .flex()
@@ -2889,7 +1893,7 @@ impl Octowatcher {
                     ),
             );
 
-        let roots = roots.children(self.scan_issues.iter().map(|issue| {
+        let roots = roots.children(self.engine.scan_issues().iter().map(|issue| {
             div().text_xs().text_color(rgb(theme.warning)).child(format!(
                 "{}: {}. Previously found repositories are retained; retrying on the next check.",
                 display_path(&issue.path),
@@ -2897,13 +1901,13 @@ impl Octowatcher {
             ))
         }));
 
-        let repos = self.repos.as_deref().unwrap_or_default();
+        let repos = self.engine.repos().unwrap_or_default();
         let list = div()
             .flex()
             .flex_col()
             .gap_2()
             .child(section_title("GitHub repositories found", theme))
-            .when(repos.is_empty() && self.scan_task.is_none(), |s| {
+            .when(repos.is_empty() && !self.engine.scanning(), |s| {
                 s.child(
                     div()
                         .text_color(rgb(theme.muted_text))
@@ -2911,7 +1915,7 @@ impl Octowatcher {
                 )
             })
             .children(repos.iter().enumerate().map(|(ix, repo)| {
-                let enabled = self.store.is_enabled(&repo.id.store_key());
+                let enabled = self.engine.store().is_enabled(&repo.id.store_key());
                 let slug = repo.id.store_key();
                 let paths = repo
                     .paths
@@ -2961,11 +1965,13 @@ impl Octowatcher {
                             }),
                     )
                     .when(
-                        repo.id.host == PUBLIC_HOST && !self.store.known_accounts.is_empty(),
+                        repo.id.host == PUBLIC_HOST
+                            && !self.engine.store().known_accounts.is_empty(),
                         |view| view.child(self.render_repo_accounts(&repo.id.slug, ix, theme, cx)),
                     )
                     .children(
-                        self.repo_errors
+                        self.engine
+                            .repo_errors()
                             .iter()
                             .filter(|((_, slug), _)| slug == &repo.id.store_key())
                             .map(|(_, error)| {
@@ -2987,7 +1993,7 @@ impl Octowatcher {
         theme: Palette,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let all = self.store.all_repo_accounts(repo);
+        let all = self.engine.store().all_repo_accounts(repo);
         let slug = repo.to_string();
         div()
             .flex()
@@ -3020,8 +2026,8 @@ impl Octowatcher {
                             },
                         )),
                     )
-                    .children(self.store.known_accounts.iter().map(|account| {
-                        let enabled = self.store.repo_account_selected(repo, account);
+                    .children(self.engine.store().known_accounts.iter().map(|account| {
+                        let enabled = self.engine.store().repo_account_selected(repo, account);
                         let account = account.clone();
                         let slug = repo.to_string();
                         self.keyboard
@@ -3050,10 +2056,11 @@ impl Octowatcher {
             )
             .when(
                 !all && !self
-                    .store
+                    .engine
+                    .store()
                     .known_accounts
                     .iter()
-                    .any(|account| self.store.repo_account_selected(repo, account)),
+                    .any(|account| self.engine.store().repo_account_selected(repo, account)),
                 |s| {
                     s.child(
                         div()
@@ -3070,16 +2077,16 @@ impl Octowatcher {
             .child(section_title("GitHub accounts", theme))
             .child(div().text_xs().text_color(rgb(theme.secondary_text))
                 .child("Sign in with gh auth login --hostname github.com, then Refresh. New saved accounts are enabled automatically."))
-            .when(self.store.known_accounts.is_empty(), |s| s.child(
+            .when(self.engine.store().known_accounts.is_empty(), |s| s.child(
                 div().text_xs().text_color(rgb(theme.muted_text)).child("No saved accounts discovered yet.")))
-            .children(self.store.known_accounts.iter().map(|account| {
-                let enabled = self.store.account_enabled(account);
+            .children(self.engine.store().known_accounts.iter().map(|account| {
+                let enabled = self.engine.store().account_enabled(account);
                 let login = account.clone();
                 let status = if !enabled {
                     "Monitoring off".into()
-                } else if let Some(error) = self.account_errors.get(account) {
+                } else if let Some(error) = self.engine.account_errors().get(account) {
                     error.clone()
-                } else if self.store.available_accounts.contains(account) {
+                } else if self.engine.store().available_accounts.contains(account) {
                     "Monitoring github.com".into()
                 } else {
                     "Waiting for a successful check".into()
@@ -3089,7 +2096,7 @@ impl Octowatcher {
                         .child(format!("@{account}"))
                         .child(self.button(Control::Account(account.clone()), if enabled { "Disable" } else { "Enable" }, theme)
                             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_account(&login, cx)))))
-                    .child(div().text_xs().text_color(rgb(if enabled && self.account_errors.contains_key(account) { theme.error } else { theme.secondary_text })).child(status))
+                    .child(div().text_xs().text_color(rgb(if enabled && self.engine.account_errors().contains_key(account) { theme.error } else { theme.secondary_text })).child(status))
             }))
     }
 
@@ -3111,7 +2118,7 @@ impl Octowatcher {
                             .flex()
                             .gap_2()
                             .children(Appearance::CHOICES.into_iter().map(|appearance| {
-                                let active = self.store.appearance == appearance;
+                                let active = self.engine.store().appearance == appearance;
                                 choice(
                                     self.keyboard.control(Control::Appearance(appearance)),
                                     appearance.label(),
@@ -3138,7 +2145,7 @@ impl Octowatcher {
                     .flex_col()
                     .gap_2()
                     .child(section_title("Launch at login", theme))
-                    .child(match &self.login_state {
+                    .child(match &self.engine.login_state() {
                         login::State::Unavailable(reason) => div()
                             .text_xs()
                             .text_color(rgb(theme.muted_text))
@@ -3171,21 +2178,21 @@ impl Octowatcher {
                             .text_color(rgb(theme.secondary_text))
                             .child("Start quietly in the tray when you sign in."),
                     )
-                    .when(self.login_state == login::State::NeedsApproval, |row| {
+                    .when(*self.engine.login_state() == login::State::NeedsApproval, |row| {
                         row.child(
                             div().text_xs().text_color(rgb(theme.warning)).child(
                                 "Allow Octowatcher in System Settings → General → Login Items.",
                             ),
                         )
                     })
-                    .when(self.login_state == login::State::NeedsRepair, |row| {
+                    .when(*self.engine.login_state() == login::State::NeedsRepair, |row| {
                         row.child(
                             div().text_xs().text_color(rgb(theme.warning)).child(
                                 "The startup command has changed. Repair it to start this copy at login.",
                             ),
                         )
                     })
-                    .when_some(self.login_error.clone(), |row, error| {
+                    .when_some(self.engine.login_error().map(str::to_owned), |row, error| {
                         row.child(div().text_xs().text_color(rgb(theme.error)).child(error))
                     }),
             )
@@ -3193,7 +2200,7 @@ impl Octowatcher {
                 theme,
                 ("Check GitHub for review requests every", Control::Poll),
                 &POLL_CHOICES,
-                self.store.poll_minutes,
+                self.engine.store().poll_minutes,
                 Self::set_poll_minutes,
                 cx,
             ))
@@ -3201,7 +2208,7 @@ impl Octowatcher {
                 theme,
                 ("Default snooze length", Control::SnoozeMinutes),
                 &SNOOZE_CHOICES,
-                self.store.snooze_minutes,
+                self.engine.store().snooze_minutes,
                 Self::set_snooze_minutes,
                 cx,
             ))
@@ -3219,7 +2226,7 @@ impl Octowatcher {
                             .child(
                                 self.button(
                                     Control::MuteNotifications,
-                                    if self.store.notifications_muted {
+                                    if self.engine.store().notifications_muted {
                                         "Resume review notifications"
                                     } else {
                                         "Mute review notifications"
@@ -3235,7 +2242,7 @@ impl Octowatcher {
                                 div()
                                     .text_xs()
                                     .text_color(rgb(theme.secondary_text))
-                                    .child(if self.store.notifications_muted {
+                                    .child(if self.engine.store().notifications_muted {
                                         "Muted · polling continues"
                                     } else {
                                         "On"
@@ -3245,7 +2252,7 @@ impl Octowatcher {
                     .child(
                         self.button(
                             Control::NotifyDrafts,
-                            if self.store.notify_drafts {
+                            if self.engine.store().notify_drafts {
                                 "Notify about drafts: On"
                             } else {
                                 "Notify about drafts: Off"
@@ -3628,24 +2635,6 @@ async fn ask(
     answer.await.ok()
 }
 
-async fn ask_restart(version: &semver::Version, cx: &mut AsyncApp) {
-    let message = format!("Octowatcher {version} is installed");
-    let answer = ask(
-        cx,
-        PromptLevel::Info,
-        &message,
-        "Restart now to start using it?",
-        &[
-            PromptButton::ok("Restart Now"),
-            PromptButton::cancel("Later"),
-        ],
-    )
-    .await;
-    if answer == Some(0) {
-        cx.update(restart).ok();
-    }
-}
-
 /// Restarts after the current process exits, retaining instance ownership until
 /// then. macOS keeps GPUI's native bundle relaunch; Linux quotes the target path.
 pub fn restart(cx: &mut App) {
@@ -3725,7 +2714,22 @@ pub fn show_window(cx: &mut App) {
 }
 
 #[cfg(test)]
+mod test_prelude {
+    pub use std::collections::BTreeMap;
+
+    pub use octowatcher_core::{
+        discovery::{self, LocalRepo},
+        engine::Done,
+        health::SyncHealth,
+        notifications::Response,
+        review_notifications::Target,
+        store::{PendingReview, Store},
+    };
+}
+
+#[cfg(test)]
 mod review_view_tests {
+    use super::test_prelude::*;
     use super::*;
 
     /// Render the real view with no tray, GitHub fetch, timers, notifications,
@@ -3741,41 +2745,51 @@ mod review_view_tests {
         );
         let keyboard = Keyboard::new(cx);
         let focus_handle = keyboard.root.clone();
+        let flush_on_quit = cx.on_app_quit(|_, _| async {});
+        let mut engine = Engine::settled(Store {
+            pending: (1..=count)
+                .rev()
+                .map(|number| PendingReview {
+                    host: repository::default_host(),
+                    account: "alice".into(),
+                    account_id: 1,
+                    repo: "Acme/API".into(),
+                    number: number as u64,
+                    title: "Café login".into(),
+                    author: "Alice".into(),
+                    url: format!("https://github.com/acme/api/pull/{number}"),
+                    is_draft: number % 2 == 0,
+                    rereview: false,
+                    requested_at: None,
+                })
+                .collect(),
+            sync_account: Some("test-viewer".into()),
+            last_successful_sync: Some(Local::now().timestamp()),
+            recovery_blocked: Some("test state must not be written".into()),
+            available_accounts: BTreeSet::from(["alice".into()]),
+            local_repos: BTreeSet::from([
+                "acme/api".into(),
+                "ghe.example.com/acme/api".into(),
+                "github.example.com/owner/repo".into(),
+            ]),
+            ..Default::default()
+        });
+        engine.set_repos(Some(vec![LocalRepo {
+            id: RepositoryId::new("github.com", "acme/api"),
+            paths: Vec::new(),
+        }]));
+        *engine.health_mut() = SyncHealth {
+            readiness: github::Readiness::Ready("alice".into()),
+            verified: true,
+            ..SyncHealth::default()
+        };
         Octowatcher {
             keyboard,
-            persist: false,
-            store: Store {
-                pending: (1..=count)
-                    .rev()
-                    .map(|number| PendingReview {
-                        host: repository::default_host(),
-                        account: "alice".into(),
-                        account_id: 1,
-                        repo: "Acme/API".into(),
-                        number: number as u64,
-                        title: "Café login".into(),
-                        author: "Alice".into(),
-                        url: format!("https://github.com/acme/api/pull/{number}"),
-                        is_draft: number % 2 == 0,
-                        rereview: false,
-                        requested_at: None,
-                    })
-                    .collect(),
-                sync_account: Some("test-viewer".into()),
-                last_successful_sync: Some(Local::now().timestamp()),
-                recovery_blocked: Some("test state must not be written".into()),
-                available_accounts: BTreeSet::from(["alice".into()]),
-                local_repos: BTreeSet::from([
-                    "acme/api".into(),
-                    "ghe.example.com/acme/api".into(),
-                    "github.example.com/owner/repo".into(),
-                ]),
-                ..Default::default()
-            },
-            repos: Some(vec![LocalRepo {
-                id: RepositoryId::new("github.com", "acme/api"),
-                paths: Vec::new(),
-            }]),
+            engine,
+            jobs: HashMap::new(),
+            next_job: 0,
+            run_jobs: false,
+            started: Vec::new(),
             tab: Tab::Reviews,
             review_filters: ReviewFilters::default(),
             review_filter_cache: ReviewFilterCache::default(),
@@ -3792,44 +2806,12 @@ mod review_view_tests {
             focus_handle,
             _search_subscription: subscription,
             review_filter_passes: 0,
-            health: SyncHealth {
-                readiness: github::Readiness::Ready("alice".into()),
-                verified: true,
-                ..SyncHealth::default()
-            },
-            scan_issues: Vec::new(),
-            load_warning: None,
-            permission: notifications::Permission::Allowed("Allowed".into()),
-            notifications_ready: true,
-            review_account_generation: 0,
-            review_account_changes: BTreeMap::new(),
-            permission_task: None,
-            _health_clock: Task::ready(()),
-            scan_error: None,
             tray_error: None,
-            save_error: None,
-            notification_error: None,
-            login_state: login::State::Unavailable("Test build".into()),
-            login_error: None,
-            account_errors: BTreeMap::new(),
-            repo_errors: BTreeMap::new(),
-            access_cache: github::AccessCache::default(),
-            announced_launch: true,
-            launch_summary: false,
-            review_delivery: Delivery::default(),
-            notification_tasks: HashMap::new(),
             tray: None,
-            update: None,
             #[cfg(target_os = "linux")]
             restart_path: None,
-            scan_task: None,
-            refresh_queue: refresh_queue::RefreshQueue::default(),
-            fetch_task: None,
-            poll_task: None,
-            wake_task: None,
-            update_check: None,
-            _startup_and_updates: cx.spawn(async |_, _| {}),
             appearance_subscription: None,
+            _flush_on_quit: flush_on_quit,
         }
     }
 
@@ -3875,7 +2857,7 @@ mod review_view_tests {
             assert!(!view.repository_picker_open);
             assert_eq!(view.review_filters, filters);
             assert_eq!(view.review_scroll.item_count(), 1);
-            assert_eq!(view.store.awake().len(), 10);
+            assert_eq!(view.engine.store().awake().len(), 10);
             assert!(!view.controls().contains(&Control::Search));
             assert_eq!(
                 view.keyboard.review_viewport.get().unwrap().size.height,
@@ -3886,7 +2868,9 @@ mod review_view_tests {
         cx.update(|window, cx| {
             assert_eq!(
                 view.read(cx).keyboard.focused(window),
-                Some(Control::Review(view.read(cx).store.pending[7].key()))
+                Some(Control::Review(
+                    view.read(cx).engine.store().pending[7].key()
+                ))
             );
         });
 
@@ -3924,23 +2908,23 @@ mod review_view_tests {
         cx.update(bind_review_keys);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let mut view = fixture(cx, 2);
-            view.health.verified = false;
-            view.health.connection_failed = true;
-            view.health.error = Some("Connection unavailable".into());
+            view.engine.health_mut().verified = false;
+            view.engine.health_mut().connection_failed = true;
+            view.engine.health_mut().error = Some("Connection unavailable".into());
             window.focus(&view.focus_handle);
             view
         });
         cx.simulate_resize(size(px(560.), px(680.)));
         assert!(cx.debug_bounds("review-health-warning").is_some());
-        let last_success = view.read_with(cx, |view, _| view.store.last_successful_sync);
+        let last_success = view.read_with(cx, |view, _| view.engine.store().last_successful_sync);
         cx.simulate_keystrokes(find_key());
         cx.simulate_input("no-match");
         assert!(cx.debug_bounds("review-no-results").is_some());
         assert!(cx.debug_bounds("review-health-warning").is_some());
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_status(), ReviewsStatus::Offline);
-            assert_eq!(view.store.awake().len(), 2);
-            assert_eq!(view.store.last_successful_sync, last_success);
+            assert_eq!(view.engine.store().awake().len(), 2);
+            assert_eq!(view.engine.store().last_successful_sync, last_success);
         });
         let settings = cx.debug_bounds("tab-Settings").unwrap();
         cx.simulate_click(settings.center(), gpui::Modifiers::none());
@@ -3958,9 +2942,9 @@ mod review_view_tests {
         cx.update(bind_review_keys);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let mut view = fixture(cx, 0);
-            view.health = SyncHealth::default();
-            view.repos = None;
-            view.store.last_successful_sync = None;
+            *view.engine.health_mut() = SyncHealth::default();
+            view.engine.set_repos(None);
+            view.engine.store_mut().last_successful_sync = None;
             window.focus(&view.focus_handle);
             view
         });
@@ -3971,20 +2955,20 @@ mod review_view_tests {
             assert!(!view.controls().contains(&Control::HealthRefresh));
         });
         view.update(cx, |view, cx| {
-            view.repos = Some(vec![LocalRepo {
+            view.engine.set_repos(Some(vec![LocalRepo {
                 id: RepositoryId::new("github.com", "acme/api"),
                 paths: Vec::new(),
-            }]);
-            view.health.readiness = github::Readiness::Offline;
-            view.health.connection_failed = true;
-            view.health.error = Some("Connection unavailable".into());
+            }]));
+            view.engine.health_mut().readiness = github::Readiness::Offline;
+            view.engine.health_mut().connection_failed = true;
+            view.engine.health_mut().error = Some("Connection unavailable".into());
             cx.notify();
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("setup-health-panel").is_none());
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_status(), ReviewsStatus::Offline);
-            assert_eq!(view.store.last_successful_sync, None);
+            assert_eq!(view.engine.store().last_successful_sync, None);
             assert!(!view.controls().contains(&Control::HealthRefresh));
         });
         cx.simulate_keystrokes(find_key());
@@ -4014,9 +2998,10 @@ mod review_view_tests {
     ) {
         let (view, visual) = cx.add_window_view(|_, cx| {
             let mut app = fixture(cx, 10);
-            app.store.snooze(&app.store.pending[7].key(), 120, 0);
+            let key = app.engine.store().pending[7].key();
+            app.engine.store_mut().snooze(&key, 120, 0);
             app.review_filters.query = "#3".into();
-            app.review_filters.repository = Some(app.store.pending[7].repository());
+            app.review_filters.repository = Some(app.engine.store_mut().pending[7].repository());
             app.review_filters.snooze = SnoozeFilter::Snoozed;
             app
         });
@@ -4027,19 +3012,23 @@ mod review_view_tests {
         });
         let filters = view.read_with(visual, |app, _| app.review_filters.clone());
         view.update(visual, |app, cx| {
-            let changes = app
-                .apply_discovery(Ok(discovery::ScanResult::default()))
-                .unwrap();
-            assert!(changes.reviews.pending_changed && changes.reviews.snoozes_changed);
-            cx.notify();
+            let roots = app.engine.store().roots.clone();
+            app.dispatch(
+                Done::Scanned {
+                    roots,
+                    result: Ok(discovery::ScanResult::default()),
+                },
+                cx,
+            );
+            assert!(app.engine.store().pending.is_empty());
         });
         visual.run_until_parked();
         view.read_with(visual, |app, _| {
             assert_eq!(app.review_scroll.item_count(), 0);
             assert!(app.review_filter_cache.visible_indices().is_empty());
             assert_eq!(app.review_filters, filters);
-            assert!(app.store.pending.is_empty());
-            assert!(app.store.snoozed.is_empty());
+            assert!(app.engine.store().pending.is_empty());
+            assert!(app.engine.store().snoozed.is_empty());
         });
     }
 
@@ -4053,14 +3042,14 @@ mod review_view_tests {
             let public = PendingReview {
                 number: 1,
                 is_draft: false,
-                ..view.store.pending[0].clone()
+                ..view.engine.store_mut().pending[0].clone()
             };
             let enterprise = PendingReview {
                 host: "ghe.example.com".into(),
                 url: "https://ghe.example.com/Acme/API/pull/1".into(),
                 ..public.clone()
             };
-            view.store.pending = vec![public, enterprise];
+            view.engine.store_mut().pending = vec![public, enterprise];
             window.focus(&view.focus_handle);
             view
         });
@@ -4096,8 +3085,8 @@ mod review_view_tests {
         // Snoozing the counterpart on github.com must not hide or close
         // the Enterprise review's picker. No disk/notification effects.
         view.update(cx, |view, cx| {
-            let public = view.store.pending[0].key();
-            view.store.snooze(&public, 5, 0);
+            let public = view.engine.store_mut().pending[0].key();
+            view.engine.store_mut().snooze(&public, 5, 0);
             view.review_filter_cache.invalidate_snoozes();
             view.dismiss_stale_snooze_picker();
             cx.notify();
@@ -4106,7 +3095,7 @@ mod review_view_tests {
         view.read_with(cx, |view, _| {
             assert!(view.snooze_picker.is_some());
             assert_eq!(view.review_scroll.item_count(), 1);
-            assert_eq!(view.store.awake().len(), 1);
+            assert_eq!(view.engine.store().awake().len(), 1);
         });
         view.update(cx, |view, cx| {
             view.review_filters.snooze = SnoozeFilter::Snoozed;
@@ -4182,11 +3171,7 @@ mod review_view_tests {
         });
         cx.update(|cx| cx.set_global(MainView(view.clone())));
         view.update(cx, |view, cx| {
-            view.respond_to_update(
-                Response::Clicked,
-                "https://github.com/mattsverse/octowatch/releases",
-                cx,
-            );
+            view.apply(vec![Effect::ShowWindow], cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -4194,11 +3179,7 @@ mod review_view_tests {
         view.read_with(cx, |view, _| assert!(view.tab == Tab::Settings));
         // An existing window is activated rather than duplicated.
         view.update(cx, |view, cx| {
-            view.respond_to_update(
-                Response::Clicked,
-                "https://github.com/mattsverse/octowatch/releases",
-                cx,
-            );
+            view.apply(vec![Effect::ShowWindow], cx);
             cx.notify();
         });
         cx.run_until_parked();
@@ -4223,7 +3204,7 @@ mod review_view_tests {
             (Appearance::Dark, Palette::DARK),
         ] {
             view.update(cx, |view, cx| {
-                view.store.appearance = appearance;
+                view.engine.store_mut().appearance = appearance;
                 cx.notify();
             });
             cx.run_until_parked();
@@ -4277,9 +3258,10 @@ mod review_view_tests {
         cx.update(bind_review_keys);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let mut view = fixture(cx, 20);
-            for pr in &mut view.store.pending {
+            let store = view.engine.store_mut();
+            for pr in &mut store.pending {
                 pr.repo = format!("Acme/repo{:02}", pr.number);
-                view.store.local_repos.insert(pr.repository().store_key());
+                store.local_repos.insert(pr.repository().store_key());
             }
             window.focus(&view.focus_handle);
             view
@@ -4439,7 +3421,12 @@ mod review_view_tests {
         view.read_with(cx, |view, _| {
             assert!(view.tab == Tab::Reviews);
             assert_eq!(view.review_filters.query, "alice");
-            assert_eq!(view.review_filters.visible_indices(&view.store).len(), 10);
+            assert_eq!(
+                view.review_filters
+                    .visible_indices(view.engine.store())
+                    .len(),
+                10
+            );
         });
         // Search -> Repository -> Reset -> Status All -> Ready.
         cx.simulate_keystrokes("tab tab tab tab enter");
@@ -4452,7 +3439,12 @@ mod review_view_tests {
         });
         cx.simulate_keystrokes("shift-tab enter");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.review_filters.visible_indices(&view.store).len(), 5)
+            assert_eq!(
+                view.review_filters
+                    .visible_indices(view.engine.store())
+                    .len(),
+                5
+            )
         });
         cx.simulate_keystrokes(find_key());
         cx.write_to_clipboard(gpui::ClipboardItem::new_string("CAFÉ\n#3".into()));
@@ -4463,14 +3455,22 @@ mod review_view_tests {
         ));
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_filters.query, "CAFÉ #3");
-            assert_eq!(view.review_filters.visible_indices(&view.store), vec![7]);
+            assert_eq!(
+                view.review_filters.visible_indices(view.engine.store()),
+                vec![7]
+            );
         });
         cx.simulate_keystrokes("escape");
         cx.simulate_input("login");
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_filters.query, "login");
             assert_eq!(view.review_filters.draft, DraftFilter::All);
-            assert_eq!(view.review_filters.visible_indices(&view.store).len(), 10);
+            assert_eq!(
+                view.review_filters
+                    .visible_indices(view.engine.store())
+                    .len(),
+                10
+            );
         });
     }
 
@@ -4502,7 +3502,10 @@ mod review_view_tests {
         });
         cx.simulate_input("#3");
         view.read_with(cx, |view, _| {
-            assert_eq!(view.review_filters.visible_indices(&view.store), vec![7])
+            assert_eq!(
+                view.review_filters.visible_indices(view.engine.store()),
+                vec![7]
+            )
         });
     }
 
@@ -4517,9 +3520,10 @@ mod review_view_tests {
         visual.simulate_keystrokes(find_key());
         visual.simulate_input("#3");
         view.update(visual, |view, cx| {
-            let mut fetched = view.store.pending.clone();
+            let mut fetched = view.engine.store_mut().pending.clone();
             fetched[7].title = "Updated after refresh".into();
-            view.store
+            view.engine
+                .store_mut()
                 .reconcile(fetched, &BTreeMap::from([("alice".into(), 1)]));
             view.review_filter_cache.invalidate_reviews();
             view.review_filter_cache.invalidate_snoozes();
@@ -4542,7 +3546,10 @@ mod review_view_tests {
         cx.simulate_keystrokes(*window, "backspace 4");
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_filters.query, "#4");
-            assert_eq!(view.review_filters.visible_indices(&view.store), vec![6]);
+            assert_eq!(
+                view.review_filters.visible_indices(view.engine.store()),
+                vec![6]
+            );
         });
     }
 
@@ -4592,8 +3599,12 @@ mod review_view_tests {
         cx.simulate_input("no-match");
         view.read_with(cx, |view, _| {
             assert!(view.snooze_picker.is_none());
-            assert!(view.review_filters.visible_indices(&view.store).is_empty());
-            assert_eq!(view.store.awake().len(), 10);
+            assert!(
+                view.review_filters
+                    .visible_indices(view.engine.store())
+                    .is_empty()
+            );
+            assert_eq!(view.engine.store().awake().len(), 10);
         });
         assert_eq!(cx.opened_url(), None);
     }
@@ -4617,16 +3628,16 @@ mod review_view_tests {
         });
         cx.run_until_parked();
         view.update(cx, |view, cx| {
-            let mut new = view.store.pending[0].clone();
+            let mut new = view.engine.store_mut().pending[0].clone();
             new.number = 101;
-            view.store.pending.insert(0, new);
+            view.engine.store_mut().pending.insert(0, new);
             view.review_filter_cache.invalidate_reviews();
             cx.notify();
         });
         cx.run_until_parked();
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_scroll.logical_scroll_top().item_ix, 11);
-            assert_eq!(view.store.pending[11].number, 90);
+            assert_eq!(view.engine.store().pending[11].number, 90);
         });
         assert!(cx.debug_bounds("review:github.com/acme/api#90").is_some());
     }
@@ -4661,14 +3672,16 @@ mod review_view_tests {
         assert!(cx.debug_bounds("review:github.com/acme/api#1").is_some());
         view.read_with(cx, |view, _| {
             assert_eq!(
-                view.review_filters.visible_indices(&view.store),
+                view.review_filters.visible_indices(view.engine.store()),
                 vec![9_999]
             )
         });
         cx.simulate_keystrokes("escape");
         view.read_with(cx, |view, _| {
             assert_eq!(
-                view.review_filters.visible_indices(&view.store).len(),
+                view.review_filters
+                    .visible_indices(view.engine.store())
+                    .len(),
                 10_000
             )
         });
@@ -4679,7 +3692,9 @@ mod review_view_tests {
         view.read_with(cx, |view, _| {
             assert_eq!(view.review_filters.query, "");
             assert_eq!(
-                view.review_filters.visible_indices(&view.store).len(),
+                view.review_filters
+                    .visible_indices(view.engine.store())
+                    .len(),
                 10_000
             );
         });
@@ -4690,6 +3705,7 @@ mod review_view_tests {
 
 #[cfg(test)]
 mod snooze_tests {
+    use super::test_prelude::*;
     use super::*;
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
 
@@ -4718,14 +3734,17 @@ mod snooze_tests {
     // No startup, tray, GitHub, config-file or notification side effects.
     fn app_for_picker_test(cx: &mut Context<Octowatcher>) -> Octowatcher {
         let mut app = review_view_tests::fixture(cx, 2);
-        app.store.pending = vec![review(1), review(2)];
-        app.store.local_repos = BTreeSet::from(["owner/repo".into()]);
-        app.repos = Some(vec![LocalRepo {
+        app.engine.store_mut().pending = vec![review(1), review(2)];
+        app.engine.store_mut().local_repos = BTreeSet::from(["owner/repo".into()]);
+        app.engine.set_repos(Some(vec![LocalRepo {
             id: RepositoryId::new("github.com", "owner/repo"),
             paths: Vec::new(),
-        }]);
-        app.announced_launch = true;
-        app.store.available_hosts.insert(repository::default_host());
+        }]));
+        app.engine.set_announced_launch(true);
+        app.engine
+            .store_mut()
+            .available_hosts
+            .insert(repository::default_host());
         app
     }
 
@@ -4738,9 +3757,9 @@ mod snooze_tests {
                 let (_, window) = cx.add_window_view(|_, cx| {
                     let mut app = app_for_picker_test(cx);
                     app.tab = Tab::Settings;
-                    app.store.appearance = appearance;
-                    app.store.notifications_muted = muted;
-                    app.store.notify_drafts = !muted;
+                    app.engine.store_mut().appearance = appearance;
+                    app.engine.store_mut().notifications_muted = muted;
+                    app.engine.store_mut().notify_drafts = !muted;
                     app
                 });
                 for selector in ["mute-notifications", "notify-drafts", "test-notification"] {
@@ -4755,438 +3774,22 @@ mod snooze_tests {
     }
 
     #[gpui::test]
-    fn account_switch_discards_queued_alerts_and_ignores_old_delivery_and_actions(
-        cx: &mut TestAppContext,
-    ) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, _| {
-            app.store.recovery_blocked = Some("test state must not be written".into());
-            app.store.notifications_muted = true;
-            app.store.notify_drafts = false;
-            app.store.queue_notifications(&[review(1)]);
-            app.store.notifications_muted = false;
-            let old_generation = app.review_account_generation;
-            let old_batch = app.review_delivery.begin(&app.store).unwrap();
-            let old_target = Target::for_reviews(&old_batch.reviews);
-
-            app.health.apply(
-                github::Check {
-                    readiness: github::Readiness::Ready("another-viewer".into()),
-                    reviews: Err(anyhow::anyhow!("review query failed")),
-                },
-                &mut app.store,
-                200,
-            );
-            app.reset_review_accounts(&[repository::default_host()].into());
-            assert!(app.store.notification_queue.is_empty());
-            assert!(app.store.available_hosts.is_empty());
-            assert!(app.launch_summary);
-            assert!(!app.store.notify_drafts);
-            // The same PR can be requested by both accounts. Old callbacks must
-            // neither snooze it nor unlock or consume the new account's batch.
-            app.store.pending = vec![review(1)];
-            app.store.available_hosts.insert(repository::default_host());
-            app.store.queue_notifications(&[review(1)]);
-            assert!(
-                app.review_delivery.begin(&app.store).is_none(),
-                "retain the in-flight send until its bounded acceptance callback"
-            );
-            let new_batch = app
-                .complete_review_batch(old_generation, &old_batch, true)
-                .unwrap();
-            assert_eq!(app.store.notification_queue, new_batch.notices);
-            assert!(app.review_delivery.begin(&app.store).is_none());
-            assert_eq!(
-                app.review_action(
-                    old_generation,
-                    &old_target,
-                    Response::Action("snooze".into())
-                ),
-                None
-            );
-            assert_eq!(
-                app.review_action(
-                    app.review_account_generation,
-                    &old_target,
-                    Response::Action("snooze".into())
-                ),
-                Some(ReviewAction::Snooze(review(1)))
-            );
-            assert!(
-                app.complete_review_batch(app.review_account_generation, &new_batch, true)
-                    .is_none()
-            );
-            assert!(app.store.notification_queue.is_empty());
-        });
-    }
-
-    #[gpui::test]
-    fn account_switch_keeps_unaffected_host_delivery_and_actions_working(cx: &mut TestAppContext) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, _| {
-            app.store.recovery_blocked = Some("test state must not be written".into());
-            let enterprise = PendingReview {
-                host: "github.example.com".into(),
-                ..review(1)
-            };
-            app.store.pending.push(enterprise.clone());
-            app.store.available_hosts.insert(enterprise.host.clone());
-            app.store
-                .queue_notifications(&[review(1), enterprise.clone()]);
-            let generation = app.review_account_generation;
-            let old_batch = app.review_delivery.begin(&app.store).unwrap();
-            app.store
-                .activate_host_account(&enterprise.host, "new-viewer");
-            app.reset_review_accounts(&[enterprise.host.clone()].into());
-            assert!(app.store.available_hosts.contains("github.com"));
-            assert!(!app.store.available_hosts.contains(&enterprise.host));
-            assert!(
-                app.review_delivery.begin(&app.store).is_none(),
-                "account switching must not duplicate a healthy host's in-flight alert"
-            );
-            assert!(
-                app.complete_review_batch(generation, &old_batch, true)
-                    .is_none()
-            );
-            assert!(
-                app.store.notification_queue.is_empty(),
-                "accepted public alert is acknowledged"
-            );
-            assert_eq!(
-                app.review_action(generation, &Target::Single(review(1)), Response::Clicked),
-                Some(ReviewAction::OpenPr(review(1).url))
-            );
-            assert_eq!(
-                app.review_action(generation, &Target::Single(enterprise), Response::Clicked),
-                None
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn queued_delivery_waits_for_permission_startup_and_launch_validation(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| app_for_picker_test(cx));
-        view.update(cx, |app, cx| {
-            app.store.queue_notifications(&[review(1)]);
-            app.notifications_ready = false;
-            app.deliver_reviews(cx);
-            assert!(app.notification_tasks.is_empty());
-            assert_eq!(app.store.notification_queue.len(), 1);
-            app.notifications_ready = true;
-            app.announced_launch = false;
-            app.deliver_reviews(cx);
-            assert!(app.notification_tasks.is_empty());
-            assert_eq!(app.store.notification_queue.len(), 1);
-            // Once this host validates, no gate was left acquired by startup.
-            app.store.available_hosts.insert(repository::default_host());
-            assert_eq!(
-                app.review_delivery.begin(&app.store).unwrap().reviews,
-                vec![review(1)]
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn enabling_repo_during_fetch_checks_it_without_waiting_for_a_poll(cx: &mut TestAppContext) {
-        use std::sync::{Arc, Mutex};
-
-        for fail_first in [false, true] {
-            let (view, cx) = cx.add_window_view(|_, cx| {
-                let mut app = app_for_picker_test(cx);
-                app.store.pending.clear();
-                app.store.disabled.insert("owner/new".into());
-                app.repos = Some(vec![
-                    LocalRepo {
-                        id: RepositoryId::new("github.com", "owner/old"),
-                        paths: vec![],
-                    },
-                    LocalRepo {
-                        id: RepositoryId::new("github.com", "owner/new"),
-                        paths: vec![],
-                    },
-                ]);
-                app
-            });
-            let calls = Arc::new(Mutex::new(Vec::new()));
-            let (release, blocked) = async_channel::bounded::<()>(1);
-            let fetch = {
-                let calls = calls.clone();
-                move |watched: BTreeSet<RepositoryId>, _, _| {
-                    let calls = calls.clone();
-                    let blocked = blocked.clone();
-                    async move {
-                        let first = {
-                            let mut calls = calls.lock().unwrap();
-                            calls.push(watched);
-                            calls.len() == 1
-                        };
-                        if first {
-                            blocked.recv().await.unwrap();
-                        }
-                        if first && fail_first {
-                            (
-                                Err(anyhow::anyhow!("first check failed")),
-                                Ok(github::FetchedReviews::default()),
-                            )
-                        } else {
-                            (
-                                Ok(github::Poll {
-                                    accounts: vec![],
-                                    checks: vec![],
-                                    access_cache: github::AccessCache::default(),
-                                }),
-                                Ok(github::FetchedReviews::default()),
-                            )
-                        }
-                    }
-                }
-            };
-            view.update(cx, |app, cx| app.refresh_with(fetch.clone(), cx));
-            cx.run_until_parked();
-            assert_eq!(
-                *calls.lock().unwrap(),
-                vec![BTreeSet::from([RepositoryId::new(
-                    "github.com",
-                    "owner/old"
-                )])]
-            );
-            // Reproduce the enable action's refresh while the first check is blocked.
-            view.update(cx, |app, cx| {
-                app.store.disabled.remove("owner/new");
-                app.refresh_with(fetch.clone(), cx);
-                // Several requests during one check should coalesce into one follow-up.
-                app.refresh_with(fetch.clone(), cx);
-            });
-            cx.run_until_parked();
-            assert_eq!(calls.lock().unwrap().len(), 1);
-            release.try_send(()).unwrap();
-            cx.run_until_parked();
-            assert_eq!(
-                *calls.lock().unwrap(),
-                vec![
-                    BTreeSet::from([RepositoryId::new("github.com", "owner/old")]),
-                    BTreeSet::from([
-                        RepositoryId::new("github.com", "owner/old"),
-                        RepositoryId::new("github.com", "owner/new")
-                    ]),
-                ],
-                "the newly enabled repo must be checked before another timer tick"
-            );
-            assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
-        }
-    }
-
-    fn account_poll(checks: Vec<github::AccountCheck>) -> github::Poll {
-        github::Poll {
-            accounts: checks
-                .iter()
-                .map(|check| github::Account {
-                    login: check.account.clone(),
-                    state: "success".into(),
-                    active: check.account == "alice",
-                    account_id: check
-                        .reviews
-                        .as_ref()
-                        .ok()
-                        .map(|reviews| reviews.account_id),
-                })
-                .collect(),
-            checks,
-            access_cache: Default::default(),
-        }
-    }
-
-    fn healthy_account(
-        account: &str,
-        id: u64,
-        pending: Vec<PendingReview>,
-    ) -> github::AccountCheck {
-        github::AccountCheck {
-            account: account.into(),
-            access_errors: vec![],
-            reviews: Ok(github::AccountReviews {
-                account_id: id,
-                pending,
-                unavailable_repos: Default::default(),
-                completed_repos: ["owner/repo".into()].into(),
-            }),
-        }
-    }
-
-    #[gpui::test]
-    fn known_account_caches_stay_stale_offline_but_never_deliver_before_confirmation(
-        cx: &mut TestAppContext,
-    ) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, cx| {
-            app.store.record_account("alice", 1);
-            let mut saved = app.store.clone();
-            saved.roots = vec!["/projects".into()];
-            saved.discovered = vec![LocalRepo {
-                id: review(1).repository(),
-                paths: vec!["/projects/clone".into()],
-            }];
-            saved.queue_notifications(&[review(1)]);
-            app.store = Store::from_json(&serde_json::to_string(&saved).unwrap()).unwrap();
-            app.health = SyncHealth::default();
-            app.review_delivery = Delivery::for_launch(&app.store);
-            assert_eq!(app.tray_reviews(), vec![review(1), review(2)]);
-            assert!(app.review_delivery.begin(&app.store).is_none());
-            app.reconcile(
-                account_poll(vec![github::AccountCheck {
-                    account: "alice".into(),
-                    reviews: Err(anyhow::anyhow!("dial tcp: network is unreachable")),
-                    access_errors: vec![],
-                }]),
-                Default::default(),
-                None,
-                cx,
-            );
-            assert_eq!(app.tray_reviews(), vec![review(1), review(2)]);
-            assert_eq!(app.review_status(), ReviewsStatus::Offline);
-            assert!(app.review_delivery.begin(&app.store).is_none());
-            app.reconcile(
-                account_poll(vec![github::AccountCheck {
-                    account: "alice".into(),
-                    reviews: Err(anyhow::anyhow!("GitHub CLI timed out after 30 seconds")),
-                    access_errors: vec![],
-                }]),
-                Default::default(),
-                None,
-                cx,
-            );
-            assert_eq!(app.tray_reviews(), vec![review(1), review(2)]);
-            assert!(app.review_delivery.begin(&app.store).is_none());
-            app.store.notifications_muted = true;
-            app.reconcile(
-                account_poll(vec![healthy_account(
-                    "alice",
-                    1,
-                    vec![review(1), review(2)],
-                )]),
-                Default::default(),
-                None,
-                cx,
-            );
-            assert_eq!(app.review_status(), ReviewsStatus::Ready);
-            assert!(app.store.available_accounts.contains("alice"));
-            assert_eq!(app.store.notification_queue.len(), 2);
-        });
-    }
-
-    #[gpui::test]
-    fn auth_failures_hide_only_that_account_and_reused_logins_do_not_inherit_caches(
-        cx: &mut TestAppContext,
-    ) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, cx| {
-            let alice = review(1);
-            let bob = PendingReview {
-                account: "bob".into(),
-                account_id: 2,
-                ..alice.clone()
-            };
-            app.store.record_account("alice", 1);
-            app.store.record_account("bob", 2);
-            app.store.pending = vec![alice.clone(), bob.clone()];
-            app.store.stale_accounts = ["alice".into(), "bob".into()].into();
-            app.store.notifications_muted = true;
-            let last_success = app.store.last_successful_sync;
-            app.reconcile(
-                account_poll(vec![
-                    github::AccountCheck {
-                        account: "alice".into(),
-                        reviews: Err(anyhow::anyhow!("Bad credentials (HTTP 401)")),
-                        access_errors: vec![],
-                    },
-                    healthy_account("bob", 2, vec![bob.clone()]),
-                ]),
-                Default::default(),
-                None,
-                cx,
-            );
-            assert_eq!(app.tray_reviews(), vec![bob.clone()]);
-            assert_eq!(app.store.pending.len(), 2);
-            assert_eq!(app.store.last_successful_sync, last_success);
-            assert_eq!(app.health.accounts["alice"], github::Readiness::SignedOut);
-            assert!(!app.health.verified);
-            let replacement = PendingReview {
-                account_id: 99,
-                ..alice.clone()
-            };
-            app.reconcile(
-                account_poll(vec![
-                    healthy_account("alice", 99, vec![replacement.clone()]),
-                    healthy_account("bob", 2, vec![bob.clone()]),
-                ]),
-                Default::default(),
-                None,
-                cx,
-            );
-            assert!(app.store.visible(&replacement));
-            assert!(!app.store.visible(&alice));
-            assert!(app.store.pending.contains(&alice));
-            assert!(app.health.verified);
-        });
-    }
-
-    #[gpui::test]
-    fn offline_account_check_does_not_reveal_a_repository_with_known_access_failure(
-        cx: &mut TestAppContext,
-    ) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, cx| {
-            app.store.record_account("alice", 1);
-            app.store.notifications_muted = true;
-            app.reconcile(
-                account_poll(vec![github::AccountCheck {
-                    account: "alice".into(),
-                    access_errors: vec![("owner/repo".into(), "Forbidden (HTTP 403)".into())],
-                    reviews: Ok(github::AccountReviews {
-                        account_id: 1,
-                        pending: vec![],
-                        unavailable_repos: ["owner/repo".into()].into(),
-                        completed_repos: Default::default(),
-                    }),
-                }]),
-                Default::default(),
-                None,
-                cx,
-            );
-            assert!(app.tray_reviews().is_empty());
-            app.reconcile(
-                account_poll(vec![github::AccountCheck {
-                    account: "alice".into(),
-                    reviews: Err(anyhow::anyhow!("dial tcp: network is unreachable")),
-                    access_errors: vec![],
-                }]),
-                Default::default(),
-                None,
-                cx,
-            );
-            assert_eq!(app.store.pending.len(), 2);
-            assert!(app.tray_reviews().is_empty());
-            assert!(app.store.notifications_due().is_empty());
-        });
-    }
-
-    #[gpui::test]
     fn all_hidden_cached_accounts_stay_unavailable_with_health_in_settings(
         cx: &mut TestAppContext,
     ) {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut app = app_for_picker_test(cx);
-            app.store.available_accounts.clear();
-            app.store.stale_accounts.clear();
-            app.health.readiness = github::Readiness::SignedOut;
-            app.health.verified = false;
-            app.health.error = Some("Not signed in".into());
+            app.engine.store_mut().available_accounts.clear();
+            app.engine.store_mut().stale_accounts.clear();
+            app.engine.health_mut().readiness = github::Readiness::SignedOut;
+            app.engine.health_mut().verified = false;
+            app.engine.health_mut().error = Some("Not signed in".into());
             app
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("setup-health-panel").is_none());
         view.read_with(cx, |app, _| {
-            assert_eq!(app.store.pending.len(), 2);
+            assert_eq!(app.engine.store().pending.len(), 2);
             assert_eq!(app.review_status(), ReviewsStatus::Unavailable);
             assert!(!app.controls().contains(&Control::CopyLogin));
         });
@@ -5199,61 +3802,6 @@ mod snooze_tests {
     }
 
     #[gpui::test]
-    fn confirmed_requests_can_finish_launch_announcement_during_a_partial_check(
-        cx: &mut TestAppContext,
-    ) {
-        let (view, cx) = cx.add_window_view(|_, cx| {
-            let mut app = app_for_picker_test(cx);
-            app.announced_launch = false;
-            app.store.pending = vec![review(1)];
-            app.review_delivery = Delivery::for_launch(&app.store);
-            app.store
-                .snooze(&review(1).key(), 60, Local::now().timestamp());
-            app
-        });
-        view.update(cx, |app, cx| {
-            app.reconcile(
-                github::Poll {
-                    accounts: vec![],
-                    checks: vec![],
-                    access_cache: Default::default(),
-                },
-                Default::default(),
-                Some("GitHub unavailable".into()),
-                cx,
-            );
-        });
-        assert!(view.read_with(cx, |app, _| !app.announced_launch));
-        view.update(cx, |app, cx| {
-            app.reconcile(
-                github::Poll {
-                    accounts: vec![github::Account {
-                        login: "alice".into(),
-                        state: "success".into(),
-                        active: true,
-                        account_id: Some(1),
-                    }],
-                    checks: vec![github::AccountCheck {
-                        account: "alice".into(),
-                        access_errors: vec![("owner/repo".into(), "unreadable team".into())],
-                        reviews: Ok(github::AccountReviews {
-                            account_id: 1,
-                            pending: vec![review(1)],
-                            unavailable_repos: ["owner/repo".into()].into(),
-                            completed_repos: Default::default(),
-                        }),
-                    }],
-                    access_cache: Default::default(),
-                },
-                Default::default(),
-                None,
-                cx,
-            );
-        });
-        assert!(view.read_with(cx, |app, _| app.announced_launch));
-    }
-
-    #[gpui::test]
     fn picker_tracks_the_pr_key_and_closes_when_the_review_disappears_or_is_snoozed(
         cx: &mut TestAppContext,
     ) {
@@ -5261,14 +3809,14 @@ mod snooze_tests {
         app.update(cx, |app, _| {
             let key = review(1).key();
             app.snooze_picker = Some(key.clone());
-            app.store.pending.reverse();
+            app.engine.store_mut().pending.reverse();
             app.dismiss_stale_snooze_picker();
             assert_eq!(app.snooze_picker, Some(key.clone()));
-            app.store.snooze(&key, 30, 1_000);
+            app.engine.store_mut().snooze(&key, 30, 1_000);
             app.dismiss_stale_snooze_picker();
             assert_eq!(app.snooze_picker, None);
             app.snooze_picker = Some(key);
-            app.store.pending.retain(|pr| pr.number != 1);
+            app.engine.store_mut().pending.retain(|pr| pr.number != 1);
             app.dismiss_stale_snooze_picker();
             assert_eq!(app.snooze_picker, None);
         });
@@ -5279,7 +3827,7 @@ mod snooze_tests {
         let (view, cx) = cx.add_window_view(|_, cx| app_for_picker_test(cx));
         for appearance in [Appearance::Light, Appearance::Dark] {
             view.update(cx, |app, cx| {
-                app.store.appearance = appearance;
+                app.engine.store_mut().appearance = appearance;
                 app.tab = Tab::Reviews;
                 cx.notify();
             });
@@ -5294,279 +3842,20 @@ mod snooze_tests {
     }
 
     #[gpui::test]
-    fn host_discovery_failure_retains_cache_but_honors_removed_roots(cx: &mut TestAppContext) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, _| {
-            app.repos = None;
-            let public = review(1);
-            let enterprise = PendingReview {
-                host: "github.example.com".into(),
-                ..public.clone()
-            };
-            app.store.pending = vec![public.clone(), enterprise.clone()];
-            app.store
-                .local_repos
-                .insert(enterprise.repository().store_key());
-            app.store.roots = vec!["/missing/kept".into()];
-            app.store.discovered = vec![
-                LocalRepo {
-                    id: public.repository(),
-                    paths: vec!["/missing/removed/clone".into()],
-                },
-                LocalRepo {
-                    id: enterprise.repository(),
-                    paths: vec!["/missing/kept/clone".into()],
-                },
-            ];
-            app.store.queue_notifications(&app.store.pending.clone());
-            app.store.snooze(&enterprise.key(), 120, 0);
-            let snoozed = app.store.snoozed.clone();
-            app.snooze_picker = Some(public.key());
-            let changes = app
-                .apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
-                .unwrap();
-            assert!(changes.start_fetch);
-            assert!(changes.cache_changed);
-            assert!(changes.reviews.pending_changed && changes.reviews.notifications_changed);
-            assert_eq!(app.store.pending, vec![enterprise.clone()]);
-            assert_eq!(app.store.snoozed, snoozed);
-            assert!(app.store.notification_queue.is_empty());
-            assert_eq!(app.store.discovered[0].id, enterprise.repository());
-            assert_eq!(app.repos.as_ref().unwrap(), &app.store.discovered);
-            assert!(app.snooze_picker.is_none());
-            assert!(
-                app.scan_error
-                    .as_deref()
-                    .unwrap()
-                    .contains("host discovery failed")
-            );
-        });
-    }
-
-    #[gpui::test]
-    fn failed_discovery_still_checks_cached_hosts_in_both_completion_orders(
-        cx: &mut TestAppContext,
-    ) {
-        use std::sync::{Arc, Mutex};
-
-        for fetch_finishes_first in [true, false] {
-            let cached = review(1).repository();
-            let (view, cx) = cx.add_window_view(|_, cx| {
-                let mut app = app_for_picker_test(cx);
-                app.store.pending.clear();
-                app.store.last_successful_sync = None;
-                app.store.roots = vec!["/missing/watched".into()];
-                app.store.discovered = vec![LocalRepo {
-                    id: cached.clone(),
-                    paths: vec!["/missing/watched/clone".into()],
-                }];
-                app.repos = Some(app.store.discovered.clone());
-                app
-            });
-            let calls = Arc::new(Mutex::new(Vec::new()));
-            let (release, blocked) = async_channel::bounded::<()>(1);
-            let fetch = {
-                let calls = calls.clone();
-                move |watched: BTreeSet<RepositoryId>, _, _| {
-                    let calls = calls.clone();
-                    let blocked = blocked.clone();
-                    async move {
-                        let first = {
-                            let mut calls = calls.lock().unwrap();
-                            calls.push(watched.clone());
-                            calls.len() == 1
-                        };
-                        if first {
-                            blocked.recv().await.unwrap();
-                        }
-                        let repos: Vec<_> = watched.iter().map(|repo| repo.slug.clone()).collect();
-                        let account = "alice".to_string();
-                        (
-                            Ok(github::Poll {
-                                accounts: vec![github::Account {
-                                    login: account.clone(),
-                                    state: "success".into(),
-                                    active: true,
-                                    account_id: Some(1),
-                                }],
-                                checks: vec![github::AccountCheck {
-                                    account,
-                                    access_errors: vec![],
-                                    reviews: Ok(github::AccountReviews {
-                                        account_id: 1,
-                                        pending: vec![],
-                                        unavailable_repos: Default::default(),
-                                        completed_repos: repos.into_iter().collect(),
-                                    }),
-                                }],
-                                access_cache: github::AccessCache::default(),
-                            }),
-                            Ok(github::FetchedReviews::default()),
-                        )
-                    }
-                }
-            };
-            view.update(cx, |app, cx| {
-                app.refresh_with(fetch.clone(), cx);
-                assert!(app.refresh_queue.request_scan(false));
-                // Hold discovery open while the real fetch callback completes.
-                app.scan_task = Some(Task::ready(()));
-            });
-            cx.run_until_parked();
-            assert_eq!(calls.lock().unwrap().len(), 1);
-            if fetch_finishes_first {
-                release.try_send(()).unwrap();
-                cx.run_until_parked();
-                assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
-                assert!(view.read_with(cx, |app, _| app.store.last_successful_sync.is_none()));
-            }
-            view.update(cx, |app, cx| {
-                app.scan_task = None;
-                assert!(!app.refresh_queue.scan_finished(false));
-                let changes = app
-                    .apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
-                    .unwrap();
-                if changes.start_fetch {
-                    app.refresh_with(fetch.clone(), cx);
-                }
-            });
-            if !fetch_finishes_first {
-                cx.run_until_parked();
-                assert_eq!(calls.lock().unwrap().len(), 1, "checks must not overlap");
-                release.try_send(()).unwrap();
-            }
-            cx.run_until_parked();
-            assert_eq!(
-                *calls.lock().unwrap(),
-                vec![BTreeSet::from([cached.clone()]); 2],
-                "failed scan must request a replacement check for the cached repository"
-            );
-            assert!(view.read_with(cx, |app, _| app.store.last_successful_sync.is_some()));
-            assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
-
-            // A persistent discovery error must not block the next scheduled check.
-            view.update(cx, |app, cx| {
-                assert!(app.refresh_queue.request_scan(false));
-                assert!(!app.refresh_queue.scan_finished(false));
-                let changes = app
-                    .apply_discovery(Err(anyhow::anyhow!("host discovery still failed")))
-                    .unwrap();
-                if changes.start_fetch {
-                    app.refresh_with(fetch.clone(), cx);
-                }
-            });
-            cx.run_until_parked();
-            assert_eq!(*calls.lock().unwrap(), vec![BTreeSet::from([cached]); 3]);
-            assert!(view.read_with(cx, |app, _| app.fetch_task.is_none()));
-            assert!(view.read_with(cx, |app, _| app.scan_error.is_some()));
-        }
-    }
-
-    #[gpui::test]
-    fn stale_cache_regressions_keep_tray_reviews_after_failed_startup_and_rescan(
-        cx: &mut TestAppContext,
-    ) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, _| {
-            // A restarted cache has not been verified in this process.
-            app.health = SyncHealth::default();
-            app.health.apply(
-                github::Check {
-                    readiness: github::Readiness::Offline,
-                    reviews: Err(anyhow::anyhow!("network is unreachable")),
-                },
-                &mut app.store,
-                100,
-            );
-            assert_eq!(app.review_status(), ReviewsStatus::Offline);
-            assert_eq!(app.tray_reviews(), app.store.pending);
-            // Beginning a rescan invalidates freshness, not cached visibility.
-            app.health.verified = false;
-            assert_eq!(app.tray_reviews().len(), 2);
-            // A confirmed different account still clears the old cache.
-            app.health.apply(
-                github::Check {
-                    readiness: github::Readiness::Ready("another-viewer".into()),
-                    reviews: Err(anyhow::anyhow!("review query failed")),
-                },
-                &mut app.store,
-                200,
-            );
-            assert!(app.tray_reviews().is_empty());
-        });
-    }
-
-    #[gpui::test]
-    fn stale_cache_regressions_snooze_expiry_during_rescan_produces_one_alert(
-        cx: &mut TestAppContext,
-    ) {
-        let (view, cx) = cx.add_window_view(|_, cx| app_for_picker_test(cx));
-        view.update(cx, |app, cx| {
-            // Keep the production wake path's saving isolated from user state.
-            app.store.recovery_blocked = Some("test state must not be written".into());
-            app.store
-                .snooze(&review(1).key(), 5, Local::now().timestamp() - 301);
-            app.health.verified = false;
-            assert_eq!(app.wake(cx), vec![review(1)]);
-            assert!(app.store.snoozed.is_empty());
-            assert_eq!(app.tray_reviews().len(), 2);
-            assert!(app.wake(cx).is_empty());
-            let batch = app.review_delivery.begin(&app.store).unwrap();
-            assert_eq!(batch.reviews, vec![review(1)]);
-            // A failed native send retains the reminder for recovery.
-            assert!(
-                app.review_delivery
-                    .complete(&mut app.store, &batch, false)
-                    .is_none()
-            );
-            assert_eq!(app.store.notification_queue, batch.notices);
-        });
-    }
-
-    #[gpui::test]
-    fn first_host_discovery_failure_preserves_legacy_reviews_and_snoozes(cx: &mut TestAppContext) {
-        let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, _| {
-            app.repos = None;
-            app.store.snooze(&review(1).key(), 5, 0);
-            let pending = app.store.pending.clone();
-            let snoozed = app.store.snoozed.clone();
-            assert!(
-                app.apply_discovery(Err(anyhow::anyhow!("host discovery failed")))
-                    .is_none()
-            );
-            assert_eq!(app.store.pending, pending);
-            assert_eq!(app.store.snoozed, snoozed);
-            assert!(app.repos.is_none());
-        });
-    }
-
-    #[gpui::test]
-    fn stale_cache_regressions_permission_wait_preserves_expired_snooze(cx: &mut TestAppContext) {
-        let (view, cx) = cx.add_window_view(|_, cx| app_for_picker_test(cx));
-        view.update(cx, |app, cx| {
-            app.store.recovery_blocked = Some("test state must not be written".into());
-            app.store
-                .snooze(&review(1).key(), 5, Local::now().timestamp() - 301);
-            app.notifications_ready = false;
-            assert!(app.wake(cx).is_empty());
-            assert_eq!(app.store.snoozed.len(), 1);
-            app.notifications_ready = true;
-            assert_eq!(app.wake(cx), vec![review(1)]);
-            assert!(app.wake(cx).is_empty());
-        });
-    }
-
-    #[gpui::test]
     fn discovery_pruning_dismisses_the_removed_review_picker(cx: &mut TestAppContext) {
         let app = cx.new(app_for_picker_test);
-        app.update(cx, |app, _| {
+        app.update(cx, |app, cx| {
             app.snooze_picker = Some(review(1).key());
-            let changes = app
-                .apply_discovery(Ok(discovery::ScanResult::default()))
-                .unwrap();
-            assert!(changes.start_fetch);
-            assert!(changes.reviews.pending_changed);
+            let roots = app.engine.store().roots.clone();
+            app.dispatch(
+                Done::Scanned {
+                    roots,
+                    result: Ok(discovery::ScanResult::default()),
+                },
+                cx,
+            );
+            assert!(app.started.contains(&JobKey::Fetch));
+            assert!(app.engine.store().pending.is_empty());
             assert!(app.snooze_picker.is_none());
         });
     }
@@ -5595,7 +3884,7 @@ mod snooze_tests {
         assert!(cx.debug_bounds("snooze-picker-1").is_some());
         click(cx, "cancel-snooze-1");
         assert!(view.read_with(cx, |v, _| v.snooze_picker.is_none()
-            && v.store.snoozed.is_empty()));
+            && v.engine.store().snoozed.is_empty()));
         assert_eq!(cx.opened_url(), None);
         click(cx, "snooze-0");
         click(cx, "snooze-0");
@@ -5616,10 +3905,11 @@ mod snooze_tests {
         let enterprise_key = enterprise.key();
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut app = app_for_picker_test(cx);
-            app.store
+            app.engine
+                .store_mut()
                 .local_repos
                 .insert("github.example.com/owner/repo".into());
-            app.store.pending = vec![public.clone(), enterprise];
+            app.engine.store_mut().pending = vec![public.clone(), enterprise];
             app
         });
         click(cx, "snooze-0");
@@ -5634,7 +3924,7 @@ mod snooze_tests {
         );
         // Snoozing the public counterpart must leave the Enterprise picker open.
         view.update(cx, |v, _| {
-            v.store.snooze(&public.key(), 5, 1_000);
+            v.engine.store_mut().snooze(&public.key(), 5, 1_000);
             v.dismiss_stale_snooze_picker();
             assert_eq!(v.snooze_picker, Some(enterprise_key));
         });
@@ -5651,8 +3941,11 @@ mod snooze_tests {
             let mut bob = alice.clone();
             bob.account = "bob".into();
             bob.account_id = 2;
-            app.store.pending = vec![alice.clone(), bob.clone()];
-            app.store.available_accounts.insert("bob".into());
+            app.engine.store_mut().pending = vec![alice.clone(), bob.clone()];
+            app.engine
+                .store_mut()
+                .available_accounts
+                .insert("bob".into());
             app
         });
         let alice = review(1);
@@ -5670,7 +3963,7 @@ mod snooze_tests {
             Some(bob.key())
         );
         view.update(cx, |v, cx| {
-            v.store.available_accounts.remove("bob");
+            v.engine.store_mut().available_accounts.remove("bob");
             v.review_filter_cache.invalidate_reviews();
             v.dismiss_stale_snooze_picker();
             cx.notify();
@@ -5678,8 +3971,8 @@ mod snooze_tests {
         cx.run_until_parked();
         view.read_with(cx, |v, _| {
             assert!(v.snooze_picker.is_none());
-            assert_eq!(v.store.pending.len(), 2);
-            assert_eq!(v.store.visible_pending(), vec![alice]);
+            assert_eq!(v.engine.store().pending.len(), 2);
+            assert_eq!(v.engine.store().visible_pending(), vec![alice]);
         });
         assert_eq!(cx.opened_url(), None);
     }
@@ -5697,7 +3990,7 @@ mod snooze_tests {
                 .collect();
             controls.push(Control::CancelSnooze(review(1).key()));
             self.keyboard
-                .set_palette(self.store.appearance.palette(window.appearance()));
+                .set_palette(theme::palette(self.store.appearance, window.appearance()));
             self.keyboard.reconcile(controls, window, cx);
             div()
                 .id("card")
@@ -5709,7 +4002,7 @@ mod snooze_tests {
                     self.store.snooze_minutes,
                     &self.keyboard,
                     review(1).key(),
-                    self.store.appearance.palette(window.appearance()),
+                    theme::palette(self.store.appearance, window.appearance()),
                     cx,
                     |this, minutes, _| {
                         this.picked.push(minutes);
@@ -5776,24 +4069,5 @@ mod snooze_tests {
             );
             assert_eq!(cx.opened_url(), None);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn review_notifications_label_receiving_accounts_for_single_and_grouped_requests() {
-        let store = Store::from_json(include_str!(
-            "../tests/fixtures/multiple-account-state.json"
-        ))
-        .unwrap();
-        let (_, single) = notification_text(&store.pending[..1]);
-        assert!(single.contains("@alice · github.com/Owner/Repo#7"));
-        let (summary, grouped) = notification_text(&store.pending);
-        assert_eq!(summary, "2 pull requests need your review");
-        assert!(grouped.contains("@alice · github.com/Owner/Repo#7"));
-        assert!(grouped.contains("@bob · github.com/Owner/Repo#7"));
     }
 }
