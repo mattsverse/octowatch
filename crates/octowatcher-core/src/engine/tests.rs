@@ -862,3 +862,126 @@ fn flush_writes_unsaved_state_and_skips_when_up_to_date() {
             .any(|error| error.contains("could not save state"))
     );
 }
+
+fn identifies(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Start(Job::Identify)))
+        .count()
+}
+
+fn identity(login: &str, verified: anyhow::Result<&str>) -> github::Identity {
+    github::Identity {
+        login: login.into(),
+        active: login == "alice",
+        verified: verified.map(str::to_string),
+    }
+}
+
+#[test]
+fn sign_in_state_shows_before_the_first_fetch_finishes() {
+    let mut app = engine();
+    app.health = SyncHealth::default();
+    app.fetch_reviews();
+    let effects = app.take_effects();
+    assert_eq!(
+        identifies(&effects),
+        1,
+        "the first fetch checks identities alongside it"
+    );
+    assert_eq!(fetches(&effects).len(), 1);
+
+    app.handle(Done::Identified(Ok(vec![identity("alice", Ok("alice"))])));
+    assert_eq!(
+        app.health().readiness,
+        github::Readiness::Ready("alice".into())
+    );
+    assert_eq!(app.health().active_public.as_deref(), Some("alice"));
+    assert!(
+        app.fetching(),
+        "the fetch is still running; reviews aren't verified yet"
+    );
+    assert!(!app.health().verified);
+}
+
+#[test]
+fn a_signed_out_account_shows_before_the_fetch_and_the_fetch_has_the_last_word() {
+    let mut app = engine();
+    app.health = SyncHealth::default();
+    app.fetch_reviews();
+    app.take_effects();
+    app.handle(Done::Identified(Ok(vec![identity(
+        "alice",
+        Err(anyhow::anyhow!("HTTP 401: Bad credentials")),
+    )])));
+    assert_eq!(app.health().readiness, github::Readiness::SignedOut);
+
+    app.handle(Done::Fetched {
+        public: Ok(account_poll(vec![healthy_account("alice", 1, vec![])])),
+        enterprise: Ok(github::FetchedReviews::default()),
+    });
+    assert_eq!(
+        app.health().readiness,
+        github::Readiness::Ready("alice".into())
+    );
+}
+
+#[test]
+fn identities_landing_after_the_fetch_never_replace_its_answer() {
+    let mut app = engine();
+    app.health = SyncHealth::default();
+    app.fetch_reviews();
+    app.take_effects();
+    app.handle(Done::Fetched {
+        public: Ok(account_poll(vec![healthy_account("alice", 1, vec![])])),
+        enterprise: Ok(github::FetchedReviews::default()),
+    });
+    let fetched = app.health().readiness.clone();
+    app.handle(Done::Identified(Err(anyhow::anyhow!(
+        "gh: could not connect"
+    ))));
+    assert_eq!(app.health().readiness, fetched);
+}
+
+#[test]
+fn later_fetches_skip_the_identity_check_once_sign_in_is_known() {
+    let mut app = engine();
+    app.fetch_reviews();
+    let effects = app.take_effects();
+    assert_eq!(fetches(&effects).len(), 1);
+    assert_eq!(identifies(&effects), 0);
+}
+
+fn scans(effects: &[Effect]) -> usize {
+    effects
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Start(Job::Scan { .. })))
+        .count()
+}
+
+#[test]
+fn switching_a_repository_off_checks_github_again_without_rescanning_folders() {
+    let broken = RepositoryId::new("github.com", "owner/no-remote");
+    let kept = RepositoryId::new("github.com", "owner/repo");
+    let mut app = engine();
+    app.repos = Some(vec![
+        LocalRepo {
+            id: kept.clone(),
+            paths: vec![],
+        },
+        LocalRepo {
+            id: broken.clone(),
+            paths: vec![],
+        },
+    ]);
+    let effects = app.handle(Command::ToggleRepo("owner/no-remote".into()));
+    assert_eq!(scans(&effects), 0, "the folders didn't change");
+    assert_eq!(fetches(&effects), vec![BTreeSet::from([kept.clone()])]);
+
+    // The same holds for account scope changes.
+    let effects = app.handle(Command::ToggleRepoAccount {
+        repo: "owner/repo".into(),
+        account: "alice".into(),
+    });
+    assert_eq!(scans(&effects), 0);
+}

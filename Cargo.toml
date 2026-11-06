@@ -17,9 +17,11 @@ async-channel = "2.5"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 dirs = "7.0.0"
 futures-lite = "2.6"
-gpui = "0.2.2"
 libc = "0.2"
 png = "0.18"
+# Rune is pre-release: pin a `dev` revision, which is never rewritten.
+rune = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", features = ["native-file-dialog"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50" }
 semver = "1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

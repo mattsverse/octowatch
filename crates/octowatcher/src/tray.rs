@@ -1,5 +1,8 @@
 use anyhow::Result;
-use gpui::App;
+use octowatcher_core::engine::Command;
+use rune::AppHandle;
+
+use crate::app::Octowatcher;
 use semver::Version;
 use tray_icon::{
     Icon, TrayIcon, TrayIconBuilder,
@@ -37,7 +40,7 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(pending: &[PendingReview], status: Option<&str>, muted: bool) -> Result<Self> {
-        // GPUI has its own X11/Wayland event loop; it doesn't initialize GTK
+        // Rune has its own X11/Wayland event loop; it doesn't initialize GTK
         // for the AppIndicator and its menu. An initialization failure must
         // return an error so quiet startup can fall back to opening a window.
         #[cfg(target_os = "linux")]
@@ -80,72 +83,55 @@ impl Tray {
     }
 }
 
-/// Routes clicks on the tray menu for as long as the app runs.
-pub fn listen(cx: &mut App) {
+/// Routes clicks on the tray menu to the app for as long as it runs. The handler fires on the
+/// main thread; each click becomes an update on the app's state.
+pub fn listen(handle: AppHandle<Octowatcher>) {
     #[cfg(target_os = "linux")]
-    cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(50))
-                .await;
-            if cx
-                .update(|_| {
-                    if gtk::is_initialized_main_thread() {
-                        let context = gtk::glib::MainContext::default();
-                        // Keep GTK's tray/D-Bus callbacks running even with no
-                        // GPUI window. Bound each turn to avoid starving GPUI.
-                        for _ in 0..32 {
-                            if !context.pending() {
-                                break;
+    {
+        // Rune runs its own X11/Wayland loop; keep GTK's tray and D-Bus callbacks turning
+        // even with no window. Each turn is bounded so it never starves the window.
+        let pump = handle.clone();
+        std::thread::Builder::new()
+            .name("octowatcher-gtk".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    pump.update_if(|_, _| {
+                        if gtk::is_initialized_main_thread() {
+                            let context = gtk::glib::MainContext::default();
+                            for _ in 0..32 {
+                                if !context.pending() {
+                                    break;
+                                }
+                                context.iteration(false);
                             }
-                            context.iteration(false);
                         }
-                    }
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    })
-    .detach();
-    let (tx, rx) = async_channel::unbounded();
-    // The handler fires on the main thread from AppKit; hand events over to
-    // the app's executor instead of acting from inside the callback.
+                        false
+                    });
+                }
+            })
+            .expect("could not start the GTK pump");
+    }
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
-        tx.send_blocking(event).ok();
-    }));
-    cx.spawn(async move |cx| {
-        while let Ok(event) = rx.recv().await {
-            let id = event.id.as_ref();
-            let handled = if id == SHOW_ID {
-                cx.update(crate::show_window)
-            } else if id == MUTE_ID {
-                cx.update(crate::toggle_notifications_muted)
-            } else if id == REFRESH_ID {
-                cx.update(crate::refresh)
-            } else if id == RESTART_ID {
-                cx.update(crate::restart)
-            } else if id == CHECK_UPDATES_ID {
-                cx.update(crate::check_for_updates)
-            } else if id == INSTALL_ID {
-                cx.update(crate::install_update)
-            } else if id == QUIT_ID {
-                cx.update(|cx| cx.quit())
-            } else if let Some((_, url)) = id
-                .strip_prefix(OPEN_PREFIX)
-                .and_then(|id| id.split_once(':'))
-            {
-                cx.update(|cx| cx.open_url(url))
-            } else {
-                Ok(())
-            };
-            if handled.is_err() {
-                break;
+        let id = event.id.as_ref().to_string();
+        handle.update(move |s: &mut Octowatcher, tx| match id.as_str() {
+            SHOW_ID => s.show_window(),
+            MUTE_ID => s.command(Command::ToggleNotificationsMuted, tx),
+            REFRESH_ID => s.command(Command::ForceRefresh, tx),
+            RESTART_ID => s.restart(tx),
+            CHECK_UPDATES_ID => s.command(Command::CheckForUpdates { manual: true }, tx),
+            INSTALL_ID => s.command(Command::InstallUpdate, tx),
+            QUIT_ID => s.quit(tx),
+            id => {
+                if let Some((_, url)) = id
+                    .strip_prefix(OPEN_PREFIX)
+                    .and_then(|id| id.split_once(':'))
+                {
+                    crate::app::open_url(url, tx);
+                }
             }
-        }
-    })
-    .detach();
+        });
+    }));
 }
 
 fn build_menu(

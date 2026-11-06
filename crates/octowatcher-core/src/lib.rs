@@ -4,6 +4,8 @@
 //! self-update). No UI toolkit is linked here.
 
 pub mod appearance;
+#[cfg(any(test, feature = "test-support"))]
+pub mod demo;
 pub mod discovery;
 pub mod engine;
 pub mod github;

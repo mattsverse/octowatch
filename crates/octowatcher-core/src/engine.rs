@@ -109,6 +109,9 @@ pub enum Job {
         preferences: Box<Store>,
         cache: github::AccessCache,
     },
+    /// Verifies the saved github.com accounts without repository queries, so sign-in state
+    /// shows before the first (slower) fetch finishes.
+    Identify,
     Permission,
     /// Asks the OS for notification permission at startup.
     Authorize,
@@ -139,6 +142,7 @@ pub enum JobKey {
     Timer(Timer),
     Scan,
     Fetch,
+    Identify,
     Permission,
     Authorize,
     Notification(usize),
@@ -169,6 +173,7 @@ pub enum Done {
         public: anyhow::Result<github::Poll>,
         enterprise: anyhow::Result<github::FetchedReviews>,
     },
+    Identified(anyhow::Result<Vec<github::Identity>>),
     UpdateChecked(anyhow::Result<Option<Release>>),
     Saved(anyhow::Result<()>),
     Installed {
@@ -552,6 +557,7 @@ impl Engine {
         match done {
             Done::Scanned { roots, result } => self.scanned(roots, result),
             Done::Fetched { public, enterprise } => self.fetched(public, enterprise),
+            Done::Identified(identities) => self.identified(identities),
             Done::UpdateChecked(checked) => self.update_checked(checked),
             Done::Installed { release, result } => self.installed(release, result),
             Done::Saved(result) => self.saved(result),
@@ -758,11 +764,83 @@ impl Engine {
             return;
         }
         self.fetching = true;
+        let watched = self.watched_repositories();
+        // Until a fetch has reported sign-in state, check identities alongside it: that
+        // answers in a second or two, where the fetch takes a request per repository.
+        if matches!(self.health.readiness, github::Readiness::Checking)
+            && (watched.is_empty() || watched.iter().any(|repo| repo.host == PUBLIC_HOST))
+        {
+            self.spawn(Job::Identify);
+        }
         self.spawn(Job::Fetch {
-            watched: self.watched_repositories(),
+            watched,
             preferences: Box::new(self.store.clone()),
             cache: self.access_cache.clone(),
         });
+    }
+
+    /// Provisional sign-in state from [`Job::Identify`]. It only fills in while readiness
+    /// is still unknown; the fetch's own result replaces it when it lands, and never the
+    /// other way round.
+    fn identified(&mut self, identities: anyhow::Result<Vec<github::Identity>>) {
+        if !matches!(self.health.readiness, github::Readiness::Checking) {
+            return;
+        }
+        let identities = match identities {
+            Ok(identities) => identities,
+            Err(err) => {
+                let readiness = github::classify_failure(&err);
+                self.health
+                    .hosts
+                    .insert(PUBLIC_HOST.into(), readiness.clone());
+                self.health.readiness = readiness;
+                return;
+            }
+        };
+        self.health.active_public = identities
+            .iter()
+            .find(|identity| identity.active)
+            .map(|identity| identity.login.clone());
+        let mut ready = Vec::new();
+        let mut worst = None;
+        for identity in identities
+            .iter()
+            .filter(|identity| self.store.account_enabled(&identity.login))
+        {
+            let readiness = match &identity.verified {
+                Ok(login) => {
+                    ready.push(login.clone());
+                    github::Readiness::Ready(login.clone())
+                }
+                Err(err) => github::classify_failure(err),
+            };
+            if !matches!(readiness, github::Readiness::Ready(_)) {
+                // Offline outranks signed out, which outranks anything else, as a fetch ranks them.
+                let rank = |ready: &github::Readiness| match ready {
+                    github::Readiness::Offline => 2,
+                    github::Readiness::SignedOut => 1,
+                    _ => 0,
+                };
+                if worst
+                    .as_ref()
+                    .is_none_or(|current| rank(&readiness) > rank(current))
+                {
+                    worst = Some(readiness.clone());
+                }
+            }
+            self.health
+                .accounts
+                .insert(identity.login.to_lowercase(), readiness);
+        }
+        let readiness = match (worst, ready.is_empty()) {
+            (Some(problem), _) => problem,
+            (None, true) => github::Readiness::SignedOut,
+            (None, false) => github::Readiness::Ready(ready.join(", @")),
+        };
+        self.health
+            .hosts
+            .insert(PUBLIC_HOST.into(), readiness.clone());
+        self.health.readiness = readiness;
     }
 
     fn fetched(
@@ -1178,7 +1256,10 @@ impl Engine {
         self.save();
         self.emit(Effect::SyncTray);
         self.schedule_wake();
-        self.force_refresh();
+        // The folders didn't change, only what to ask GitHub about: check again over the
+        // repositories already discovered, without rescanning the disk. A check already
+        // running finishes first and the new scope follows it (see `fetch_reviews`).
+        self.fetch_reviews();
     }
 
     fn check_for_updates(&mut self, manual: bool) {
@@ -1526,6 +1607,10 @@ impl Engine {
         self.announced_launch = announced;
     }
 
+    pub fn set_login_state(&mut self, state: login::State) {
+        self.login_state = state;
+    }
+
     pub fn set_update(&mut self, update: Option<Update>) {
         self.update = update;
     }
@@ -1552,6 +1637,7 @@ impl Job {
             Self::Sleep(timer, _) => JobKey::Timer(*timer),
             Self::Scan { .. } => JobKey::Scan,
             Self::Fetch { .. } => JobKey::Fetch,
+            Self::Identify => JobKey::Identify,
             Self::Permission => JobKey::Permission,
             Self::Authorize => JobKey::Authorize,
             Self::Notify { slot, .. } | Self::AwaitResponse { slot, .. } => {
@@ -1644,6 +1730,7 @@ impl Job {
                 let response = delivered.response(|duration| sleep(duration)).await;
                 Event::NotificationResponse { slot, response }
             })),
+            Self::Identify => Work::Blocking(Box::new(|| Done::Identified(github::identities()))),
             Self::CheckUpdate => Work::Blocking(Box::new(|| Done::UpdateChecked(updater::check()))),
             Self::Save {
                 store,

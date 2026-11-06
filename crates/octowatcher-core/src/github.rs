@@ -343,6 +343,40 @@ fn credential(runner: &impl GhRunner, account: &str, known_id: Option<u64>) -> R
     Ok(Session { token, viewer })
 }
 
+/// A saved github.com account and whether its credential still verifies.
+pub struct Identity {
+    pub login: String,
+    pub active: bool,
+    /// The verified login, or why the account can't sign in.
+    pub verified: Result<String>,
+}
+
+/// Lists the saved github.com accounts and verifies each credential, without any repository
+/// queries. Takes a second or two where a full [`poll`] takes one request per repository, so
+/// the shell can show sign-in state while the first sync is still running.
+pub fn identities() -> Result<Vec<Identity>> {
+    identities_with(&Cli::default())
+}
+
+fn identities_with(runner: &impl GhRunner) -> Result<Vec<Identity>> {
+    Ok(accounts(runner)?
+        .into_iter()
+        .map(|account| {
+            runner.begin_check();
+            let verified = if account.state != "success" {
+                Err(anyhow::anyhow!(
+                    "@{}: authentication unavailable ({}); check gh auth status --hostname github.com and sign in again",
+                    account.login,
+                    account.state
+                ))
+            } else {
+                credential(runner, &account.login, None).map(|session| session.viewer.login)
+            };
+            Identity { login: account.login, active: account.active, verified }
+        })
+        .collect())
+}
+
 pub fn poll(repos: &[String], preferences: Store, cache: AccessCache) -> Result<Poll> {
     poll_with(&Cli::default(), repos, preferences, cache, Instant::now())
 }
